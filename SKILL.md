@@ -291,6 +291,27 @@ outstation.Update(db => db.UpdateAnalog(
 `NopApplication` and override `Now()`, `SupportsWriteTime()`,
 `WriteAbsoluteTime()`, `ColdRestart()`, `WarmRestart()` as needed.
 
+**Several masters on one device.** A control centre and an engineering
+workstation polling the same RTU is one session, not two:
+
+```csharp
+MaxMasters = 4,   // in OutstationConfig; needs a listening channel
+```
+
+They share the database, the clock, the command handler and `Stats`. Everything
+that is per-conversation — the event queue, sequence numbers, the
+select-before-operate reservation, which classes each has enabled for
+unsolicited reporting, the internal indications each is owed — is private, so a
+select from one is not operable by the other and events one acknowledges still
+reach the rest. Three things follow:
+
+- `Events.MaxEvents` is charged **per master**, so it multiplies.
+- Requests are still processed one at a time across all masters, so your
+  `ICommandHandler` needs no locking — and a handler that blocks stalls every
+  master, not just the one that called it.
+- A master past the limit is disconnected immediately and counted in
+  `Stats.MastersRefused`, rather than left connected and unanswered.
+
 ### 2.5 Test without hardware
 
 ```csharp
@@ -300,7 +321,9 @@ var (masterSide, outstationSide) = Pipe.Create();
 Two `IChannel`s wired to each other in memory — the real link, transport,
 application and object layers, no socket, no device. This is how every
 integration test in the repository runs, and the fastest way to develop against
-a device you do not have.
+a device you do not have. For several masters against one outstation, use
+`PipeListener`: `listener.Server` is the outstation's channel and every
+`listener.Connect()` is another master dialling in.
 
 ```csharp
 var outTask = outstation.RunAsync(outstationSide, cts.Token);
@@ -383,8 +406,10 @@ var (a, b) = Pipe.Create();
 - **TLS is mutually authenticated and that cannot be turned off.** DNP3 carries
   controls that operate plant. A configuration without a cert, key and CA is
   refused at construction.
-- **`TcpServerChannel` serves one master at a time.** Several concurrent masters
-  needs a session per connection, which is not implemented.
+- **A channel either accepts peers or dials one.** `TcpServerChannel`,
+  `TlsServerChannel` and `PipeListener` report
+  `SupportsConcurrentConnections = true` and are the ones an outstation serving
+  several masters can run over; everything else produces one peer.
 - Over serial, set `UseLinkConfirms = true`, `LinkRetries = 3` and a
   `LinkTimeout` scaled to the baud rate — and use `SyncTimeWithDelayAsync`, not
   `SyncTimeAsync`.
@@ -502,6 +527,8 @@ silently by design. `dnp3-explorer` can edit both live with `C`, and
   fragment can span nine frames. Always check.
 - **Event buffer overflow discards the oldest events** and latches the
   indication — the only way a master learns its record has a hole. Alarm on it.
+- **With several masters, every one of them holds a full event queue.**
+  `Events.MaxEvents` is per master, not per device, so it multiplies.
 - `AddPeriodicScanAsync` completes when the scan is *queued*, not when it first
   runs. Failures never stop it.
 - `RestartAsync` returns when the request was *accepted*, not when the device is
@@ -542,6 +569,7 @@ forced.
 | `MasterStats.Connections` | climbing means a flapping link |
 | `OutstationStats.ConfirmTimeouts` | the master is not confirming; events are being re-sent |
 | `OutstationStats.MalformedRequests` | something on the wire is wrong |
+| `OutstationStats.MastersRefused` | masters turned away at the `MaxMasters` limit |
 
 ### Logging
 

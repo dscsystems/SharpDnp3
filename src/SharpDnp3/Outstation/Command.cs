@@ -186,9 +186,10 @@ public sealed partial class OutstationSession
     /// <remarks>
     /// The response echoes the request's objects with each status filled in,
     /// which is how a master learns which point in a multi-command request
-    /// failed.
+    /// failed. The selection is the association's own, so one master's OPERATE
+    /// can never be matched against another's SELECT.
     /// </remarks>
-    private void OnCommand(Received r, Fragment frag)
+    private void OnCommand(Association a, Received r, Fragment frag)
     {
         var now = _appl.Now();
         var fc = frag.Header.Func;
@@ -197,7 +198,7 @@ public sealed partial class OutstationSession
         // A SELECT reserves; everything else operates.
         if (fc == FuncCode.Select)
         {
-            OnSelect(r, frag, objectsRaw, now);
+            OnSelect(a, r, frag, objectsRaw, now);
             return;
         }
 
@@ -212,32 +213,33 @@ public sealed partial class OutstationSession
         var selectStatus = CommandStatus.Success;
         if (opType == OperateType.Selected)
         {
-            selectStatus = _sel.Matches(objectsRaw.Span, frag.Header.Control.Seq, now);
+            selectStatus = a.Sel.Matches(objectsRaw.Span, frag.Header.Control.Seq, now);
 
             // The selection is consumed either way: a failed operate must not
             // leave a reservation an operator could stumble into later.
-            _sel.Clear();
+            a.Sel.Clear();
         }
 
-        var (body, outcomes) = ExecuteCommands(frag, opType, selectStatus);
-        LogCommands(fc, opType, outcomes);
+        var (body, outcomes) = ExecuteCommands(a, frag, opType, selectStatus);
+        LogCommands(a, fc, opType, outcomes);
 
         if (fc.NoReply() || r.Broadcast)
         {
             return;
         }
 
-        Respond(r, frag.Header, body);
+        Respond(a, r, frag.Header, body);
     }
 
     /// <summary>Reserves the commands without operating anything.</summary>
     private void OnSelect(
+        Association a,
         Received r,
         Fragment frag,
         ReadOnlyMemory<byte> objectsRaw,
         DateTimeOffset now)
     {
-        var (body, outcomes) = ExecuteCommands(frag, OperateType.Direct, CommandStatus.Success);
+        var (body, outcomes) = ExecuteCommands(a, frag, OperateType.Direct, CommandStatus.Success);
 
         var allOK = true;
         foreach (var o in outcomes)
@@ -251,23 +253,23 @@ public sealed partial class OutstationSession
 
         if (allOK)
         {
-            _sel.Active = true;
-            _sel.Objects = objectsRaw.ToArray();
-            _sel.Seq = frag.Header.Control.Seq;
-            _sel.Expires = now + _cfg.SelectTimeout;
+            a.Sel.Active = true;
+            a.Sel.Objects = objectsRaw.ToArray();
+            a.Sel.Seq = frag.Header.Control.Seq;
+            a.Sel.Expires = now + _cfg.SelectTimeout;
         }
         else
         {
-            _sel.Clear();
+            a.Sel.Clear();
         }
 
-        LogCommands(FuncCode.Select, OperateType.Direct, outcomes);
+        LogCommands(a, FuncCode.Select, OperateType.Direct, outcomes);
         if (r.Broadcast)
         {
             return;
         }
 
-        Respond(r, frag.Header, body);
+        Respond(a, r, frag.Header, body);
     }
 
     /// <summary>
@@ -280,6 +282,7 @@ public sealed partial class OutstationSession
     /// handler, which is what keeps a stale OPERATE from moving anything.
     /// </remarks>
     private (byte[] Body, List<CommandOutcome> Outcomes) ExecuteCommands(
+        Association a,
         Fragment frag,
         OperateType opType,
         CommandStatus selectStatus)
@@ -294,13 +297,13 @@ public sealed partial class OutstationSession
             if (!ObjectRegistry.TryLookup(GroupVar.GV(h.Group, h.Variation), out var d) ||
                 d.Kind != Kind.Command)
             {
-                _iin = _iin.Set(Iin.ObjectUnknown);
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
                 continue;
             }
 
             if (!d.TrySizeOctets(out var size) || size == 0)
             {
-                _iin = _iin.Set(Iin.ObjectUnknown);
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
                 continue;
             }
 
@@ -309,7 +312,7 @@ public sealed partial class OutstationSession
             {
                 // A command with no index prefix cannot say which point it
                 // means.
-                _iin = _iin.Set(Iin.ParameterError);
+                a.Iin = a.Iin.Set(Iin.ParameterError);
                 continue;
             }
 
@@ -408,11 +411,15 @@ public sealed partial class OutstationSession
         return new AnalogOutputCommand(value, variation);
     }
 
-    private void LogCommands(FuncCode fc, OperateType opType, List<CommandOutcome> outcomes)
+    private void LogCommands(
+        Association a,
+        FuncCode fc,
+        OperateType opType,
+        List<CommandOutcome> outcomes)
     {
         foreach (var o in outcomes)
         {
-            _log.Log(
+            a.Log.Log(
                 Dnp3LogLevel.Info,
                 "command",
                 ("func", fc.ToDisplayString()),
@@ -442,12 +449,12 @@ public sealed partial class OutstationSession
     /// have to select again rather than operate on a decision they no longer
     /// remember making.
     /// </remarks>
-    private void CheckSelectTimeout(DateTimeOffset now)
+    private static void CheckSelectTimeout(Association a, DateTimeOffset now)
     {
-        if (_sel.Active && now > _sel.Expires)
+        if (a.Sel.Active && now > a.Sel.Expires)
         {
-            _log.Log(Dnp3LogLevel.Debug, "selection expired", ("seq", _sel.Seq));
-            _sel.Clear();
+            a.Log.Log(Dnp3LogLevel.Debug, "selection expired", ("seq", a.Sel.Seq));
+            a.Sel.Clear();
         }
     }
 

@@ -314,4 +314,52 @@ public sealed class EventBuffer
             _overflow = false;
         }
     }
+
+    /// <summary>
+    /// Empties the buffer and returns what was in it, with every selection
+    /// undone.
+    /// </summary>
+    /// <remarks>
+    /// This is how a queue moves between buffers when a master connects or
+    /// disconnects. The selections are dropped because they record a response
+    /// that a particular master was sent, and that fact does not travel: the
+    /// events go back to being unreported, which is what they are as far as
+    /// whoever picks them up next is concerned.
+    /// </remarks>
+    internal List<Event> Drain(out bool overflowed)
+    {
+        lock (_gate)
+        {
+            var output = new List<Event>(_events.Count);
+            foreach (var e in _events)
+            {
+                output.Add(e with { Selected = false });
+            }
+
+            overflowed = _overflow;
+            _events.Clear();
+            _overflow = false;
+            return output;
+        }
+    }
+
+    /// <summary>Adds a queue taken from another buffer, oldest first.</summary>
+    internal void Seed(List<Event> events, bool overflowed)
+    {
+        lock (_gate)
+        {
+            foreach (var e in events)
+            {
+                if (_events.Count >= _max)
+                {
+                    _events.RemoveFirst();
+                    overflowed = true;
+                }
+
+                _events.AddLast(e);
+            }
+
+            _overflow |= overflowed;
+        }
+    }
 }

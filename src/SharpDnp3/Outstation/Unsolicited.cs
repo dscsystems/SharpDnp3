@@ -121,25 +121,38 @@ public sealed partial class OutstationSession
     /// moment is right.
     /// </summary>
     /// <remarks>
-    /// It runs on the session's tick, which is what lets the hold time and the
-    /// confirm timeout be enforced without a timer per event.
+    /// It runs on the association's tick, which is what lets the hold time and
+    /// the confirm timeout be enforced without a timer per event. Each master
+    /// enables its own classes and acknowledges its own responses, so this runs
+    /// once per attached master against that master's own event queue.
     /// </remarks>
-    private void PollUnsolicited(DateTimeOffset now)
+    private void PollUnsolicited(Association a, DateTimeOffset now)
     {
-        if (!_cfg.Unsolicited.Enabled || !_connected)
+        if (!_cfg.Unsolicited.Enabled || !a.Connected)
         {
             return;
         }
 
-        // An unconfirmed response is either still in its window or has run out.
-        if (_unsol.Awaiting)
+        if (_cfg.MaxMasters > 1 && !a.RemoteKnown)
         {
-            if (now < _unsol.Deadline)
+            // With one master the configured address is the master's address,
+            // so the announcement can go out the moment the connection is up.
+            // With several it is a guess that is wrong for all but one of them,
+            // and an announcement sent to the wrong link address is not
+            // received at all — so this waits until the master has said
+            // something and named itself.
+            return;
+        }
+
+        // An unconfirmed response is either still in its window or has run out.
+        if (a.Unsol.Awaiting)
+        {
+            if (now < a.Unsol.Deadline)
             {
                 return;
             }
 
-            OnUnsolicitedTimeout(now);
+            OnUnsolicitedTimeout(a, now);
             return;
         }
 
@@ -149,22 +162,22 @@ public sealed partial class OutstationSession
         // to an outstation that restarted — that this outstation exists and is
         // asserting DEVICE_RESTART, without gambling event data on a session
         // the master may not be ready for.
-        if (!_unsol.NullConfirmed)
+        if (!a.Unsol.NullConfirmed)
         {
-            if (!_unsol.NullSent || now > _unsol.NextAllowed)
+            if (!a.Unsol.NullSent || now > a.Unsol.NextAllowed)
             {
-                SendUnsolicited([], now, isNull: true);
+                SendUnsolicited(a, [], now, isNull: true);
             }
 
             return;
         }
 
-        if (_unsolClasses == 0 || now < _unsol.NextAllowed)
+        if (a.UnsolClasses == 0 || now < a.Unsol.NextAllowed)
         {
             return;
         }
 
-        var pending = _db.Events?.Count(_unsolClasses) ?? 0;
+        var pending = a.Events.Count(a.UnsolClasses);
         if (pending == 0)
         {
             return;
@@ -174,31 +187,31 @@ public sealed partial class OutstationSession
         // enough events have piled up that waiting no longer helps.
         if (_cfg.Unsolicited.HoldTime > TimeSpan.Zero)
         {
-            _unsol.FirstEventAt ??= now;
+            a.Unsol.FirstEventAt ??= now;
 
             var enough = _cfg.Unsolicited.MaxEvents > 0 && pending >= _cfg.Unsolicited.MaxEvents;
-            if (!enough && now - _unsol.FirstEventAt.Value < _cfg.Unsolicited.HoldTime)
+            if (!enough && now - a.Unsol.FirstEventAt.Value < _cfg.Unsolicited.HoldTime)
             {
                 return;
             }
         }
 
-        _unsol.FirstEventAt = null;
+        a.Unsol.FirstEventAt = null;
 
-        var events = _db.Events?.Select(_unsolClasses, 64) ?? [];
+        var events = a.Events.Select(a.UnsolClasses, 64);
         if (events.Count == 0)
         {
             return;
         }
 
-        SendUnsolicited(events, now, isNull: false);
+        SendUnsolicited(a, events, now, isNull: false);
     }
 
     /// <summary>Retries or gives up on an unconfirmed response.</summary>
-    private void OnUnsolicitedTimeout(DateTimeOffset now)
+    private void OnUnsolicitedTimeout(Association a, DateTimeOffset now)
     {
-        _unsol.Awaiting = false;
-        _unsol.Retries++;
+        a.Unsol.Awaiting = false;
+        a.Unsol.Retries++;
 
         lock (_gate)
         {
@@ -209,28 +222,32 @@ public sealed partial class OutstationSession
         // up, the master's next poll collects them — losing them because
         // unsolicited delivery failed would defeat the point of the
         // confirmation.
-        var requeued = _db.Events?.Unselect() ?? 0;
+        var requeued = a.Events.Unselect();
 
-        if (_unsol.Retries > _cfg.Unsolicited.MaxRetries)
+        if (a.Unsol.Retries > _cfg.Unsolicited.MaxRetries)
         {
-            _log.Log(
+            a.Log.Log(
                 Dnp3LogLevel.Warn,
                 "giving up on unsolicited reporting until the master polls",
-                ("retries", _unsol.Retries), ("events_requeued", requeued));
+                ("retries", a.Unsol.Retries), ("events_requeued", requeued));
 
-            _unsol.Retries = 0;
-            _unsol.NextAllowed = now + _cfg.Unsolicited.ConfirmTimeout;
+            a.Unsol.Retries = 0;
+            a.Unsol.NextAllowed = now + _cfg.Unsolicited.ConfirmTimeout;
             return;
         }
 
-        _log.Log(
+        a.Log.Log(
             Dnp3LogLevel.Debug,
             "unsolicited response unconfirmed; retrying",
-            ("attempt", _unsol.Retries), ("events_requeued", requeued));
+            ("attempt", a.Unsol.Retries), ("events_requeued", requeued));
     }
 
     /// <summary>Transmits one unsolicited response.</summary>
-    private void SendUnsolicited(IReadOnlyList<Event> events, DateTimeOffset now, bool isNull)
+    private void SendUnsolicited(
+        Association a,
+        IReadOnlyList<Event> events,
+        DateTimeOffset now,
+        bool isNull)
     {
         var ctx = new Context { Synchronized = _synchronized };
         var b = new ResponseBuilder(_cfg.MaxTxFragment, ctx);
@@ -247,66 +264,69 @@ public sealed partial class OutstationSession
         // asked for it.
         var body = bodies[0];
 
-        _unsol.Seq = (byte)((_unsol.Seq + 1) % AppConstants.SeqModulus);
+        a.Unsol.Seq = (byte)((a.Unsol.Seq + 1) % AppConstants.SeqModulus);
 
         var frag = new List<byte>(AppConstants.ResponseHeaderSize + body.Length);
         HeaderCodec.AppendHeader(frag, new AppHeader(
-            new AppControl(Fir: true, Fin: true, Con: true, Uns: true, Seq: _unsol.Seq),
+            new AppControl(Fir: true, Fin: true, Con: true, Uns: true, Seq: a.Unsol.Seq),
             FuncCode.UnsolicitedResponse,
-            CurrentIin()));
+            CurrentIin(a)));
         frag.AddRange(body);
 
         try
         {
-            _stack!.Send(_sink, [.. frag]);
+            // Addressed rather than sent to the configured master: with several
+            // attached, each one's unsolicited responses have to go to its own
+            // link address.
+            a.Stack.SendTo(a.Sink, a.RemoteAddr, [.. frag]);
         }
         catch (Dnp3Exception ex)
         {
             // The events are still selected; the retry path requeues them.
-            _log.Log(Dnp3LogLevel.Warn, "unsolicited transmission failed", ("err", ex.Message));
+            a.Log.Log(Dnp3LogLevel.Warn, "unsolicited transmission failed", ("err", ex.Message));
             return;
         }
 
-        _unsol.Awaiting = true;
-        _unsol.AwaitSeq = _unsol.Seq;
-        _unsol.Deadline = now + _cfg.Unsolicited.ConfirmTimeout;
-        _unsol.NullSent = _unsol.NullSent || isNull;
+        a.Unsol.Awaiting = true;
+        a.Unsol.AwaitSeq = a.Unsol.Seq;
+        a.Unsol.Deadline = now + _cfg.Unsolicited.ConfirmTimeout;
+        a.Unsol.NullSent = a.Unsol.NullSent || isNull;
 
         lock (_gate)
         {
             _stats.UnsolicitedSent++;
         }
 
-        _log.Log(
+        a.Log.Log(
             Dnp3LogLevel.Debug,
             "unsolicited response sent",
-            ("seq", _unsol.Seq), ("events", events.Count), ("null", isNull));
+            ("seq", a.Unsol.Seq), ("events", events.Count), ("null", isNull));
     }
 
     /// <summary>Handles a confirmation of an unsolicited response.</summary>
-    private void OnUnsolicitedConfirm(AppHeader h)
+    private void OnUnsolicitedConfirm(Association a, AppHeader h)
     {
-        if (!_unsol.Awaiting || h.Control.Seq != _unsol.AwaitSeq)
+        if (!a.Unsol.Awaiting || h.Control.Seq != a.Unsol.AwaitSeq)
         {
-            _log.Log(
+            a.Log.Log(
                 Dnp3LogLevel.Debug,
                 "unexpected unsolicited confirm",
-                ("seq", h.Control.Seq), ("awaiting", _unsol.Awaiting));
+                ("seq", h.Control.Seq), ("awaiting", a.Unsol.Awaiting));
             return;
         }
 
-        _unsol.Awaiting = false;
-        _unsol.Retries = 0;
+        a.Unsol.Awaiting = false;
+        a.Unsol.Retries = 0;
 
-        if (!_unsol.NullConfirmed)
+        if (!a.Unsol.NullConfirmed)
         {
             // The master has acknowledged our existence; data may now flow.
-            _unsol.NullConfirmed = true;
-            _log.Log(Dnp3LogLevel.Debug, "null unsolicited response confirmed");
+            a.Unsol.NullConfirmed = true;
+            a.Log.Log(Dnp3LogLevel.Debug, "null unsolicited response confirmed");
             return;
         }
 
-        var n = _db.Events?.Confirm() ?? 0;
-        _log.Log(Dnp3LogLevel.Debug, "unsolicited events confirmed", ("count", n));
+        var n = a.Events.Confirm();
+        a.Log.Log(Dnp3LogLevel.Debug, "unsolicited events confirmed", ("count", n));
     }
 }

@@ -522,11 +522,26 @@ public static class Pipe
 {
     public static (IChannel A, IChannel B) Create();
 }
+
+public sealed class PipeListener : IDisposable
+{
+    public IChannel Server { get; }   // the listening end
+    public IChannel Connect();        // one more peer
+}
 ```
 
-**`TcpServerChannel` and `TlsServerChannel` serve one master at a time.** That is
-the common field configuration; serving several concurrently needs a session per
-connection, which belongs above this layer and is not implemented.
+Every `IChannel` reports whether it can produce more than one peer:
+
+```csharp
+bool SupportsConcurrentConnections { get; }  // default false
+```
+
+`TcpServerChannel`, `TlsServerChannel` and `PipeListener.Server` say yes: each
+accept is a different master. The channels that dial — TCP client, TLS client,
+UDP, serial, `Pipe` — say no, because asking one of them for a second connection
+produces a second connection to the same peer, not a second peer. An outstation
+configured with `MaxMasters` above one over a channel that says no is refused at
+`RunAsync` rather than quietly serving one master.
 
 `BoundAddress` is how a test asks for port `0` and finds out which port it got.
 
@@ -534,6 +549,10 @@ connection, which belongs above this layer and is not implemented.
 what every integration test runs over and what the explorer's demo mode uses: a
 full master and outstation talking through the real link, transport and
 application layers, with no socket and no hardware.
+
+`PipeListener` is the same idea for several masters: `Server` behaves like a
+listening socket and every `Connect()` is another peer dialling it, so a
+multi-master outstation can be tested without one.
 
 Address strings are `host:port`; an empty host (`":20000"`) binds every
 interface, dual-stack.
@@ -949,6 +968,7 @@ public sealed partial class OutstationSession
     public void Update(Action<Database> action);
     public Database Database { get; }
     public EventBuffer? Events { get; }
+    public int MastersAttached { get; }
     public void Restart();
     public OutstationStats Stats { get; }
 }
@@ -958,8 +978,10 @@ A null `IOutstationApplication` uses `NopApplication`. **A null `ICommandHandler
 uses `RejectingCommandHandler`, which refuses every control** — an outstation
 whose controls are not wired up must say so rather than silently report success.
 
-`Update` applies the action on the session loop and is safe to call from
-anywhere. Batching related changes in one call is what makes a breaker opening
+`Update` applies the action holding the database's lock and is safe to call from
+anywhere. An update queued before a request arrives is applied before that
+request is answered, so a master that polls after your application reports a
+change is told about the change. Batching related changes in one call is what makes a breaker opening
 and its alarm asserting produce one consistent set of events rather than a torn
 read:
 
@@ -976,11 +998,59 @@ prefer `Update` for modifications once the session is running. Reading or
 configuring it before `RunAsync` starts is fine, and is where point configuration
 belongs.
 
-`Restart()` makes the outstation report a restart to its master. It is what a
+`Restart()` makes the outstation report a restart to its masters. It is what a
 device calls when it has genuinely restarted and what a simulator calls to
 produce the condition on demand. The restart indication is the only signal that
 tells a master its whole picture is stale: the event history is gone, so no
-incremental poll can recover it and only a full re-baseline will do.
+incremental poll can recover it and only a full re-baseline will do. Every
+attached master is told, and so is any that attaches before one of them clears
+it.
+
+### Serving several masters
+
+`MaxMasters` above one makes one session serve that many masters at once over a
+listening channel, running a conversation per connection against one database:
+
+```csharp
+var outstation = new OutstationSession(new OutstationConfig
+{
+    LocalAddr = 10,
+    RemoteAddr = 1,
+    MaxMasters = 4,
+    Events = new EventBufferConfig { MaxEvents = 1000 },
+});
+
+await outstation.RunAsync(new TcpServerChannel(":20000"), token);
+```
+
+Shared between the masters: the database, the clock, the command handler, the
+application, and the counters in `Stats`. Private to each: the event queue,
+application sequence numbers, the select-before-operate reservation, which
+classes it has enabled for unsolicited reporting, and the internal indications
+it is owed. None of those mean anything across a connection — a select from the
+control centre must not be operable from the engineering workstation, and events
+one master acknowledges must still reach the other.
+
+Four consequences worth knowing before you turn it on:
+
+- **Each master costs an event queue of `Events.MaxEvents` entries.** Size the
+  two together.
+- **`Events` returns the sole master's queue** when one is attached, and the
+  queue events accumulate in while none is. With several attached there is no
+  single answer and it returns the empty unattached queue; read
+  `MastersAttached` before drawing conclusions from it.
+- **Events raised while nothing is attached go to the next master to attach**,
+  which is what makes a reconnecting master see what it missed. A master joining
+  an outstation that already has one starts with an empty queue and re-baselines
+  from its integrity poll.
+- **A master arriving past the limit is accepted and immediately disconnected**,
+  logged, and counted in `Stats.MastersRefused`. Leaving the connection open and
+  unserved would look to both sides like an outstation that had gone mute.
+
+Requests are processed one at a time across all masters, so `ICommandHandler`
+and `IOutstationApplication` are called the same way they are with one master
+and need no locking of their own. The same fact is the cost: a handler that
+blocks stalls every master, not just the one that called it.
 
 ## OutstationConfig
 
@@ -991,7 +1061,9 @@ public sealed class OutstationConfig
     public ushort RemoteAddr { get; set; } // the master's
 
     public DatabaseConfig Database { get; set; }
-    public EventBufferConfig Events { get; set; }
+    public EventBufferConfig Events { get; set; } // sizes the queue each attached master holds
+
+    public int MaxMasters { get; set; }    // default 1; above one needs a listening channel
 
     public int MaxTxFragment { get; set; } // default 2048
     public int MaxRxFragment { get; set; } // default 2048
@@ -1243,6 +1315,10 @@ record.
 
 The session drives all of this. You normally only read the counters.
 
+Each attached master holds its own buffer, because selection and confirmation
+are per-master: one shared between them would let the first master to poll take
+the events and leave the second never knowing they happened.
+
 ```csharp
 public record struct Event
 {
@@ -1284,8 +1360,15 @@ public record struct OutstationStats
     public ulong CommandsRejected;
     public ulong UnsolicitedSent;
     public ulong UnsolicitedTimeouts;
+
+    public int MastersAttached;      // right now
+    public int PeakMastersAttached;  // the most at once
+    public ulong MastersRefused;     // turned away at the MaxMasters limit
 }
 ```
+
+The counters are the device's, not one master's: with several attached they are
+the totals across all of them.
 
 ---
 

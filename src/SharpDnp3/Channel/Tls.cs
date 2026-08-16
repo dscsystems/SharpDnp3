@@ -304,6 +304,9 @@ public sealed class TlsServerChannel : IChannel
     }
 
     /// <inheritdoc/>
+    public bool SupportsConcurrentConnections => true;
+
+    /// <inheritdoc/>
     public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
     {
         var listener = Listen();
@@ -363,7 +366,7 @@ public sealed class TlsServerChannel : IChannel
 }
 
 /// <summary>An <see cref="SslStream"/> that disposes the socket beneath it.</summary>
-internal sealed class TlsConnectionStream : Stream
+internal sealed class TlsConnectionStream : Stream, IPeerEndpoint
 {
     private readonly TcpClient _client;
     private readonly SslStream _inner;
@@ -372,7 +375,23 @@ internal sealed class TlsConnectionStream : Stream
     {
         _client = client;
         _inner = inner;
+
+        try
+        {
+            Peer = client.Client.RemoteEndPoint?.ToString();
+        }
+        catch (SocketException)
+        {
+            Peer = null;
+        }
+        catch (ObjectDisposedException)
+        {
+            Peer = null;
+        }
     }
+
+    /// <inheritdoc/>
+    public string? Peer { get; }
 
     public override bool CanRead => _inner.CanRead;
 

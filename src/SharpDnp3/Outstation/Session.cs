@@ -3,6 +3,7 @@
 // Licensed under the GNU General Public License v3.0 or later.
 
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Threading.Channels;
 using SharpDnp3.App;
 using SharpDnp3.Channels;
@@ -18,13 +19,51 @@ public sealed class OutstationConfig
     public ushort LocalAddr { get; set; }
 
     /// <summary>The master's link address.</summary>
+    /// <remarks>
+    /// It is where unsolicited responses go before a master has said anything.
+    /// Solicited responses always go back to whoever asked, so a session serving
+    /// several masters answers each of them correctly whatever this says.
+    /// </remarks>
     public ushort RemoteAddr { get; set; }
 
     /// <summary>Sizes the point database.</summary>
     public DatabaseConfig Database { get; set; } = new();
 
     /// <summary>Sizes the event buffer.</summary>
+    /// <remarks>
+    /// Each attached master holds a queue of this size, because what one master
+    /// has acknowledged says nothing about what another has seen.
+    /// </remarks>
     public EventBufferConfig Events { get; set; } = new();
+
+    /// <summary>
+    /// How many masters may be served at once. Zero or one serves one at a
+    /// time, which is the usual field configuration.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Above one, the session accepts that many connections and runs a
+    /// conversation on each: they share the database, the clock, the command
+    /// handler and the counters, and nothing else. Events, sequence numbers,
+    /// select-before-operate reservations, unsolicited enables and internal
+    /// indications are all per-master, because none of them mean anything
+    /// across a connection. A master arriving past the limit is accepted and
+    /// immediately disconnected, and counted in
+    /// <see cref="OutstationStats.MastersRefused"/>.
+    /// </para>
+    /// <para>
+    /// It requires a channel that accepts connections — <c>TcpServerChannel</c>,
+    /// <c>TlsServerChannel</c> or <c>PipeListener</c>. Running it over a channel
+    /// that dials is refused rather than quietly serving one master, since a
+    /// dialling channel asked for a second connection produces a second
+    /// connection to the same peer.
+    /// </para>
+    /// <para>
+    /// Each master costs an event queue of <see cref="Events"/> entries, so size
+    /// the two together.
+    /// </para>
+    /// </remarks>
+    public int MaxMasters { get; set; }
 
     /// <summary>
     /// Caps a response fragment. Zero uses the standard's 2048.
@@ -68,6 +107,11 @@ public sealed class OutstationConfig
 
     internal void ApplyDefaults()
     {
+        if (MaxMasters <= 0)
+        {
+            MaxMasters = 1;
+        }
+
         if (MaxTxFragment <= 0)
         {
             MaxTxFragment = AppConstants.DefaultMaxFragment;
@@ -191,13 +235,33 @@ public record struct OutstationStats
 
     /// <summary>Unsolicited responses the master never confirmed.</summary>
     public ulong UnsolicitedTimeouts;
+
+    /// <summary>Masters currently attached.</summary>
+    public int MastersAttached;
+
+    /// <summary>The most masters that have been attached at once.</summary>
+    public int PeakMastersAttached;
+
+    /// <summary>
+    /// Masters turned away because <see cref="OutstationConfig.MaxMasters"/>
+    /// was already reached.
+    /// </summary>
+    public ulong MastersRefused;
 }
 
 /// <summary>An outstation.</summary>
 /// <remarks>
-/// All protocol state lives in the loop started by <see cref="RunAsync"/>.
+/// <para>
+/// All protocol state lives in the loops started by <see cref="RunAsync"/>.
 /// Database updates arrive through <see cref="Update"/>, which is safe to call
 /// from anywhere.
+/// </para>
+/// <para>
+/// One session is one device, not one conversation. With
+/// <see cref="OutstationConfig.MaxMasters"/> above one it serves that many
+/// masters at once over a listening channel, running a conversation per
+/// connection against the same database.
+/// </para>
 /// </remarks>
 public sealed partial class OutstationSession
 {
@@ -206,67 +270,49 @@ public sealed partial class OutstationSession
     private readonly Database _db;
     private readonly ResponseWriter _writer;
     private readonly IDnp3Logger _log;
-    private ProtocolStack? _stack;
-    private readonly BufferSink _sink = new();
 
     /// <summary>
-    /// The internal indications the outstation reports. It is touched only from
-    /// the session loop.
+    /// Tracks whether a master has set our clock, which decides the quality
+    /// stamped on the timestamps we report. It is the device's clock, so it is
+    /// shared: whichever master sets it, every master's timestamps improve.
     /// </summary>
-    private Iin _iin;
+    private volatile bool _synchronized;
 
     /// <summary>
-    /// Tracks whether the master has set our clock, which decides the quality
-    /// stamped on the timestamps we report.
+    /// Latched while the device has restarted, and used to seed the restart
+    /// indication of a master that attaches later.
     /// </summary>
-    private bool _synchronized;
-
-    /// <summary>
-    /// The mask of classes the master has enabled for unsolicited reporting.
-    /// </summary>
-    private Class _unsolClasses;
-
-    /// <summary>
-    /// Set while a response is awaiting an application confirmation.
-    /// </summary>
-    private bool _awaitingConfirm;
-
-    private byte _confirmSeq;
-    private DateTimeOffset _confirmDeadline;
-
-    /// <summary>The live select-before-operate reservation.</summary>
-    private readonly Selection _sel = new();
+    /// <remarks>
+    /// The indication itself is per-master, because it is a handshake: a master
+    /// clears it once it has re-baselined, and one master finishing that says
+    /// nothing about another. What is shared is the fact of the restart, which
+    /// a master attaching afterwards still needs to be told about.
+    /// </remarks>
+    private volatile bool _deviceRestart;
 
     /// <summary>Executes the controls themselves.</summary>
     private readonly ICommandHandler _cmds;
 
-    /// <summary>The unsolicited reporting state.</summary>
-    private readonly UnsolState _unsol = new();
-
-    /// <summary>
-    /// Gates unsolicited reporting: an outstation with no master attached has
-    /// nowhere to send.
-    /// </summary>
-    private bool _connected;
-
-    /// <summary>When an unacknowledged link frame should be retried.</summary>
-    private DateTimeOffset _linkDeadline;
-
-    /// <summary>
-    /// When the last RECORD_CURRENT_TIME request arrived, which a master reads
-    /// back as group 50 variation 3 to work out the transit delay before
-    /// setting the clock.
-    /// </summary>
-    private DateTimeOffset? _recordedTime;
-
+    /// <remarks>
+    /// Several readers, because every association drains it before answering a
+    /// request as well as the pump draining it while the session is idle.
+    /// </remarks>
     private readonly Channel<Action<Database>> _updates =
-        Channel.CreateBounded<Action<Database>>(new BoundedChannelOptions(64)
-        {
-            SingleReader = true,
-        });
+        Channel.CreateBounded<Action<Database>>(new BoundedChannelOptions(64));
+
+    /// <summary>
+    /// Serialises draining, so a drain that finds the queue empty knows every
+    /// earlier update has been applied rather than merely dequeued.
+    /// </summary>
+    private readonly Lock _drainGate = new();
 
     private readonly Lock _gate = new();
     private OutstationStats _stats;
+
+    /// <summary>The masters currently attached. Guarded by <see cref="_gate"/>.</summary>
+    private readonly List<Association> _assocs = [];
+
+    private int _nextAssocId;
 
     /// <summary>Creates an outstation session.</summary>
     /// <remarks>
@@ -295,33 +341,74 @@ public sealed partial class OutstationSession
         // A fresh outstation reports a restart until the master clears it.
         // Suppressing that would deny the master the one signal that says "my
         // event history is gone, re-poll everything".
-        _iin = Iin.DeviceRestart;
+        _deviceRestart = true;
     }
 
-    /// <summary>Makes the outstation report a restart to its master.</summary>
+    /// <summary>Makes the outstation report a restart to its masters.</summary>
     /// <remarks>
     /// It is what a device calls when it has genuinely restarted, and what a
     /// simulator calls to produce the condition on demand. The restart
     /// indication is the only signal that tells a master its whole picture is
     /// stale — the event history is gone, so no incremental poll can recover it
-    /// and only a full re-baseline will do.
+    /// and only a full re-baseline will do. Every attached master is told, and
+    /// so is any that attaches before one of them clears it.
     /// </remarks>
-    public void Restart() => Update(_ =>
+    public void Restart()
     {
-        _iin = _iin.Set(Iin.DeviceRestart);
+        _deviceRestart = true;
         _synchronized = false;
-        _db.Events?.Reset();
-        _unsol.Reset();
-    });
+        _db.ResetEvents();
+
+        foreach (var a in Attached())
+        {
+            // The association's own loop applies it, so nothing but that loop
+            // ever writes its protocol state.
+            a.RestartPending = true;
+        }
+    }
 
     /// <summary>
     /// The point database. Prefer <see cref="Update"/> for modifications, which
-    /// serialises them with the session loop.
+    /// serialises them with the session's own work.
     /// </summary>
     public Database Database => _db;
 
-    /// <summary>The event buffer.</summary>
-    public EventBuffer? Events => _db.Events;
+    /// <summary>The event queue.</summary>
+    /// <remarks>
+    /// Each attached master holds its own, so this returns the sole master's
+    /// queue when one is attached and the queue events accumulate in while none
+    /// is. With several attached there is no single answer and it returns the
+    /// unattached queue, which is empty; read
+    /// <see cref="OutstationStats.MastersAttached"/> before drawing conclusions
+    /// from it.
+    /// </remarks>
+    public EventBuffer? Events
+    {
+        get
+        {
+            lock (_gate)
+            {
+                if (_assocs.Count == 1)
+                {
+                    return _assocs[0].Events;
+                }
+            }
+
+            return _db.Events;
+        }
+    }
+
+    /// <summary>How many masters are attached right now.</summary>
+    public int MastersAttached
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _assocs.Count;
+            }
+        }
+    }
 
     /// <summary>Returns a snapshot of the session counters.</summary>
     public OutstationStats Stats
@@ -330,16 +417,19 @@ public sealed partial class OutstationSession
         {
             lock (_gate)
             {
-                return _stats;
+                var s = _stats;
+                s.MastersAttached = _assocs.Count;
+                return s;
             }
         }
     }
 
-    /// <summary>Applies an action to the database from the session loop.</summary>
+    /// <summary>Applies an action to the database, serialised with the session.</summary>
     /// <remarks>
     /// Batching changes in one call is what makes a set of related updates — a
     /// breaker opening and its alarm asserting — produce one consistent set of
-    /// events rather than a torn read.
+    /// events rather than a torn read. The action runs holding the database's
+    /// lock, so no master can be answered halfway through it.
     /// </remarks>
     public void Update(Action<Database> action)
     {
@@ -348,27 +438,83 @@ public sealed partial class OutstationSession
         if (!_updates.Writer.TryWrite(action))
         {
             // The queue is full, which means the session is not running or is
-            // wedged. Apply directly rather than dropping the update: the
-            // database takes its own lock.
-            action(_db);
+            // wedged. Apply directly rather than dropping the update.
+            Apply(action);
+        }
+    }
+
+    /// <summary>Runs one update action under the database's lock.</summary>
+    private void Apply(Action<Database> action)
+    {
+        using var scope = _db.EnterScope();
+        action(_db);
+    }
+
+    /// <summary>Returns the attached associations.</summary>
+    private Association[] Attached()
+    {
+        lock (_gate)
+        {
+            return [.. _assocs];
         }
     }
 
     /// <summary>Connects and serves until the token is cancelled.</summary>
+    /// <remarks>
+    /// With <see cref="OutstationConfig.MaxMasters"/> at one it serves a master,
+    /// waits for the next, and repeats. Above one it accepts up to that many at
+    /// once and serves each on its own loop.
+    /// </remarks>
     public async Task RunAsync(IChannel channel, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(channel);
 
-        _stack = new ProtocolStack(new StackConfig
+        if (_cfg.MaxMasters > 1 && !channel.SupportsConcurrentConnections)
         {
-            LocalAddr = _cfg.LocalAddr,
-            RemoteAddr = _cfg.RemoteAddr,
-            IsMaster = false,
-            UseConfirms = _cfg.UseLinkConfirms,
-            MaxRetries = _cfg.LinkRetries,
-            MaxRxFragment = _cfg.MaxRxFragment,
-        });
+            throw new BadConfigException(string.Format(
+                CultureInfo.InvariantCulture,
+                "outstation: MaxMasters is {0} but {1} produces one peer at a time; " +
+                "serving several masters needs a listening channel",
+                _cfg.MaxMasters,
+                channel));
+        }
 
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var ct = linked.Token;
+
+        // Updates are pumped for as long as the session runs rather than only
+        // while a master is attached, so events that happen during an outage
+        // are queued for whoever attaches next instead of piling up unapplied.
+        var pump = PumpUpdatesAsync(ct);
+
+        try
+        {
+            if (_cfg.MaxMasters > 1)
+            {
+                await ServeManyAsync(channel, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                await ServeOneAsync(channel, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await linked.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await pump.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Shutting down.
+            }
+        }
+    }
+
+    /// <summary>Serves one master at a time, reconnecting after each.</summary>
+    private async Task ServeOneAsync(IChannel channel, CancellationToken cancellationToken)
+    {
         // Cancelling the token is how RunAsync is asked to stop, and a closed
         // channel is the same instruction arriving from the other direction.
         while (true)
@@ -392,48 +538,265 @@ public sealed partial class OutstationSession
                 return;
             }
 
-            lock (_gate)
+            await ServeConnectionAsync(channel, conn, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Accepts up to the configured number of masters and serves each.</summary>
+    private async Task ServeManyAsync(IChannel channel, CancellationToken cancellationToken)
+    {
+        // The semaphore is the connection limit.
+        using var slots = new SemaphoreSlim(_cfg.MaxMasters, _cfg.MaxMasters);
+        var live = new List<Task>();
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
             {
-                _stats.Connections++;
+                Stream conn;
+                try
+                {
+                    conn = await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Channels.ChannelClosedException)
+                {
+                    return;
+                }
+                catch (Exception ex) when (ex is Dnp3Exception or IOException or SystemException)
+                {
+                    // One master failing to arrive — a refused TLS handshake,
+                    // say — must not take down the masters already attached.
+                    _log.Log(Dnp3LogLevel.Warn, "accept failed", ("err", ex.Message));
+                    await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken)
+                        .ConfigureAwait(false);
+                    continue;
+                }
+
+                if (!slots.Wait(0, cancellationToken))
+                {
+                    // A master past the limit is turned away rather than left
+                    // to time out. Refusing it is a fact the operator can see
+                    // in a log and the master can see as a disconnection;
+                    // leaving the connection open and unserved looks to both
+                    // sides like an outstation that has gone mute.
+                    lock (_gate)
+                    {
+                        _stats.MastersRefused++;
+                    }
+
+                    _log.Log(
+                        Dnp3LogLevel.Warn,
+                        "refusing a master: the connection limit is reached",
+                        ("peer", Association.Describe(conn, channel)),
+                        ("limit", _cfg.MaxMasters));
+
+                    conn.Dispose();
+                    continue;
+                }
+
+                live.RemoveAll(t => t.IsCompleted);
+                live.Add(ServeAcceptedAsync(channel, conn, slots, cancellationToken));
             }
-
-            _log.Log(Dnp3LogLevel.Info, "connected", ("channel", channel.ToString()));
-
-            _stack.Reset();
+        }
+        finally
+        {
+            // The connections are cancelled with the session's token; this only
+            // waits for their loops to unwind so RunAsync does not return with
+            // masters still being served.
             try
             {
-                await ServeAsync(conn, cancellationToken).ConfigureAwait(false);
+                await Task.WhenAll(live).ConfigureAwait(false);
             }
-            finally
+            catch (Exception ex) when (ex is OperationCanceledException or Dnp3Exception or IOException)
             {
-                conn.Dispose();
-                _log.Log(Dnp3LogLevel.Info, "disconnected");
+                // Whatever went wrong has already been logged per connection.
+            }
+        }
+    }
+
+    /// <summary>Serves one accepted connection and frees its slot afterwards.</summary>
+    private async Task ServeAcceptedAsync(
+        IChannel channel,
+        Stream conn,
+        SemaphoreSlim slots,
+        CancellationToken cancellationToken)
+    {
+        // Yield first so the accept loop is back waiting on the listener rather
+        // than running this connection's opening turn.
+        await Task.Yield();
+
+        try
+        {
+            await ServeConnectionAsync(channel, conn, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // The session is stopping.
+        }
+        catch (Exception ex)
+        {
+            // Deliberately everything. This task is one master's conversation;
+            // whatever ends it badly must end that conversation and no other.
+            _log.Log(Dnp3LogLevel.Error, "connection failed", ("err", ex.Message));
+        }
+        finally
+        {
+            slots.Release();
+        }
+    }
+
+    /// <summary>Attaches a master, serves it, and detaches it.</summary>
+    private async Task ServeConnectionAsync(
+        IChannel channel,
+        Stream conn,
+        CancellationToken cancellationToken)
+    {
+        var a = Attach(channel, conn);
+        try
+        {
+            await ServeAsync(a, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Detach(a);
+            conn.Dispose();
+            a.Log.Log(Dnp3LogLevel.Info, "disconnected");
+        }
+    }
+
+    /// <summary>Builds the state for one master and registers it.</summary>
+    private Association Attach(IChannel channel, Stream conn)
+    {
+        var id = Interlocked.Increment(ref _nextAssocId);
+        var peer = Association.Describe(conn, channel);
+
+        var a = new Association
+        {
+            Id = id,
+            Connection = conn,
+            Peer = peer,
+            Events = new EventBuffer(_cfg.Events),
+            Log = new ScopedLogger(_log, ("conn", id), ("peer", peer)),
+            Stack = new ProtocolStack(new StackConfig
+            {
+                LocalAddr = _cfg.LocalAddr,
+                RemoteAddr = _cfg.RemoteAddr,
+                IsMaster = false,
+                UseConfirms = _cfg.UseLinkConfirms,
+                MaxRetries = _cfg.LinkRetries,
+                MaxRxFragment = _cfg.MaxRxFragment,
+            }),
+            RemoteAddr = _cfg.RemoteAddr,
+
+            // A master that attaches after a restart nobody has cleared yet has
+            // to be told about it too: its picture is as stale as everyone
+            // else's.
+            Iin = _deviceRestart ? Iin.DeviceRestart : Iin.None,
+        };
+
+        // Subscribing hands over whatever queued while nothing was attached, so
+        // a master that reconnects still gets the events it missed.
+        _db.Subscribe(a.Events);
+
+        int attached;
+        lock (_gate)
+        {
+            _assocs.Add(a);
+            attached = _assocs.Count;
+            _stats.Connections++;
+            if (attached > _stats.PeakMastersAttached)
+            {
+                _stats.PeakMastersAttached = attached;
+            }
+        }
+
+        a.Log.Log(Dnp3LogLevel.Info, "connected", ("masters", attached));
+        return a;
+    }
+
+    /// <summary>Unregisters a master and returns its queue if it was the last.</summary>
+    private void Detach(Association a)
+    {
+        lock (_gate)
+        {
+            _assocs.Remove(a);
+        }
+
+        _db.Unsubscribe(a.Events);
+    }
+
+    /// <summary>Applies queued database updates until the session stops.</summary>
+    /// <remarks>
+    /// It exists for the quiet times. While a master is being served the
+    /// association drains the queue itself before answering, which is what
+    /// makes an update that was queued before a request arrived visible to the
+    /// response to it.
+    /// </remarks>
+    private async Task PumpUpdatesAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (await _updates.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                DrainUpdates();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down.
+        }
+    }
+
+    /// <summary>Applies everything waiting on the update queue.</summary>
+    private void DrainUpdates()
+    {
+        // Under the drain lock rather than merely reading the queue: a request
+        // being answered has to know the earlier updates are applied, not just
+        // that somebody has taken them off the queue.
+        lock (_drainGate)
+        {
+            while (_updates.Reader.TryRead(out var fn))
+            {
+                try
+                {
+                    Apply(fn);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // A caller's update throwing must not stop the session
+                    // applying the rest of them.
+                    _log.Log(Dnp3LogLevel.Error, "update failed", ("err", ex.Message));
+                }
             }
         }
     }
 
     /// <summary>Runs one connection until it fails or the token is cancelled.</summary>
-    private async Task ServeAsync(Stream conn, CancellationToken cancellationToken)
+    private async Task ServeAsync(Association a, CancellationToken cancellationToken)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var ct = linked.Token;
 
-        // The read loop only moves octets. Everything that touches protocol
-        // state runs here, so the stack needs no locking and a response can
-        // never interleave with the processing of an inbound frame.
+        // The read loop only moves octets. Everything that touches this
+        // association's protocol state runs here, so its stack needs no locking
+        // and a response can never interleave with the processing of an inbound
+        // frame.
         var rx = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(8)
         {
             SingleWriter = true,
             SingleReader = true,
         });
 
-        var readTask = ReadIntoAsync(conn, rx.Writer, ct);
+        var readTask = ReadIntoAsync(a.Connection, rx.Writer, ct);
 
-        _connected = true;
-        _unsol.Reset();
+        a.Connected = true;
+        a.Unsol.Reset();
 
         Task<bool>? rxWait = null;
-        Task<bool>? updateWait = null;
 
         try
         {
@@ -442,8 +805,12 @@ public sealed partial class OutstationSession
             // and waiting for the first tick would let the master's own startup
             // sequence clear the restart indication first — leaving the
             // announcement carrying nothing worth announcing.
-            PollUnsolicited(_appl.Now());
-            await FlushAsync(conn, ct).ConfigureAwait(false);
+            using (_db.EnterScope())
+            {
+                PollUnsolicited(a, _appl.Now());
+            }
+
+            await FlushAsync(a, ct).ConfigureAwait(false);
 
             // The tick drives the confirm timeout, the select timeout and the
             // unsolicited hold time, so it has to be short relative to all
@@ -458,11 +825,9 @@ public sealed partial class OutstationSession
                 }
 
                 rxWait ??= rx.Reader.WaitToReadAsync(ct).AsTask();
-                updateWait ??= _updates.Reader.WaitToReadAsync(ct).AsTask();
 
                 var delay = Task.Delay(tick, ct);
-                var completed = await Task.WhenAny(rxWait, updateWait, delay, readTask)
-                    .ConfigureAwait(false);
+                var completed = await Task.WhenAny(rxWait, delay, readTask).ConfigureAwait(false);
 
                 if (ct.IsCancellationRequested)
                 {
@@ -474,40 +839,28 @@ public sealed partial class OutstationSession
                     return;
                 }
 
-                if (completed == updateWait)
-                {
-                    updateWait = null;
-                    while (_updates.Reader.TryRead(out var fn))
-                    {
-                        fn(_db);
-                    }
-                }
-                else if (completed == rxWait)
+                if (completed == rxWait)
                 {
                     rxWait = null;
-                    while (rx.Reader.TryRead(out var chunk))
+                    if (!Receive(a, rx.Reader))
                     {
-                        try
-                        {
-                            _stack!.Receive(_sink, chunk, r => Handle(r));
-                        }
-                        catch (Dnp3Exception ex)
-                        {
-                            _log.Log(Dnp3LogLevel.Warn, "receive failed", ("err", ex.Message));
-                            return;
-                        }
+                        return;
                     }
                 }
                 else
                 {
                     var now = _appl.Now();
-                    CheckLinkTimeout();
-                    CheckConfirmTimeout();
-                    CheckSelectTimeout(now);
-                    PollUnsolicited(now);
+                    using (_db.EnterScope())
+                    {
+                        ApplyPendingRestart(a);
+                        CheckLinkTimeout(a);
+                        CheckConfirmTimeout(a);
+                        CheckSelectTimeout(a, now);
+                        PollUnsolicited(a, now);
+                    }
                 }
 
-                await FlushAsync(conn, ct).ConfigureAwait(false);
+                await FlushAsync(a, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -516,7 +869,7 @@ public sealed partial class OutstationSession
         }
         finally
         {
-            _connected = false;
+            a.Connected = false;
             await linked.CancelAsync().ConfigureAwait(false);
             rx.Writer.TryComplete();
 
@@ -530,6 +883,58 @@ public sealed partial class OutstationSession
                 // Expected when the connection drops or the session stops.
             }
         }
+    }
+
+    /// <summary>
+    /// Feeds whatever the read loop has produced through the stack. Returns
+    /// false when the connection must be dropped.
+    /// </summary>
+    private bool Receive(Association a, ChannelReader<byte[]> reader)
+    {
+        // Updates queued before this request arrived are applied first: a
+        // master that polls after the application has reported a change must be
+        // told about the change, not about the state before it.
+        //
+        // Before the scope below, not inside it. Draining takes the drain lock
+        // and then the database's; doing it while already holding the database
+        // would be the reverse order, and two of these running at once would
+        // deadlock.
+        DrainUpdates();
+
+        // One scope around the whole batch: a request is answered from a
+        // database that is not being modified underneath it.
+        using var scope = _db.EnterScope();
+
+        while (reader.TryRead(out var chunk))
+        {
+            try
+            {
+                a.Stack.Receive(a.Sink, chunk, r => Handle(a, r));
+            }
+            catch (Dnp3Exception ex)
+            {
+                a.Log.Log(Dnp3LogLevel.Warn, "receive failed", ("err", ex.Message));
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Picks up a restart raised from outside this loop.</summary>
+    private void ApplyPendingRestart(Association a)
+    {
+        if (!a.RestartPending)
+        {
+            return;
+        }
+
+        a.RestartPending = false;
+        a.Iin = a.Iin.Set(Iin.DeviceRestart);
+        a.Sel.Clear();
+        a.Unsol.Reset();
+        a.AwaitingConfirm = false;
+        a.Log.Log(Dnp3LogLevel.Info, "device restarted; reporting it to this master");
     }
 
     /// <summary>Moves octets from the connection to the session loop.</summary>
@@ -559,23 +964,23 @@ public sealed partial class OutstationSession
     }
 
     /// <summary>Writes whatever the stack queued to the connection.</summary>
-    private async Task FlushAsync(Stream conn, CancellationToken cancellationToken)
+    private static async Task FlushAsync(Association a, CancellationToken cancellationToken)
     {
-        if (_sink.IsEmpty)
+        if (a.Sink.IsEmpty)
         {
             return;
         }
 
-        var pending = _sink.Pending.ToArray();
-        _sink.Clear();
-        await conn.WriteAsync(pending, cancellationToken).ConfigureAwait(false);
-        await conn.FlushAsync(cancellationToken).ConfigureAwait(false);
+        var pending = a.Sink.Pending.ToArray();
+        a.Sink.Clear();
+        await a.Connection.WriteAsync(pending, cancellationToken).ConfigureAwait(false);
+        await a.Connection.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Retransmits an unacknowledged link frame.</summary>
-    private void CheckLinkTimeout()
+    private void CheckLinkTimeout(Association a)
     {
-        if (!_stack!.Pending || _appl.Now() < _linkDeadline)
+        if (!a.Stack.Pending || _appl.Now() < a.LinkDeadline)
         {
             return;
         }
@@ -583,18 +988,18 @@ public sealed partial class OutstationSession
         bool failed;
         try
         {
-            failed = _stack.OnTimeout(_sink);
+            failed = a.Stack.OnTimeout(a.Sink);
         }
         catch (Dnp3Exception ex)
         {
-            _log.Log(Dnp3LogLevel.Warn, "link retransmission failed", ("err", ex.Message));
+            a.Log.Log(Dnp3LogLevel.Warn, "link retransmission failed", ("err", ex.Message));
             return;
         }
 
-        _linkDeadline = _appl.Now() + _cfg.LinkTimeout;
+        a.LinkDeadline = _appl.Now() + _cfg.LinkTimeout;
         if (failed)
         {
-            _log.Log(Dnp3LogLevel.Warn, "link layer gave up on a response");
+            a.Log.Log(Dnp3LogLevel.Warn, "link layer gave up on a response");
         }
     }
 
@@ -602,34 +1007,44 @@ public sealed partial class OutstationSession
     /// Returns selected events to the queue when the master never confirmed the
     /// response that carried them.
     /// </summary>
-    private void CheckConfirmTimeout()
+    private void CheckConfirmTimeout(Association a)
     {
-        if (!_awaitingConfirm || _appl.Now() < _confirmDeadline)
+        if (!a.AwaitingConfirm || _appl.Now() < a.ConfirmDeadline)
         {
             return;
         }
 
-        _awaitingConfirm = false;
-        var n = _db.Events?.Unselect() ?? 0;
+        a.AwaitingConfirm = false;
+        var n = a.Events.Unselect();
 
         lock (_gate)
         {
             _stats.ConfirmTimeouts++;
         }
 
-        _log.Log(
+        a.Log.Log(
             Dnp3LogLevel.Warn,
             "application confirm timed out; events requeued",
             ("events", n));
     }
 
     /// <summary>Dispatches one request fragment.</summary>
-    private void Handle(Received r)
+    private void Handle(Association a, Received r)
     {
+        // Before anything is answered: a restart raised a moment ago has to be
+        // reported in this response rather than waiting for the next tick, or a
+        // master that polls immediately after one is told the device is fine.
+        ApplyPendingRestart(a);
+
         lock (_gate)
         {
             _stats.RequestsReceived++;
         }
+
+        // Whatever address this master uses is where its unsolicited responses
+        // go from now on, whether or not the configuration guessed it right.
+        a.RemoteAddr = r.Source;
+        a.RemoteKnown = true;
 
         var status = FragmentParser.ParseFragment(null, r.Fragment, out var frag, out var error);
         if (status != AppParseStatus.Ok)
@@ -639,12 +1054,12 @@ public sealed partial class OutstationSession
                 _stats.MalformedRequests++;
             }
 
-            _log.Log(Dnp3LogLevel.Warn, "malformed request", ("err", error));
+            a.Log.Log(Dnp3LogLevel.Warn, "malformed request", ("err", error));
 
             // A fragment we cannot parse cannot be answered meaningfully: we do
             // not know its sequence number's validity or what it asked for. The
             // parameter-error indication rides on the next response instead.
-            _iin = _iin.Set(Iin.ParameterError);
+            a.Iin = a.Iin.Set(Iin.ParameterError);
             return;
         }
 
@@ -653,7 +1068,7 @@ public sealed partial class OutstationSession
             // A broadcast request is executed but never answered — every
             // outstation answering at once would collide. The next response
             // carries the broadcast indication instead.
-            _iin = _iin.Set(Iin.Broadcast);
+            a.Iin = a.Iin.Set(Iin.Broadcast);
         }
 
         switch (frag.Header.Func)
@@ -664,50 +1079,50 @@ public sealed partial class OutstationSession
                 // Confusing them would drop events the master never received.
                 if (frag.Header.Control.Uns)
                 {
-                    OnUnsolicitedConfirm(frag.Header);
+                    OnUnsolicitedConfirm(a, frag.Header);
                 }
                 else
                 {
-                    OnConfirm(frag.Header);
+                    OnConfirm(a, frag.Header);
                 }
 
                 return;
 
             case FuncCode.Read:
-                OnRead(r, frag);
+                OnRead(a, r, frag);
                 return;
 
             case FuncCode.Write:
-                OnWrite(r, frag);
+                OnWrite(a, r, frag);
                 return;
 
             case FuncCode.DelayMeasure:
-                OnDelayMeasure(r, frag);
+                OnDelayMeasure(a, r, frag);
                 return;
 
             case FuncCode.RecordCurrentTime:
-                OnRecordCurrentTime(r, frag);
+                OnRecordCurrentTime(a, r, frag);
                 return;
 
             case FuncCode.ColdRestart:
             case FuncCode.WarmRestart:
-                OnRestart(r, frag);
+                OnRestart(a, r, frag);
                 return;
 
             case FuncCode.EnableUnsolicited:
             case FuncCode.DisableUnsolicited:
-                OnUnsolicitedControl(r, frag);
+                OnUnsolicitedControl(a, r, frag);
                 return;
 
             case FuncCode.AssignClass:
-                OnAssignClass(r, frag);
+                OnAssignClass(a, r, frag);
                 return;
 
             case FuncCode.Select:
             case FuncCode.Operate:
             case FuncCode.DirectOperate:
             case FuncCode.DirectOperateNR:
-                OnCommand(r, frag);
+                OnCommand(a, r, frag);
                 return;
 
             case FuncCode.ImmedFreeze:
@@ -718,7 +1133,7 @@ public sealed partial class OutstationSession
                     return;
                 }
 
-                Respond(r, frag.Header, []);
+                Respond(a, r, frag.Header, []);
                 return;
 
             default:
@@ -727,43 +1142,43 @@ public sealed partial class OutstationSession
                     _stats.UnknownFunction++;
                 }
 
-                _iin = _iin.Set(Iin.NoFuncCodeSupport);
+                a.Iin = a.Iin.Set(Iin.NoFuncCodeSupport);
                 if (r.Broadcast)
                 {
                     return;
                 }
 
-                Respond(r, frag.Header, []);
+                Respond(a, r, frag.Header, []);
                 return;
         }
     }
 
     /// <summary>Clears the events the confirmed response carried.</summary>
-    private void OnConfirm(AppHeader h)
+    private void OnConfirm(Association a, AppHeader h)
     {
         lock (_gate)
         {
             _stats.ConfirmsReceived++;
         }
 
-        if (!_awaitingConfirm || h.Control.Seq != _confirmSeq)
+        if (!a.AwaitingConfirm || h.Control.Seq != a.ConfirmSeq)
         {
             // A confirm for a response we are not waiting on. Ignoring it is
             // right: acting on it would drop events the master never received.
-            _log.Log(
+            a.Log.Log(
                 Dnp3LogLevel.Debug,
                 "unexpected confirm",
-                ("seq", h.Control.Seq), ("awaiting", _awaitingConfirm));
+                ("seq", h.Control.Seq), ("awaiting", a.AwaitingConfirm));
             return;
         }
 
-        _awaitingConfirm = false;
-        var n = _db.Events?.Confirm() ?? 0;
-        _log.Log(Dnp3LogLevel.Debug, "events confirmed", ("count", n));
+        a.AwaitingConfirm = false;
+        var n = a.Events.Confirm();
+        a.Log.Log(Dnp3LogLevel.Debug, "events confirmed", ("count", n));
     }
 
     /// <summary>Answers a read request.</summary>
-    private void OnRead(Received r, Fragment frag)
+    private void OnRead(Association a, Received r, Fragment frag)
     {
         var ctx = new Context { Synchronized = _synchronized };
         var b = new ResponseBuilder(_cfg.MaxTxFragment, ctx);
@@ -788,7 +1203,7 @@ public sealed partial class OutstationSession
                     case 3:
                     case 4: // event classes 1, 2 and 3
                         var mask = (Class)((byte)Class.Class1 << (h.Variation - 2));
-                        selected.AddRange(_db.Events?.Select(mask, 512) ?? []);
+                        selected.AddRange(a.Events.Select(mask, 512));
                         break;
 
                     default:
@@ -802,9 +1217,9 @@ public sealed partial class OutstationSession
             {
                 // The second half of the LAN time-sync procedure: hand back the
                 // time the RECORD_CURRENT_TIME request arrived.
-                if (_recordedTime is not { } recorded)
+                if (a.RecordedTime is not { } recorded)
                 {
-                    _iin = _iin.Set(Iin.ParameterError);
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
                     continue;
                 }
 
@@ -824,7 +1239,7 @@ public sealed partial class OutstationSession
 
             if (!TryPointTypeForGroup(h.Group, out var pt))
             {
-                _iin = _iin.Set(Iin.ObjectUnknown);
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
                 continue;
             }
 
@@ -844,20 +1259,23 @@ public sealed partial class OutstationSession
             _writer.BuildEvents(b, selected);
         }
 
-        SendFragments(r, frag.Header, b.Done(), selected.Count > 0);
+        SendFragments(a, r, frag.Header, b.Done(), selected.Count > 0);
     }
 
     /// <summary>Handles the write function code.</summary>
-    private void OnWrite(Received r, Fragment frag)
+    private void OnWrite(Association a, Received r, Fragment frag)
     {
         foreach (var h in frag.Objects)
         {
             if (h.Group == 80 && h.Variation == 1)
             {
                 // A master clears DEVICE_RESTART by writing zero to index 7.
-                // This is the handshake that ends the restart sequence.
-                _iin = _iin.Clear(Iin.DeviceRestart);
-                _log.Log(Dnp3LogLevel.Debug, "device restart indication cleared by master");
+                // This is the handshake that ends the restart sequence — for
+                // this master. Another that has not re-baselined keeps its own
+                // indication until it does the same.
+                a.Iin = a.Iin.Clear(Iin.DeviceRestart);
+                _deviceRestart = false;
+                a.Log.Log(Dnp3LogLevel.Debug, "device restart indication cleared by master");
                 continue;
             }
 
@@ -873,21 +1291,21 @@ public sealed partial class OutstationSession
                 // measured rather than assumed.
                 if (!_appl.SupportsWriteTime())
                 {
-                    _iin = _iin.Set(Iin.NoFuncCodeSupport);
+                    a.Iin = a.Iin.Set(Iin.NoFuncCodeSupport);
                     continue;
                 }
 
-                if (_recordedTime is not { } reference)
+                if (a.RecordedTime is not { } reference)
                 {
                     // No RECORD_CURRENT_TIME preceded this, so there is no
                     // reference to correct against.
-                    _iin = _iin.Set(Iin.ParameterError);
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
                     continue;
                 }
 
                 if (h.Data.Length < CommandObjects.Time48Size)
                 {
-                    _iin = _iin.Set(Iin.ParameterError);
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
                     continue;
                 }
 
@@ -896,16 +1314,16 @@ public sealed partial class OutstationSession
                 if (_appl.WriteAbsoluteTime(recorded.Time + elapsed))
                 {
                     _synchronized = true;
-                    _iin = _iin.Clear(Iin.NeedTime);
-                    _recordedTime = null;
-                    _log.Log(
+                    a.Iin = a.Iin.Clear(Iin.NeedTime);
+                    a.RecordedTime = null;
+                    a.Log.Log(
                         Dnp3LogLevel.Debug,
                         "clock set by the recorded-time procedure",
                         ("recorded_at", recorded.Time), ("elapsed", elapsed));
                 }
                 else
                 {
-                    _iin = _iin.Set(Iin.ParameterError);
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
                 }
 
                 continue;
@@ -915,13 +1333,13 @@ public sealed partial class OutstationSession
             {
                 if (!_appl.SupportsWriteTime())
                 {
-                    _iin = _iin.Set(Iin.NoFuncCodeSupport);
+                    a.Iin = a.Iin.Set(Iin.NoFuncCodeSupport);
                     continue;
                 }
 
                 if (h.Data.Length < CommandObjects.Time48Size)
                 {
-                    _iin = _iin.Set(Iin.ParameterError);
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
                     continue;
                 }
 
@@ -929,12 +1347,12 @@ public sealed partial class OutstationSession
                 if (_appl.WriteAbsoluteTime(ts.Time))
                 {
                     _synchronized = true;
-                    _iin = _iin.Clear(Iin.NeedTime);
-                    _log.Log(Dnp3LogLevel.Debug, "clock set by master", ("time", ts.Time));
+                    a.Iin = a.Iin.Clear(Iin.NeedTime);
+                    a.Log.Log(Dnp3LogLevel.Debug, "clock set by master", ("time", ts.Time));
                 }
                 else
                 {
-                    _iin = _iin.Set(Iin.ParameterError);
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
                 }
 
                 continue;
@@ -942,11 +1360,11 @@ public sealed partial class OutstationSession
 
             if (h.Group == 34)
             {
-                WriteDeadbands(h);
+                WriteDeadbands(a, h);
                 continue;
             }
 
-            _iin = _iin.Set(Iin.ObjectUnknown);
+            a.Iin = a.Iin.Set(Iin.ObjectUnknown);
         }
 
         if (r.Broadcast)
@@ -954,26 +1372,28 @@ public sealed partial class OutstationSession
             return;
         }
 
-        Respond(r, frag.Header, []);
+        Respond(a, r, frag.Header, []);
     }
 
     /// <summary>Applies a group 34 analog deadband write.</summary>
     /// <remarks>
     /// A deadband is how a master tells an outstation how much a point must
     /// move before it is worth an event, which is the only lever it has over a
-    /// chattering analog short of dropping the point from its class.
+    /// chattering analog short of dropping the point from its class. It is a
+    /// property of the point rather than of the conversation, so a deadband one
+    /// master writes applies to what every master is told.
     /// </remarks>
-    private void WriteDeadbands(ObjectHeader h)
+    private void WriteDeadbands(Association a, ObjectHeader h)
     {
         if (!ObjectRegistry.TryLookup(GroupVar.GV(h.Group, h.Variation), out var d))
         {
-            _iin = _iin.Set(Iin.ObjectUnknown);
+            a.Iin = a.Iin.Set(Iin.ObjectUnknown);
             return;
         }
 
         if (!d.TrySizeOctets(out var size) || size == 0)
         {
-            _iin = _iin.Set(Iin.ObjectUnknown);
+            a.Iin = a.Iin.Set(Iin.ObjectUnknown);
             return;
         }
 
@@ -990,7 +1410,7 @@ public sealed partial class OutstationSession
         {
             if (off + prefixLen + size > data.Length)
             {
-                _iin = _iin.Set(Iin.ParameterError);
+                a.Iin = a.Iin.Set(Iin.ParameterError);
                 return;
             }
 
@@ -1006,13 +1426,13 @@ public sealed partial class OutstationSession
 
             if (!_db.TryGetAnalog(index, out _, out var cfg))
             {
-                _iin = _iin.Set(Iin.ParameterError);
+                a.Iin = a.Iin.Set(Iin.ParameterError);
                 continue;
             }
 
             cfg.Deadband = value;
             _db.Configure(PointType.Analog, index, cfg);
-            _log.Log(Dnp3LogLevel.Debug, "deadband written", ("index", index), ("value", value));
+            a.Log.Log(Dnp3LogLevel.Debug, "deadband written", ("index", index), ("value", value));
         }
     }
 
@@ -1029,7 +1449,7 @@ public sealed partial class OutstationSession
     /// Answers with the fine time delay, which a master uses to estimate the
     /// round trip before setting the clock.
     /// </summary>
-    private void OnDelayMeasure(Received r, Fragment frag)
+    private void OnDelayMeasure(Association a, Received r, Fragment frag)
     {
         var body = new List<byte>();
         ObjectHeaderCodec.AppendObjectHeader(body, new ObjectHeader
@@ -1041,7 +1461,7 @@ public sealed partial class OutstationSession
             Data = new byte[] { 0, 0 }, // no processing delay to declare
         });
 
-        Respond(r, frag.Header, [.. body]);
+        Respond(a, r, frag.Header, [.. body]);
     }
 
     /// <summary>Notes when the request arrived.</summary>
@@ -1051,7 +1471,9 @@ public sealed partial class OutstationSession
     /// procedure: the master sends it, the outstation records the arrival time,
     /// and the master then reads that time back as group 50 variation 3 to work
     /// out how long the message took to get there. An outstation that refuses
-    /// it leaves that master unable to set the clock at all.
+    /// it leaves that master unable to set the clock at all. The recorded time
+    /// belongs to the master that asked for it, so two masters running the
+    /// procedure at once do not overwrite each other's reference.
     /// </para>
     /// <para>
     /// The standard says to record the time the <em>first octet</em> arrived.
@@ -1061,38 +1483,52 @@ public sealed partial class OutstationSession
     /// right one to use anyway.
     /// </para>
     /// </remarks>
-    private void OnRecordCurrentTime(Received r, Fragment frag)
+    private void OnRecordCurrentTime(Association a, Received r, Fragment frag)
     {
-        _recordedTime = _appl.Now();
-        _log.Log(Dnp3LogLevel.Debug, "current time recorded", ("time", _recordedTime));
+        a.RecordedTime = _appl.Now();
+        a.Log.Log(Dnp3LogLevel.Debug, "current time recorded", ("time", a.RecordedTime));
 
         if (r.Broadcast)
         {
             return;
         }
 
-        Respond(r, frag.Header, []);
+        Respond(a, r, frag.Header, []);
     }
 
     /// <summary>
     /// Answers a restart request with how long the outstation expects to be
     /// unavailable.
     /// </summary>
-    private void OnRestart(Received r, Fragment frag)
+    /// <remarks>
+    /// A restart is the device restarting, not one conversation ending: every
+    /// other attached master is told about it too, because their event history
+    /// has gone with everyone else's.
+    /// </remarks>
+    private void OnRestart(Association a, Received r, Fragment frag)
     {
         TimeSpan d;
         if (frag.Header.Func == FuncCode.ColdRestart)
         {
             d = _appl.ColdRestart();
-            _db.Events?.Reset();
+            _db.ResetEvents();
         }
         else
         {
             d = _appl.WarmRestart();
         }
 
-        _iin = _iin.Set(Iin.DeviceRestart);
+        _deviceRestart = true;
         _synchronized = false;
+        a.Iin = a.Iin.Set(Iin.DeviceRestart);
+
+        foreach (var other in Attached())
+        {
+            if (!ReferenceEquals(other, a))
+            {
+                other.RestartPending = true;
+            }
+        }
 
         var ms = (long)d.TotalMilliseconds;
         if (ms > 0xFFFF)
@@ -1119,32 +1555,32 @@ public sealed partial class OutstationSession
             return;
         }
 
-        Respond(r, frag.Header, [.. body]);
+        Respond(a, r, frag.Header, [.. body]);
     }
 
     /// <summary>
     /// Records the enable or disable, answering truthfully that the request was
     /// understood.
     /// </summary>
-    private void OnUnsolicitedControl(Received r, Fragment frag)
+    private void OnUnsolicitedControl(Association a, Received r, Fragment frag)
     {
         var enable = frag.Header.Func == FuncCode.EnableUnsolicited;
         foreach (var h in frag.Objects)
         {
             if (h.Group != 60 || h.Variation is < 2 or > 4)
             {
-                _iin = _iin.Set(Iin.ObjectUnknown);
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
                 continue;
             }
 
             var cls = (Class)((byte)Class.Class1 << (h.Variation - 2));
             if (enable)
             {
-                _unsolClasses |= cls;
+                a.UnsolClasses |= cls;
             }
             else
             {
-                _unsolClasses &= ~cls;
+                a.UnsolClasses &= ~cls;
             }
         }
 
@@ -1153,11 +1589,11 @@ public sealed partial class OutstationSession
             return;
         }
 
-        Respond(r, frag.Header, []);
+        Respond(a, r, frag.Header, []);
     }
 
     /// <summary>Moves point types between event classes.</summary>
-    private void OnAssignClass(Received r, Fragment frag)
+    private void OnAssignClass(Association a, Received r, Fragment frag)
     {
         var cls = Class.None;
         foreach (var h in frag.Objects)
@@ -1180,7 +1616,7 @@ public sealed partial class OutstationSession
             }
             else
             {
-                _iin = _iin.Set(Iin.ObjectUnknown);
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
             }
         }
 
@@ -1189,12 +1625,12 @@ public sealed partial class OutstationSession
             return;
         }
 
-        Respond(r, frag.Header, []);
+        Respond(a, r, frag.Header, []);
     }
 
     /// <summary>Sends a single-fragment response carrying a body.</summary>
-    private void Respond(Received r, AppHeader req, byte[] body) =>
-        SendFragments(r, req, [body], false);
+    private void Respond(Association a, Received r, AppHeader req, byte[] body) =>
+        SendFragments(a, r, req, [body], false);
 
     /// <summary>
     /// Emits a response, splitting it across fragments as needed.
@@ -1204,7 +1640,12 @@ public sealed partial class OutstationSession
     /// events sets CON, because only a confirmation lets the outstation drop
     /// them.
     /// </remarks>
-    private void SendFragments(Received r, AppHeader req, List<byte[]> bodies, bool hasEvents)
+    private void SendFragments(
+        Association a,
+        Received r,
+        AppHeader req,
+        List<byte[]> bodies,
+        bool hasEvents)
     {
         if (r.Broadcast)
         {
@@ -1228,10 +1669,10 @@ public sealed partial class OutstationSession
                 Seq: req.Control.Seq);
 
             var frag = new List<byte>(AppConstants.ResponseHeaderSize + bodies[i].Length);
-            HeaderCodec.AppendHeader(frag, new AppHeader(ctrl, FuncCode.Response, CurrentIin()));
+            HeaderCodec.AppendHeader(frag, new AppHeader(ctrl, FuncCode.Response, CurrentIin(a)));
             frag.AddRange(bodies[i]);
 
-            _stack!.SendTo(_sink, r.Source, [.. frag]);
+            a.Stack.SendTo(a.Sink, r.Source, [.. frag]);
 
             lock (_gate)
             {
@@ -1240,9 +1681,9 @@ public sealed partial class OutstationSession
 
             if (needConfirm)
             {
-                _awaitingConfirm = true;
-                _confirmSeq = ctrl.Seq;
-                _confirmDeadline = _appl.Now() + _cfg.ConfirmTimeout;
+                a.AwaitingConfirm = true;
+                a.ConfirmSeq = ctrl.Seq;
+                a.ConfirmDeadline = _appl.Now() + _cfg.ConfirmTimeout;
             }
         }
 
@@ -1253,18 +1694,18 @@ public sealed partial class OutstationSession
 
         // The broadcast indication reports only the request that arrived by
         // broadcast, so it is cleared once reported.
-        _iin = _iin.Clear(Iin.Broadcast);
+        a.Iin = a.Iin.Clear(Iin.Broadcast);
     }
 
     /// <summary>
-    /// Assembles the indications to report, folding in the event state that
-    /// changes between responses.
+    /// Assembles the indications to report to one master, folding in the event
+    /// state that changes between responses.
     /// </summary>
-    private Iin CurrentIin()
+    private Iin CurrentIin(Association a)
     {
-        var iin = _iin;
+        var iin = a.Iin;
 
-        var classes = _db.Events?.Classes() ?? Class.None;
+        var classes = a.Events.Classes();
         if ((classes & Class.Class1) != 0)
         {
             iin = iin.Set(Iin.Class1Events);
@@ -1280,7 +1721,7 @@ public sealed partial class OutstationSession
             iin = iin.Set(Iin.Class3Events);
         }
 
-        if (_db.Events?.Overflowed == true)
+        if (a.Events.Overflowed)
         {
             iin = iin.Set(Iin.EventBufferOverflow);
         }

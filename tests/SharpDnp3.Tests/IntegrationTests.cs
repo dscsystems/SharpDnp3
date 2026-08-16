@@ -651,8 +651,13 @@ public class IntegrationTests
 
         db.UpdateAnalog(0, new Analog(100, Flags.Online, Now()));
 
-        // Drain whatever the first update produced.
+        // Drain whatever the first update produced, and wait for it to be gone
+        // rather than assuming it is. The scan returns when the response
+        // arrives; the events it carried are dropped only when the application
+        // confirmation that follows it is processed, which is a moment later.
         await pair.Master.ScanClassesAsync(Class.Class123);
+        await TestPair.WaitForAsync(
+            () => pair.Outstation.Events!.Total == 0, "the scanned events to be confirmed");
 
         var before = pair.Outstation.Events!.Total;
 

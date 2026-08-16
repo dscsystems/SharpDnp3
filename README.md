@@ -135,6 +135,7 @@ testing](#building-and-testing).
 | | |
 | --- | --- |
 | **Roles** | Master and outstation, both complete sessions with their own task scheduling |
+| **Multi-master** | One outstation session serving several concurrent masters, each with its own event queue, sequence numbers and reservations |
 | **Transports** | TCP client and server, TLS (mutually authenticated), UDP, serial, in-process pipe |
 | **Reads** | Integrity polls, class polls, range scans, periodic scans |
 | **Events** | Class 1/2/3 assignment, deadbands, confirmation-backed event buffer, unsolicited reporting |
@@ -143,8 +144,8 @@ testing](#building-and-testing).
 | **Objects** | Groups 1–4, 10–13, 20–23, 30–34, 40–43, 50–52, 60, 80, 110–111, generated from a declarative spec |
 | **Tooling** | Structured protocol decoder, four working command-line programs |
 
-Deliberately out of scope: Secure Authentication v5 (use TLS), file transfer,
-datasets, and serving several concurrent masters from one outstation session.
+Deliberately out of scope: Secure Authentication v5 (use TLS), file transfer and
+datasets.
 
 ---
 

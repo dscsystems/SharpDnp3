@@ -140,7 +140,21 @@ public sealed class Database
 
     private readonly EventBuffer? _events;
 
-    /// <summary>The event buffer this database raises events into.</summary>
+    /// <summary>
+    /// The buffers of the masters currently attached, replaced wholesale so a
+    /// reader never sees a half-built list.
+    /// </summary>
+    private EventBuffer[] _subscribers = [];
+
+    /// <summary>
+    /// The event queue used while no master is attached.
+    /// </summary>
+    /// <remarks>
+    /// Events do not stop happening because nobody is connected, and a master
+    /// that reconnects wants the ones it missed. They accumulate here and the
+    /// next master to attach takes them; while masters are attached this stays
+    /// empty and each of them holds its own queue instead.
+    /// </remarks>
     public EventBuffer? Events => _events;
 
     /// <summary>
@@ -148,6 +162,88 @@ public sealed class Database
     /// snapshot.
     /// </summary>
     private readonly Lock _gate = new();
+
+    /// <summary>
+    /// Takes the database's lock for a batch of related work.
+    /// </summary>
+    /// <remarks>
+    /// Every individual accessor locks already, so this is not about safety —
+    /// it is about a set of updates being visible together. A session serving
+    /// several masters builds each response inside this scope, so a master
+    /// cannot read a breaker as open while the alarm that went with it is still
+    /// half applied.
+    /// </remarks>
+    internal Lock.Scope EnterScope() => _gate.EnterScope();
+
+    /// <summary>Attaches a master's event buffer, handing it whatever is queued.</summary>
+    internal void Subscribe(EventBuffer buffer)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        lock (_gate)
+        {
+            var next = new EventBuffer[_subscribers.Length + 1];
+            _subscribers.CopyTo(next, 0);
+            next[^1] = buffer;
+            _subscribers = next;
+
+            // Whatever piled up while nothing was attached belongs to whoever
+            // attaches next. A master joining an outstation that already has
+            // one finds nothing here, which is right: it has just connected,
+            // and its integrity poll is what gives it the present state.
+            if (_events is null)
+            {
+                return;
+            }
+
+            var backlog = _events.Drain(out var overflowed);
+            if (backlog.Count > 0 || overflowed)
+            {
+                buffer.Seed(backlog, overflowed);
+            }
+        }
+    }
+
+    /// <summary>Detaches a master's event buffer.</summary>
+    /// <remarks>
+    /// The last one out puts its queue back, so events a master never got are
+    /// still there when it reconnects rather than being lost with its socket.
+    /// </remarks>
+    internal void Unsubscribe(EventBuffer buffer)
+    {
+        lock (_gate)
+        {
+            var next = new List<EventBuffer>(_subscribers.Length);
+            foreach (var b in _subscribers)
+            {
+                if (!ReferenceEquals(b, buffer))
+                {
+                    next.Add(b);
+                }
+            }
+
+            _subscribers = [.. next];
+
+            var queued = buffer.Drain(out var overflowed);
+            if (_subscribers.Length == 0 && _events is not null)
+            {
+                _events.Seed(queued, overflowed);
+            }
+        }
+    }
+
+    /// <summary>Empties every event queue, attached or not.</summary>
+    internal void ResetEvents()
+    {
+        lock (_gate)
+        {
+            _events?.Reset();
+            foreach (var b in _subscribers)
+            {
+                b.Reset();
+            }
+        }
+    }
 
     /// <summary>
     /// The variations used when a point's configuration does not name one.
@@ -556,15 +652,32 @@ public sealed class Database
     }
 
     /// <summary>Queues an event if the point is assigned to an event class.</summary>
+    /// <remarks>
+    /// Every attached master gets its own copy. Sharing one queue between them
+    /// would be worse than wasteful: selection and confirmation are per-master,
+    /// so the first master to poll would take the events and the second would
+    /// never learn they happened.
+    /// </remarks>
     private void Raise(PointConfig config, Event e)
     {
-        if (_events is null || config.Class == Class.None)
+        if (config.Class == Class.None)
         {
             return;
         }
 
         e.Class = config.Class;
-        _events.Add(e);
+
+        var subscribers = _subscribers;
+        if (subscribers.Length == 0)
+        {
+            _events?.Add(e);
+            return;
+        }
+
+        foreach (var b in subscribers)
+        {
+            b.Add(e);
+        }
     }
 
     // ---------- Reads ----------

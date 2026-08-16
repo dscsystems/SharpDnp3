@@ -86,10 +86,17 @@ TLS is mutually authenticated — all three files or none.
 | `-address N` | `10` | override the outstation link address |
 | `-master N` | `1` | override the master link address |
 | `-unsolicited` | off | push events without being polled |
+| `-max-masters N` | `1` | serve up to N masters at once, over TCP or TLS |
 | `-points` | | print the point list and exit |
 
 `-address` and `-master` override the configuration file, so one plant
 description can be started several times on different addresses.
+
+`-max-masters` above one makes the tool behave like an RTU with a control centre
+and an engineering workstation on it: one plant, one database, and a separate
+conversation per master. Each master holds its own event queue, so the event
+buffer's memory multiplies; a master arriving past the limit is disconnected and
+logged. It needs TCP or TLS — a serial line or a UDP socket has one peer.
 
 ### Fault injection (repeatable)
 

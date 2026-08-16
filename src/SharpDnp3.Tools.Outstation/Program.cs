@@ -32,6 +32,7 @@ string? configFile = null;
 ushort? addressOverride = null;
 ushort? masterOverride = null;
 var unsolicited = false;
+var maxMasters = 1;
 var printPoints = false;
 var verbose = false;
 var quiet = false;
@@ -56,6 +57,9 @@ for (var i = 0; i < args.Length; i++)
             break;
         case "-master" when i + 1 < args.Length:
             masterOverride = ushort.Parse(args[++i], CultureInfo.InvariantCulture);
+            break;
+        case "-max-masters" when i + 1 < args.Length:
+            maxMasters = int.Parse(args[++i], CultureInfo.InvariantCulture);
             break;
         case "-inject" when i + 1 < args.Length: injections.Add(args[++i]); break;
         case "-unsolicited": unsolicited = true; break;
@@ -112,6 +116,9 @@ var config = new OutstationConfig
     RemoteAddr = plant.Master,
     Database = plant.DatabaseConfig(),
     Events = new EventBufferConfig { MaxEvents = 5000 },
+    // Each master holds its own event queue, so this is also a multiplier on
+    // the memory the event buffer costs.
+    MaxMasters = maxMasters,
     Log = log,
     // A serial line has no framing of its own, so the link-layer handshake is
     // what makes it reliable. Over TCP the transport already guarantees order.
@@ -153,7 +160,12 @@ Console.Write(simulator.Describe());
 Console.WriteLine();
 Console.WriteLine(string.Format(
     CultureInfo.InvariantCulture,
-    "Outstation {0} listening for master {1} on {2}", plant.Address, plant.Master, channel));
+    "Outstation {0} listening for {1} on {2}",
+    plant.Address,
+    maxMasters > 1
+        ? string.Format(CultureInfo.InvariantCulture, "up to {0} masters", maxMasters)
+        : string.Format(CultureInfo.InvariantCulture, "master {0}", plant.Master),
+    channel));
 Console.WriteLine("Press Ctrl-C to stop.");
 
 var run = session.RunAsync(channel, cts.Token);
@@ -251,6 +263,8 @@ static void Usage() => Console.Error.Write(
       -address N          override the outstation link address
       -master N           override the master link address
       -unsolicited        push events without being polled
+      -max-masters N      serve up to N masters at once, over TCP or TLS
+                          (default 1; each holds its own event queue)
       -points             print the point list and exit
 
     Fault injection (repeatable):
@@ -266,6 +280,7 @@ static void Usage() => Console.Error.Write(
     Examples:
       dnp3-outstation
       dnp3-outstation -config substation.yaml -unsolicited -v
+      dnp3-outstation -max-masters 4
       dnp3-outstation -inject event-storm=500 -inject offline-every=30s
 
     """);

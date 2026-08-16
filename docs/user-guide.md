@@ -405,10 +405,11 @@ while (await timer.WaitForNextTickAsync(cts.Token))
 ### The rules that matter
 
 **Update through `Session.Update`, not through `Database` directly.** The database
-is not safe for concurrent use; `Update` runs your action on the session loop,
-which serialises it against the protocol. Touching `Database` directly is fine
-*before* `RunAsync` starts — that is where point configuration belongs — and a
-race afterwards.
+is not safe for concurrent use; `Update` runs your action holding the database's
+lock, which serialises it against the protocol, and applies it before any request
+that arrives after it is answered. Touching `Database` directly is fine *before*
+`RunAsync` starts — that is where point configuration belongs — and a race
+afterwards.
 
 **Batch related changes into one `Update`.** A breaker opening and its alarm
 asserting should be one call, so they become one consistent set of events rather
@@ -438,6 +439,65 @@ back. If the plant takes ten seconds to move, the honest answer is usually to
 return success on *accepting* the command and report the actual movement through
 the status point, which is what the example above does.
 
+### Serving several masters
+
+A control centre and an engineering workstation polling the same RTU is one
+outstation with two masters attached, not two outstations. Set `MaxMasters`:
+
+```csharp
+var outstation = new OutstationSession(new OutstationConfig
+{
+    LocalAddr = 10,
+    RemoteAddr = 1,
+    MaxMasters = 4,
+    Events = new EventBufferConfig { MaxEvents = 1000 },
+    Database = new DatabaseConfig { Binary = 8, Analog = 4, DefaultClass = Class.Class1 },
+});
+
+// A listening channel, because each accept has to be a different master.
+using var channel = new TcpServerChannel(":20000");
+await outstation.RunAsync(channel, cts.Token);
+```
+
+The session accepts up to that many connections and runs a conversation on each.
+What they share is the device: the point database, the clock, your
+`ICommandHandler`, your `IOutstationApplication`, and the counters in `Stats`.
+What each one keeps to itself is the conversation:
+
+| Per master | Why |
+| --- | --- |
+| The event queue | Selection and confirmation are per-master. One shared queue would let the first master to poll take the events and leave the second never knowing they happened. |
+| Application sequence numbers and confirm state | Two masters do not take turns. |
+| The select-before-operate reservation | A select from the control centre must not be operable from the workstation. |
+| Which classes are enabled for unsolicited reporting | Each master enables its own, and each response is addressed to that master's link address. |
+| The internal indications, including `DEVICE_RESTART` | Clearing the restart bit is a handshake with one master. One having re-baselined says nothing about another. |
+
+Four things to know before turning it on:
+
+- **`Events.MaxEvents` is charged per master.** Four masters at 1000 events is
+  4000 events of memory, not 1000. Size the two together.
+- **`Session.Events` means "the sole master's queue"** when one is attached, and
+  "the queue events accumulate in" when none is. With several attached there is
+  no single answer and it returns the empty unattached queue — read
+  `MastersAttached` before drawing conclusions from it.
+- **Requests are processed one at a time across all masters.** Your command
+  handler and application need no locking of their own, and a handler that
+  blocks stalls every master rather than one.
+- **A master arriving past the limit is disconnected immediately** and counted in
+  `Stats.MastersRefused`. Leaving it connected and unanswered would look like an
+  outstation that had gone mute.
+
+`RemoteAddr` stays useful with several masters: it is where an unsolicited
+response goes before that master has said anything. Once a master has sent a
+request the outstation answers and reports to whatever address that master
+actually uses, so solicited traffic is correct whatever `RemoteAddr` says.
+
+`RunAsync` throws `BadConfigException` if `MaxMasters` is above one and the
+channel is one that dials rather than accepts — a TCP client, serial, UDP or
+`Pipe`. Asking such a channel for a second connection gets a second connection to
+the same peer, so serving one master would be a silent downgrade of what you
+configured.
+
 ---
 
 ## Transports
@@ -449,7 +509,8 @@ given.
 // TCP client — a master dialling out.
 IChannel channel = new TcpClientChannel("10.0.0.5:20000", Retry.Default);
 
-// TCP server — an outstation listening. One master at a time.
+// TCP server — an outstation listening. One master at a time by default; see
+// "Serving several masters" for more.
 channel = new TcpServerChannel(":20000");
 
 // Serial. USB adapters disappear and come back; the session reconnects.
@@ -804,6 +865,19 @@ Wait for `master.Connected` before asserting on anything timing-sensitive.
 `MasterConfig.TimeProvider` takes a `FakeTimeProvider` when a test needs to drive
 timeouts without waiting for them.
 
+For several masters against one outstation, `PipeListener` is the in-memory
+equivalent of a listening socket:
+
+```csharp
+using var listener = new PipeListener();
+
+var outTask = outstation.RunAsync(listener.Server, cts.Token);   // MaxMasters > 1
+var firstTask = first.RunAsync(listener.Connect(), cts.Token);
+var secondTask = second.RunAsync(listener.Connect(), cts.Token);
+```
+
+Give each master a different `LocalAddr`, as they would have in the field.
+
 For a more demanding target, the outstation example simulates plant that behaves
 like plant and injects the faults that break masters:
 
@@ -927,6 +1001,7 @@ $ dotnet run --project src/SharpDnp3.Tools.Outstation                       # a 
 $ dotnet run --project src/SharpDnp3.Tools.Outstation -- -points            # print the point list and exit
 $ dotnet run --project src/SharpDnp3.Tools.Outstation -- -config substation.yaml
 $ dotnet run --project src/SharpDnp3.Tools.Outstation -- -inject event-storm=500
+$ dotnet run --project src/SharpDnp3.Tools.Outstation -- -max-masters 4         # serve four at once
 ```
 
 The points behave like plant: a breaker stays open once tripped and takes time to
@@ -1068,9 +1143,9 @@ started. Move it into `Session.Update`.
 - The API is not stable yet. Pin a version.
 - Nothing here is a certified conformance claim. Check that what you rely on is
   actually implemented before you depend on it in the field.
-- A `TcpServerChannel` outstation serves **one master at a time**. If two SCADA
-  systems poll the device, that is a session per connection and it is not
-  implemented.
+- A `TcpServerChannel` outstation serves **one master at a time** unless you set
+  `MaxMasters`. If two SCADA systems poll the device, set it, and size the event
+  buffer knowing each master holds its own.
 - Self-address (0xFFFC) is not supported. Broadcast is received and executed but
   never answered, as the standard requires.
 - Use TLS with mutual authentication for anything that leaves a locked cabinet.

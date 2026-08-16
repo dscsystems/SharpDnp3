@@ -123,14 +123,12 @@ public sealed class TcpClientChannel : IChannel
     public override string ToString() => "tcp-client " + _address;
 }
 
-/// <summary>
-/// A channel that accepts inbound connections on an address, serving one at a
-/// time.
-/// </summary>
+/// <summary>A channel that accepts inbound connections on an address.</summary>
 /// <remarks>
-/// An outstation that accepts one master at a time is the common field
-/// configuration; serving several concurrently needs a session per connection,
-/// which belongs above this layer.
+/// Each <see cref="ConnectAsync"/> accepts one master. A session that serves
+/// one master at a time calls it again after each disconnection; a session
+/// configured for several calls it again straight away, so the listener hands
+/// out as many peers as the session is willing to hold.
 /// </remarks>
 public sealed class TcpServerChannel : IChannel
 {
@@ -190,6 +188,9 @@ public sealed class TcpServerChannel : IChannel
     }
 
     /// <inheritdoc/>
+    public bool SupportsConcurrentConnections => true;
+
+    /// <inheritdoc/>
     public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
     {
         var listener = Listen();
@@ -223,7 +224,7 @@ public sealed class TcpServerChannel : IChannel
 /// The session closes the stream when a connection drops; without this the
 /// <see cref="TcpClient"/> wrapper would leak until finalization.
 /// </remarks>
-internal sealed class TcpConnectionStream : Stream
+internal sealed class TcpConnectionStream : Stream, IPeerEndpoint
 {
     private readonly TcpClient _client;
     private readonly NetworkStream _inner;
@@ -232,7 +233,26 @@ internal sealed class TcpConnectionStream : Stream
     {
         _client = client;
         _inner = client.GetStream();
+
+        // Read it once, here: a dropped socket no longer knows who it was
+        // connected to, and the log line that matters most is the one written
+        // when the connection ends.
+        try
+        {
+            Peer = client.Client.RemoteEndPoint?.ToString();
+        }
+        catch (SocketException)
+        {
+            Peer = null;
+        }
+        catch (ObjectDisposedException)
+        {
+            Peer = null;
+        }
     }
+
+    /// <inheritdoc/>
+    public string? Peer { get; }
 
     public override bool CanRead => _inner.CanRead;
 

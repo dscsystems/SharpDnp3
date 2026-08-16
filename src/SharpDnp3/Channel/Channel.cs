@@ -30,6 +30,32 @@ public interface IChannel : IDisposable
     /// Shuts the channel down; it will produce no more connections.
     /// </summary>
     void Close();
+
+    /// <summary>
+    /// Reports whether <see cref="ConnectAsync"/> may be called again while an
+    /// earlier connection is still in use.
+    /// </summary>
+    /// <remarks>
+    /// A listener says yes: each call accepts a different peer, so an outstation
+    /// can serve several masters at once. A channel that dials — TCP client,
+    /// serial, UDP — says no, because asking it for another connection does not
+    /// produce another peer, it produces a second connection to the same one.
+    /// An outstation configured for several masters refuses to run over a
+    /// channel that says no rather than quietly serving one.
+    /// </remarks>
+    bool SupportsConcurrentConnections => false;
+}
+
+/// <summary>Names the far end of a connection, for logging.</summary>
+/// <remarks>
+/// A session serving several masters at once needs something to tell them apart
+/// in the log beyond a counter, and the socket address is the only thing it
+/// knows about a peer before the first request arrives.
+/// </remarks>
+internal interface IPeerEndpoint
+{
+    /// <summary>A short description of the peer, or null when there is none.</summary>
+    string? Peer { get; }
 }
 
 /// <summary>
@@ -368,5 +394,139 @@ public static class Pipe
 
         public override string ToString() =>
             string.Format(CultureInfo.InvariantCulture, "pipe-{0}", side);
+    }
+}
+
+/// <summary>
+/// An in-memory listener that accepts any number of connections at once.
+/// </summary>
+/// <remarks>
+/// <see cref="Pipe"/> connects exactly two ends, which is all a single
+/// master-outstation pair needs. An outstation serving several masters needs a
+/// channel that behaves like a listening socket — one that hands out a
+/// different peer on every accept — and this is that, without a socket.
+/// </remarks>
+public sealed class PipeListener : IDisposable
+{
+    // Not SingleReader: the accept loop reads it, and so does the shutdown that
+    // disposes whatever is still queued.
+    private readonly Channel<Stream> _accepted = Channel.CreateUnbounded<Stream>();
+
+    private readonly Lock _gate = new();
+    private bool _closed;
+    private int _peers;
+
+    /// <summary>The listening end, which an outstation session runs over.</summary>
+    public IChannel Server { get; }
+
+    /// <summary>Creates a listener with nothing connected to it.</summary>
+    public PipeListener() => Server = new ServerEnd(this);
+
+    /// <summary>
+    /// Returns a channel for one more peer. Every connection it makes is a
+    /// separate connection to the listener, so a master running over it can
+    /// reconnect the way it would over a socket.
+    /// </summary>
+    public IChannel Connect() => new ClientEnd(this, Interlocked.Increment(ref _peers));
+
+    /// <inheritdoc/>
+    public void Dispose() => Close();
+
+    /// <remarks>
+    /// Only the ends nobody has accepted yet are disposed, the way a listening
+    /// socket being shut down closes its backlog and leaves the connections
+    /// already handed out to their owners. A session holding one ends it by
+    /// being cancelled.
+    /// </remarks>
+    private void Close()
+    {
+        lock (_gate)
+        {
+            if (_closed)
+            {
+                return;
+            }
+
+            _closed = true;
+        }
+
+        _accepted.Writer.TryComplete();
+        while (_accepted.Reader.TryRead(out var pending))
+        {
+            pending.Dispose();
+        }
+    }
+
+    /// <summary>Creates a connected pair and queues the listener's end.</summary>
+    private Stream Dial()
+    {
+        lock (_gate)
+        {
+            if (_closed)
+            {
+                throw new ChannelClosedException();
+            }
+
+            var (server, client) = DuplexStream.CreatePair();
+            if (!_accepted.Writer.TryWrite(server))
+            {
+                server.Dispose();
+                client.Dispose();
+                throw new ChannelClosedException();
+            }
+
+            return client;
+        }
+    }
+
+    private async Task<Stream> AcceptAsync(CancellationToken cancellationToken)
+    {
+        // WaitToReadAsync reports a closed listener by returning false rather
+        // than throwing, which is the same shape as a listening socket being
+        // shut down under an accept.
+        if (!await _accepted.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false) ||
+            !_accepted.Reader.TryRead(out var conn))
+        {
+            throw new ChannelClosedException();
+        }
+
+        return conn;
+    }
+
+    private sealed class ServerEnd(PipeListener owner) : IChannel
+    {
+        public bool SupportsConcurrentConnections => true;
+
+        public Task<Stream> ConnectAsync(CancellationToken cancellationToken) =>
+            owner.AcceptAsync(cancellationToken);
+
+        public void Close() => owner.Close();
+
+        public void Dispose() => Close();
+
+        public override string ToString() => "pipe-listener";
+    }
+
+    private sealed class ClientEnd(PipeListener owner, int id) : IChannel
+    {
+        private volatile bool _closed;
+
+        public Task<Stream> ConnectAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_closed)
+            {
+                throw new ChannelClosedException();
+            }
+
+            return Task.FromResult(owner.Dial());
+        }
+
+        public void Close() => _closed = true;
+
+        public void Dispose() => Close();
+
+        public override string ToString() =>
+            string.Format(CultureInfo.InvariantCulture, "pipe-peer-{0}", id);
     }
 }
