@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>SharpDnp3</RootNamespace>
+    <AssemblyName>SharpDnp3</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>SharpDnp3</PackageId>
+    <Title>SharpDnp3 — DNP3 (IEEE 1815-2012) master and outstation</Title>
+    <Description>A native C# implementation of DNP3 (IEEE Std 1815-2012), providing both master and outstation roles over TCP, TLS, UDP, serial and in-process pipes.</Description>
+    <PackageTags>dnp3;scada;ieee1815;protocol;master;outstation;substation;industrial</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/dscsystems/SharpDnp3</PackageProjectUrl>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IncludeSymbols>true</IncludeSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)../../README.md" Pack="true" PackagePath="/" Condition="Exists('$(MSBuildThisFileDirectory)../../README.md')" />
+    <None Include="$(MSBuildThisFileDirectory)../../LICENSE" Pack="true" PackagePath="/" Condition="Exists('$(MSBuildThisFileDirectory)../../LICENSE')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>
