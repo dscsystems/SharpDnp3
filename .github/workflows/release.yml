@@ -1,0 +1,344 @@
+name: Build and release
+
+# Builds the four command-line tools for every runtime identifier .NET 10
+# supports for console applications, and publishes a GitHub release whenever a
+# `v*` tag is pushed.
+#
+# All targets cross-compile from a single Linux runner: crossgen2 (ReadyToRun)
+# and the apphost are cross-targeting, and every runtime pack — including the
+# musl and arm ones — is a plain NuGet download. Running the matrix on three
+# operating systems would only make it slower.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp on a manual build (no release is published)'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the version once so every downstream job stamps the same string.
+  # ---------------------------------------------------------------------------
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      is_release: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ inputs.version || '0.0.0-dev' }}"
+          fi
+          # A hyphen means a SemVer pre-release label (1.2.0-rc.1, 0.9.0-beta).
+          if [[ "${version}" == *-* ]]; then prerelease=true; else prerelease=false; fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${version} (prerelease=${prerelease})"
+
+  # ---------------------------------------------------------------------------
+  # Nothing ships that has not built clean and passed the suite.
+  # ---------------------------------------------------------------------------
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Build.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Build
+        run: dotnet build SharpDnp3.sln -c Release
+
+      # The object table is generated from dnp3_objects.yaml and committed. If
+      # the two have drifted, the release would ship code nobody can regenerate.
+      - name: Verify the generated object table is in sync
+        if: runner.os == 'Linux'
+        run: dotnet run --project build/SharpDnp3.Generator -c Release --no-build -- -root . -check
+
+      - name: Test
+        run: dotnet test SharpDnp3.sln -c Release --no-build
+
+  # ---------------------------------------------------------------------------
+  # One self-contained tool bundle per runtime identifier.
+  #
+  # The four tools publish into a single directory so they share one copy of the
+  # runtime: ~82 MB for all four, against ~100 MB each if every tool carried its
+  # own. Self-contained means no .NET install is required on the target.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            archive: tar.gz
+          - rid: linux-arm64
+            archive: tar.gz
+          - rid: linux-arm
+            archive: tar.gz
+          - rid: linux-musl-x64
+            archive: tar.gz
+          - rid: linux-musl-arm64
+            archive: tar.gz
+          - rid: linux-musl-arm
+            archive: tar.gz
+          - rid: win-x64
+            archive: zip
+          - rid: win-arm64
+            archive: zip
+          - rid: win-x86
+            archive: zip
+          - rid: osx-x64
+            archive: tar.gz
+          - rid: osx-arm64
+            archive: tar.gz
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      RID: ${{ matrix.rid }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-publish-${{ matrix.rid }}-${{ hashFiles('**/*.csproj', 'Directory.Build.props') }}
+          restore-keys: |
+            nuget-publish-${{ matrix.rid }}-
+            nuget-Linux-
+
+      - name: Publish the tools
+        run: |
+          set -euo pipefail
+          stage="stage/SharpDnp3-${VERSION}-${RID}"
+          mkdir -p "${stage}"
+          if [[ "${RID}" == win-* ]]; then ext=".exe"; else ext=""; fi
+          for pair in Decode:dnp3-decode Master:dnp3-master \
+                      Outstation:dnp3-outstation Explorer:dnp3-explorer; do
+            tool="${pair%%:*}"
+            bin="${pair##*:}"
+            echo "::group::SharpDnp3.Tools.${tool} -> ${bin} (${RID})"
+            dotnet publish "src/SharpDnp3.Tools.${tool}/SharpDnp3.Tools.${tool}.csproj" \
+              -c Release \
+              -r "${RID}" \
+              --self-contained true \
+              -o "${stage}" \
+              -p:Version="${VERSION}" \
+              -p:SourceRevisionId="${GITHUB_SHA}" \
+              -p:ContinuousIntegrationBuild=true \
+              -p:PublishReadyToRun=true \
+              -p:DebugType=none \
+              -p:AllowedReferenceRelatedFileExtensions=none
+            # Ship the name the documentation uses. Only the native apphost is
+            # renamed: it carries the name of its managed dll internally, and
+            # runtimeconfig.json is resolved from that dll, not from the file
+            # name of the executable. Setting AssemblyName instead would flow
+            # into the referenced library project and rename SharpDnp3.dll too.
+            mv "${stage}/SharpDnp3.Tools.${tool}${ext}" "${stage}/${bin}${ext}"
+            echo "::endgroup::"
+          done
+          cp README.md LICENSE "${stage}/"
+
+      - name: Archive
+        run: |
+          set -euo pipefail
+          name="SharpDnp3-tools-${VERSION}-${RID}"
+          mkdir -p dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (cd stage && zip -q -r "../dist/${name}.zip" "SharpDnp3-${VERSION}-${RID}")
+          else
+            tar -czf "dist/${name}.tar.gz" -C stage "SharpDnp3-${VERSION}-${RID}"
+          fi
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.rid }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # The library as a NuGet package, with symbols.
+  # ---------------------------------------------------------------------------
+  pack:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-pack-${{ hashFiles('**/*.csproj', 'Directory.Build.props') }}
+          restore-keys: nuget-Linux-
+
+      - name: Pack
+        run: |
+          dotnet pack src/SharpDnp3/SharpDnp3.csproj \
+            -c Release \
+            -o dist \
+            -p:Version="${VERSION}" \
+            -p:SourceRevisionId="${GITHUB_SHA}" \
+            -p:ContinuousIntegrationBuild=true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-nuget
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Publish the release. Tags only — a manual run stops at the artifacts above.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [version, publish, pack]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum SharpDnp3-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          ## Downloads
+
+          Each `SharpDnp3-tools-*` archive holds all four command-line tools —
+          `SharpDnp3.Tools.Master`, `SharpDnp3.Tools.Outstation`,
+          `SharpDnp3.Tools.Decode` and `SharpDnp3.Tools.Explorer` — built
+          self-contained, so **no .NET runtime needs to be installed**. Pick the
+          archive matching your platform:
+
+          | Platform | Archive |
+          | --- | --- |
+          | Linux x64 (glibc) | `linux-x64.tar.gz` |
+          | Linux arm64 (glibc) | `linux-arm64.tar.gz` |
+          | Linux arm32 (glibc) | `linux-arm.tar.gz` |
+          | Alpine / musl x64 | `linux-musl-x64.tar.gz` |
+          | Alpine / musl arm64 | `linux-musl-arm64.tar.gz` |
+          | Alpine / musl arm32 | `linux-musl-arm.tar.gz` |
+          | Windows x64 | `win-x64.zip` |
+          | Windows arm64 | `win-arm64.zip` |
+          | Windows x86 | `win-x86.zip` |
+          | macOS Intel | `osx-x64.tar.gz` |
+          | macOS Apple silicon | `osx-arm64.tar.gz` |
+
+          Verify a download against `SHA256SUMS.txt`:
+
+          ```console
+          $ sha256sum -c SHA256SUMS.txt --ignore-missing
+          ```
+
+          macOS binaries are unsigned; clear the quarantine attribute after
+          extracting:
+
+          ```console
+          $ xattr -dr com.apple.quarantine SharpDnp3-*/
+          ```
+
+          ## Library
+
+          ```console
+          $ dotnet add package SharpDnp3
+          ```
+
+          The `.nupkg` and `.snupkg` are attached here as well.
+
+          ---
+          EOF
+
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "SharpDnp3 ${VERSION}" \
+            --notes-file notes.md \
+            --generate-notes \
+            ${{ needs.version.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            dist/*
+
+      # Opt-in: runs only once a NUGET_API_KEY secret exists on the repository.
+      # Without it the package is still attached to the release above.
+      - name: Push to nuget.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        if: ${{ needs.version.outputs.prerelease == 'false' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NUGET_API_KEY}" ]]; then
+            echo "NUGET_API_KEY is not set; skipping nuget.org push."
+            exit 0
+          fi
+          dotnet nuget push 'dist/*.nupkg' \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "${NUGET_API_KEY}" \
+            --skip-duplicate

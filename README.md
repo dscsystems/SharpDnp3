@@ -89,6 +89,47 @@ $ dotnet run --project src/SharpDnp3.Tools.Explorer -- -demo
 
 ---
 
+## Downloads
+
+The four command-line tools are built for every platform .NET 10 runs on and
+attached to each [release](https://github.com/dscsystems/SharpDnp3/releases).
+They are self-contained: **nothing needs to be installed, not even .NET.**
+
+| Platform | Archive |
+| --- | --- |
+| Linux x64 · arm64 · arm32 (glibc) | `SharpDnp3-tools-<version>-linux-{x64,arm64,arm}.tar.gz` |
+| Alpine and other musl systems | `SharpDnp3-tools-<version>-linux-musl-{x64,arm64,arm}.tar.gz` |
+| Windows x64 · arm64 · x86 | `SharpDnp3-tools-<version>-win-{x64,arm64,x86}.zip` |
+| macOS Apple silicon · Intel | `SharpDnp3-tools-<version>-osx-{arm64,x64}.tar.gz` |
+
+One archive holds all four tools — `dnp3-explorer`, `dnp3-master`,
+`dnp3-outstation` and `dnp3-decode` — sharing a single copy of the runtime:
+
+```console
+$ tar xzf SharpDnp3-tools-0.1.0-linux-x64.tar.gz
+$ cd SharpDnp3-0.1.0-linux-x64
+$ ./dnp3-outstation            # a simulated substation on :20000
+$ ./dnp3-explorer -host 127.0.0.1:20000
+```
+
+Every release also carries `SHA256SUMS.txt`:
+
+```console
+$ sha256sum -c SHA256SUMS.txt --ignore-missing
+```
+
+The macOS binaries are not signed or notarised, so Gatekeeper will refuse them
+until the quarantine attribute is cleared:
+
+```console
+$ xattr -dr com.apple.quarantine SharpDnp3-0.1.0-osx-arm64/
+```
+
+Building the tools yourself is `dotnet publish` away — see [building and
+testing](#building-and-testing).
+
+---
+
 ## What is implemented
 
 | | |
