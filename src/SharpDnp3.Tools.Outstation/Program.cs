@@ -130,7 +130,14 @@ var config = new OutstationConfig
         HoldTime = TimeSpan.FromMilliseconds(200),
         MaxEvents = 50,
     },
+    Files = BuildFileConfig(plant),
 };
+
+var attributes = plant.Device.ToAttributes();
+foreach (var attribute in attributes)
+{
+    config.Attributes.Add(attribute);
+}
 
 var commands = new SimulatedCommandHandler(simulator);
 var session = new OutstationSession(config, null, commands);
@@ -157,6 +164,9 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 Console.Write(simulator.Describe());
+Console.WriteLine();
+Console.Write(DeviceConfig.Describe(attributes));
+Console.WriteLine(DescribeFiles(config.Files));
 Console.WriteLine();
 Console.WriteLine(string.Format(
     CultureInfo.InvariantCulture,
@@ -284,6 +294,55 @@ static void Usage() => Console.Error.Write(
       dnp3-outstation -inject event-storm=500 -inject offline-every=30s
 
     """);
+
+// Builds the file transfer configuration.
+//
+// A directory named in the configuration is served as itself — and only itself:
+// the handler is rooted, so a master cannot climb out of it. With none named,
+// the device serves a small filesystem synthesised in memory, so file transfer
+// can be exercised without preparing anything first.
+static SharpDnp3.Outstation.FileConfig BuildFileConfig(PlantConfig plant)
+{
+    var files = plant.Files;
+    if (files.Disabled)
+    {
+        // No handler at all: the outstation answers the file function codes the
+        // way a device that does not implement them does.
+        return new SharpDnp3.Outstation.FileConfig();
+    }
+
+    SharpDnp3.Outstation.IFileHandler handler =
+        string.IsNullOrWhiteSpace(files.Directory)
+            ? new MemoryFileHandler(plant, plant.Device, files.ReadOnly)
+            : new SharpDnp3.Outstation.DirectoryFileHandler(files.Directory)
+            {
+                ReadOnly = files.ReadOnly,
+            };
+
+    return new SharpDnp3.Outstation.FileConfig
+    {
+        Handler = handler,
+        MaxBlockSize = files.BlockSize,
+        Timeout = files.Timeout,
+    };
+}
+
+// Says what a master will find if it asks for a file.
+static string DescribeFiles(SharpDnp3.Outstation.FileConfig files)
+{
+    if (files.Handler is null)
+    {
+        return "  File transfer: disabled — the file function codes are refused";
+    }
+
+    var what = files.Handler is MemoryFileHandler
+        ? "a simulated filesystem in memory"
+        : "a real directory";
+
+    return string.Format(
+        System.Globalization.CultureInfo.InvariantCulture,
+        "  File transfer: {0}, blocks up to {1} octets", what, files.MaxBlockSize);
+}
 
 namespace SharpDnp3.Tools.Outstation
 {

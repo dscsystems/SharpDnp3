@@ -89,6 +89,60 @@ internal sealed class Association
     public DateTimeOffset LinkDeadline;
 
     /// <summary>
+    /// The fragments still to send for a response that spans more than one.
+    /// </summary>
+    /// <remarks>
+    /// Only one is ever truly in flight at a time, on purpose: every fragment
+    /// in the response shares the request's own sequence number, the only field
+    /// a confirm is matched against, so a confirm for the first fragment cannot
+    /// be told apart from one for a later one unless the outstation never has
+    /// more than one outstanding.
+    /// </remarks>
+    public List<byte[]>? PendingBodies;
+
+    /// <summary>The index of the next fragment to go out.</summary>
+    public int PendingIndex;
+
+    /// <summary>The link address the response in progress is addressed to.</summary>
+    public ushort PendingDest;
+
+    /// <summary>The sequence number every fragment of the response carries.</summary>
+    public byte PendingSeq;
+
+    /// <summary>
+    /// Whether the response carries events at all, which decides whether its
+    /// last fragment needs a confirmation of its own.
+    /// </summary>
+    public bool PendingHasEvents;
+
+    /// <summary>
+    /// Set once <see cref="LastReqSource"/> and its companions describe a real
+    /// request.
+    /// </summary>
+    /// <remarks>
+    /// A master retransmits a request whenever it does not see the response,
+    /// reusing the sequence number precisely so the outstation can recognise
+    /// the repeat; answering it from the stored response rather than running it
+    /// again is what keeps one operator action from operating a point twice.
+    /// </remarks>
+    public bool LastReqValid;
+
+    /// <summary>The link address the last acted-on request came from.</summary>
+    public ushort LastReqSource;
+
+    /// <summary>The sequence number of the last acted-on request.</summary>
+    public byte LastReqSeq;
+
+    /// <summary>The octets of the last acted-on request, compared verbatim.</summary>
+    public byte[]? LastReqFrag;
+
+    /// <summary>The fragments of the response that request produced.</summary>
+    public List<byte[]>? LastRespBodies;
+
+    /// <summary>Whether that response carried events.</summary>
+    public bool LastRespEvents;
+
+    /// <summary>
     /// This master's select-before-operate reservation. Keeping it private to
     /// the association is what stops one master operating on another's select.
     /// </summary>

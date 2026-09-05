@@ -49,8 +49,16 @@ public static class Peers
             return null;
         }
 
+        // The .exe suffix is added on Windows, where a binary built by `go
+        // build` carries one and the name a test asks for does not.
         var path = Path.Combine(dir, name);
-        return File.Exists(path) ? path : null;
+        if (File.Exists(path))
+        {
+            return path;
+        }
+
+        var windows = path + ".exe";
+        return File.Exists(windows) ? windows : null;
     }
 
     /// <summary>Returns a TCP port nothing is listening on.</summary>
@@ -107,6 +115,37 @@ public sealed class PeerProcess : IAsyncDisposable
         {
             target.AppendLine(line);
         }
+    }
+
+    /// <summary>
+    /// Runs a peer to completion and returns everything it wrote, on both
+    /// streams.
+    /// </summary>
+    /// <remarks>
+    /// It is for the peer's one-shot subcommands — read these attributes, list
+    /// that directory — where the interesting thing is what the tool printed
+    /// rather than that it kept running. Both streams are returned together
+    /// because a tool that reports a failure on standard error and nothing on
+    /// standard output would otherwise look like a silent success.
+    /// </remarks>
+    public static async Task<string> RunToCompletionAsync(
+        string path, TimeSpan timeout, params string[] arguments)
+    {
+        await using var peer = new PeerProcess(path, arguments);
+
+        using var cts = new CancellationTokenSource(timeout);
+        try
+        {
+            await peer._process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw new TimeoutException(
+                $"{Path.GetFileName(path)} did not finish within {timeout}: " +
+                peer.StandardError);
+        }
+
+        return peer.StandardOutput + peer.StandardError;
     }
 
     /// <summary>Everything the peer has written to standard output.</summary>

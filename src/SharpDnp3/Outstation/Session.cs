@@ -89,6 +89,26 @@ public sealed class OutstationConfig
     public UnsolicitedConfig Unsolicited { get; set; } = new();
 
     /// <summary>
+    /// What this device says about itself when a master reads group 0.
+    /// </summary>
+    /// <remarks>
+    /// The session derives the point counts and fragment sizes on its own, so
+    /// they cannot drift from the database they describe. What belongs here is
+    /// everything only the application can know: the vendor, the model, the
+    /// serial number, the location. An entry whose set and variation match a
+    /// derived one replaces it.
+    /// </remarks>
+    public IList<DeviceAttribute> Attributes { get; } = [];
+
+    /// <summary>Parameterises file transfer.</summary>
+    /// <remarks>
+    /// It is off until <see cref="FileConfig.Handler"/> is set: handing a
+    /// master a path into the device's filesystem is authority no outstation
+    /// should grant by default.
+    /// </remarks>
+    public FileConfig Files { get; set; } = new();
+
+    /// <summary>
     /// Enables link-layer confirmation, normally off over TCP.
     /// </summary>
     public bool UseLinkConfirms { get; set; }
@@ -138,6 +158,7 @@ public sealed class OutstationConfig
         }
 
         Unsolicited.ApplyDefaults();
+        Files.ApplyDefaults();
         Log ??= NullDnp3Logger.Instance;
     }
 }
@@ -218,8 +239,45 @@ public record struct OutstationStats
     /// <summary>Requests carrying a function code we do not implement.</summary>
     public ulong UnknownFunction;
 
+    /// <summary>
+    /// Requests recognised as a retransmission and answered from the stored
+    /// response rather than executed again.
+    /// </summary>
+    public ulong RepeatedRequests;
+
+    /// <summary>
+    /// Fragments discarded for not carrying both FIR and FIN, so not being a
+    /// complete request.
+    /// </summary>
+    public ulong IncompleteRequests;
+
     /// <summary>Requests that would not parse.</summary>
     public ulong MalformedRequests;
+
+    /// <summary>Group 0 device attribute reads answered.</summary>
+    public ulong AttributesRead;
+
+    /// <summary>File transfers opened.</summary>
+    public ulong FilesOpened;
+
+    /// <summary>File blocks sent to a master reading a file.</summary>
+    public ulong FileBlocksSent;
+
+    /// <summary>File blocks accepted from a master writing one.</summary>
+    public ulong FileBlocksReceived;
+
+    /// <summary>
+    /// File operations refused with a status code — a missing file, a denied
+    /// write — which is a configuration problem far more often than a protocol
+    /// one.
+    /// </summary>
+    public ulong FileErrors;
+
+    /// <summary>Transfers closed because the master went quiet.</summary>
+    public ulong FileTimeouts;
+
+    /// <summary>Transfers the master abandoned.</summary>
+    public ulong FilesAborted;
 
     /// <summary>Connections established.</summary>
     public ulong Connections;
@@ -293,6 +351,12 @@ public sealed partial class OutstationSession
     /// <summary>Executes the controls themselves.</summary>
     private readonly ICommandHandler _cmds;
 
+    /// <summary>
+    /// What this device answers a group 0 read with, assembled once at
+    /// construction because neither half of it changes.
+    /// </summary>
+    private readonly Dictionary<AttributeKey, DeviceAttribute> _attributes;
+
     /// <remarks>
     /// Several readers, because every association drains it before answering a
     /// request as well as the pump draining it while the session is idle.
@@ -332,6 +396,8 @@ public sealed partial class OutstationSession
         _cfg = config;
         _appl = application ?? new NopApplication();
         _cmds = commandHandler ?? new RejectingCommandHandler();
+
+        _attributes = BuildAttributes(config);
 
         var events = new EventBuffer(config.Events);
         _db = new Database(config.Database, events);
@@ -841,8 +907,22 @@ public sealed partial class OutstationSession
 
                 if (completed == rxWait)
                 {
+                    // A false result means the read loop has completed the
+                    // channel, which it does only on end of stream: the master
+                    // has gone. Checking it is what ends this connection —
+                    // waiting on the read task alone is not enough, because
+                    // once the channel is complete this wait returns
+                    // immediately every time round and the loop would spin
+                    // without ever noticing.
+                    var more = await rxWait.ConfigureAwait(false);
                     rxWait = null;
+
                     if (!Receive(a, rx.Reader))
+                    {
+                        return;
+                    }
+
+                    if (!more)
                     {
                         return;
                     }
@@ -856,6 +936,7 @@ public sealed partial class OutstationSession
                         CheckLinkTimeout(a);
                         CheckConfirmTimeout(a);
                         CheckSelectTimeout(a, now);
+                        CheckFileTimeout(now);
                         PollUnsolicited(a, now);
                     }
                 }
@@ -870,6 +951,12 @@ public sealed partial class OutstationSession
         finally
         {
             a.Connected = false;
+
+            // A transfer belongs to the connection it started on: the master
+            // that opened it cannot come back to the same handle, and holding
+            // the file open would deny the next one.
+            TryCloseFile();
+
             await linked.CancelAsync().ConfigureAwait(false);
             rx.Writer.TryComplete();
 
@@ -916,6 +1003,23 @@ public sealed partial class OutstationSession
                 a.Log.Log(Dnp3LogLevel.Warn, "receive failed", ("err", ex.Message));
                 return false;
             }
+        }
+
+        // A link-layer acknowledgement in that batch may have freed the stack
+        // for the next fragment of a response in progress. Nothing else would
+        // notice: the confirm path drives the application-layer pacing, but the
+        // link's own is only ever released here.
+        try
+        {
+            AdvanceResponse(a);
+        }
+        catch (Dnp3Exception ex)
+        {
+            a.Log.Log(
+                Dnp3LogLevel.Warn,
+                "sending a queued response fragment failed",
+                ("err", ex.Message));
+            return false;
         }
 
         return true;
@@ -1015,6 +1119,15 @@ public sealed partial class OutstationSession
         }
 
         a.AwaitingConfirm = false;
+
+        // The master's silence on one fragment means it cannot be paced through
+        // the rest of the response either, so the whole thing is abandoned
+        // rather than pressing on: the events it carried, wherever in the
+        // series they actually landed, go back in the queue for the master's
+        // next poll.
+        a.PendingBodies = null;
+        a.PendingIndex = 0;
+
         var n = a.Events.Unselect();
 
         lock (_gate)
@@ -1063,12 +1176,93 @@ public sealed partial class OutstationSession
             return;
         }
 
+        // Only a fragment carrying both FIR and FIN is a complete request. A
+        // multi-fragment request is not something this outstation reassembles,
+        // and a fragment with FIR clear is a continuation of a series whose
+        // beginning it never saw — acting on either means acting on a request
+        // it cannot know the whole of, which for a control means operating a
+        // point on the strength of half a message.
+        if (!frag.Header.Control.Fir || !frag.Header.Control.Fin)
+        {
+            lock (_gate)
+            {
+                _stats.IncompleteRequests++;
+            }
+
+            a.Log.Log(
+                Dnp3LogLevel.Warn,
+                "discarding a fragment that is not a complete request",
+                ("fir", frag.Header.Control.Fir),
+                ("fin", frag.Header.Control.Fin),
+                ("seq", frag.Header.Control.Seq));
+
+            // As with a fragment we cannot parse: there is nothing meaningful
+            // to answer, so the indication rides on the next response instead.
+            a.Iin = a.Iin.Set(Iin.ParameterError);
+            return;
+        }
+
+        // A confirm is an acknowledgement of our own response, not a request:
+        // it has its own sequence space and nothing to replay, so it is
+        // dispatched without going near the repeat-detection below.
+        if (frag.Header.Func != FuncCode.Confirm)
+        {
+            if (IsRepeatRequest(a, r, frag))
+            {
+                lock (_gate)
+                {
+                    _stats.RepeatedRequests++;
+                }
+
+                a.Log.Log(
+                    Dnp3LogLevel.Debug,
+                    "repeated request; re-sending the previous response",
+                    ("seq", frag.Header.Control.Seq));
+                ReplayResponse(a, r, frag.Header);
+                return;
+            }
+
+            RememberRequest(a, r, frag);
+        }
+
         if (r.Broadcast)
         {
             // A broadcast request is executed but never answered — every
             // outstation answering at once would collide. The next response
             // carries the broadcast indication instead.
             a.Iin = a.Iin.Set(Iin.Broadcast);
+        }
+
+        // A request whose function code is meaningless without objects asked
+        // for nothing, which is not the same as having nothing to do. Answering
+        // it with an empty success would tell the master its request was
+        // carried out: for a control, that its point was operated.
+        if (frag.Header.Func.RequiresObjects() && frag.Objects.Count == 0)
+        {
+            lock (_gate)
+            {
+                _stats.MalformedRequests++;
+            }
+
+            a.Log.Log(
+                Dnp3LogLevel.Warn,
+                "request carried no objects but requires them",
+                ("func", frag.Header.Func.ToDisplayString()),
+                ("seq", frag.Header.Control.Seq));
+
+            a.Iin = a.Iin.Set(Iin.ParameterError);
+            if (frag.Header.Func.NoReply() || r.Broadcast)
+            {
+                // Nothing to answer to; the indication rides on the next
+                // response.
+                return;
+            }
+
+            // Unlike a fragment we cannot parse, this one has a valid header
+            // and a sequence number to answer on, and the master is waiting: it
+            // gets a null response carrying the error rather than silence.
+            Respond(a, r, frag.Header, []);
+            return;
         }
 
         switch (frag.Header.Func)
@@ -1102,6 +1296,26 @@ public sealed partial class OutstationSession
 
             case FuncCode.RecordCurrentTime:
                 OnRecordCurrentTime(a, r, frag);
+                return;
+
+            case FuncCode.OpenFile:
+                OnOpenFile(a, r, frag);
+                return;
+
+            case FuncCode.CloseFile:
+                OnCloseFile(a, r, frag);
+                return;
+
+            case FuncCode.DeleteFile:
+                OnDeleteFile(a, r, frag);
+                return;
+
+            case FuncCode.GetFileInfo:
+                OnGetFileInfo(a, r, frag);
+                return;
+
+            case FuncCode.AbortFile:
+                OnAbortFile(a, r, frag);
                 return;
 
             case FuncCode.ColdRestart:
@@ -1153,7 +1367,16 @@ public sealed partial class OutstationSession
         }
     }
 
-    /// <summary>Clears the events the confirmed response carried.</summary>
+    /// <summary>Clears the wait on the fragment just confirmed.</summary>
+    /// <remarks>
+    /// It does not touch the event buffer: a multi-fragment response may still
+    /// have fragments left to send, sharing this same sequence number, so this
+    /// confirm cannot be told apart from one for a later fragment. The events
+    /// are only actually cleared once the whole response is done — see
+    /// <see cref="FinishResponse"/>, reached through <see cref="AdvanceResponse"/>
+    /// once every fragment has both gone out and, where it needed one, been
+    /// confirmed.
+    /// </remarks>
     private void OnConfirm(Association a, AppHeader h)
     {
         lock (_gate)
@@ -1173,13 +1396,34 @@ public sealed partial class OutstationSession
         }
 
         a.AwaitingConfirm = false;
-        var n = a.Events.Confirm();
-        a.Log.Log(Dnp3LogLevel.Debug, "events confirmed", ("count", n));
+
+        // The confirmation released the pacing: whatever is left of the
+        // response can now go out, and if nothing is left this closes it.
+        AdvanceResponse(a);
     }
 
     /// <summary>Answers a read request.</summary>
     private void OnRead(Association a, Received r, Fragment frag)
     {
+        // A group 0 read is answered on its own. The attributes are not
+        // measurements and share none of the machinery below: each carries its
+        // own header, because for group 0 the variation is the attribute's
+        // identity rather than an encoding of a point.
+        if (TryAttributeHeader(frag, out var attributeHeader))
+        {
+            OnAttributeRead(a, r, frag, attributeHeader);
+            return;
+        }
+
+        // A group 70 read is not a read of measurements either: it asks for the
+        // next block of a file already open, addressed by handle rather than by
+        // index.
+        if (TryFileObject(frag, out var fileHeader))
+        {
+            OnFileRead(a, r, frag, fileHeader);
+            return;
+        }
+
         var ctx = new Context { Synchronized = _synchronized };
         var b = new ResponseBuilder(_cfg.MaxTxFragment, ctx);
 
@@ -1265,6 +1509,14 @@ public sealed partial class OutstationSession
     /// <summary>Handles the write function code.</summary>
     private void OnWrite(Association a, Received r, Fragment frag)
     {
+        // A group 70 write carries a block of a file being written, which
+        // shares nothing with the point writes below.
+        if (TryFileObject(frag, out var fileHeader))
+        {
+            OnFileWrite(a, r, frag, fileHeader);
+            return;
+        }
+
         foreach (var h in frag.Objects)
         {
             if (h.Group == 80 && h.Variation == 1)
@@ -1633,12 +1885,18 @@ public sealed partial class OutstationSession
         SendFragments(a, r, req, [body], false);
 
     /// <summary>
-    /// Emits a response, splitting it across fragments as needed.
+    /// Starts a response, splitting it across fragments as needed, and sends as
+    /// much of it as the link and the master's pacing allow right now.
     /// </summary>
     /// <remarks>
+    /// The rest, if any, is queued and driven forward by
+    /// <see cref="AdvanceResponse"/> as each fragment's acknowledgement arrives
+    /// — see <see cref="Association.PendingBodies"/>.
+    /// <para>
     /// Every fragment but the last carries FIN clear. A fragment carrying
     /// events sets CON, because only a confirmation lets the outstation drop
     /// them.
+    /// </para>
     /// </remarks>
     private void SendFragments(
         Association a,
@@ -1652,39 +1910,130 @@ public sealed partial class OutstationSession
             return;
         }
 
-        for (var i = 0; i < bodies.Count; i++)
+        if (a.PendingBodies is { } queued && a.PendingIndex < queued.Count)
         {
-            var last = i == bodies.Count - 1;
-
-            // Intermediate fragments must be confirmed or the master cannot
-            // pace the series; the final one only needs it when it carries
-            // events.
-            var needConfirm = !last || hasEvents;
-
-            var ctrl = new AppControl(
-                Fir: i == 0,
-                Fin: last,
-                Con: needConfirm,
-                Uns: false,
-                Seq: req.Control.Seq);
-
-            var frag = new List<byte>(AppConstants.ResponseHeaderSize + bodies[i].Length);
-            HeaderCodec.AppendHeader(frag, new AppHeader(ctrl, FuncCode.Response, CurrentIin(a)));
-            frag.AddRange(bodies[i]);
-
-            a.Stack.SendTo(a.Sink, r.Source, [.. frag]);
-
-            lock (_gate)
+            // A well-behaved master confirms (or lets confirm time out) before
+            // asking anything else, so this should not happen; abandon the
+            // response still in flight rather than silently losing track of
+            // whatever events it was holding.
+            a.Log.Log(Dnp3LogLevel.Warn, "a new response is replacing one still in flight");
+            if (a.AwaitingConfirm)
             {
-                _stats.FragmentsSent++;
+                a.AwaitingConfirm = false;
+                a.Events.Unselect();
             }
+        }
 
-            if (needConfirm)
-            {
-                a.AwaitingConfirm = true;
-                a.ConfirmSeq = ctrl.Seq;
-                a.ConfirmDeadline = _appl.Now() + _cfg.ConfirmTimeout;
-            }
+        a.PendingBodies = bodies;
+        a.PendingIndex = 0;
+        a.PendingDest = r.Source;
+        a.PendingSeq = req.Control.Seq;
+        a.PendingHasEvents = hasEvents;
+
+        // Kept so a retransmission of the request that produced it is answered
+        // with this same response rather than by running the request again.
+        a.LastRespBodies = bodies;
+        a.LastRespEvents = hasEvents;
+
+        AdvanceResponse(a);
+    }
+
+    /// <summary>
+    /// Sends the next queued fragment of a response in progress, if nothing is
+    /// holding it back, and finishes the response once every fragment has been
+    /// both sent and, where required, confirmed.
+    /// </summary>
+    /// <remarks>
+    /// Two independent things can hold the next fragment back, and only one is
+    /// ever outstanding for long: the link layer, when link confirms are in use
+    /// and the peer has not yet acknowledged the last frame
+    /// (<see cref="ProtocolStack.Busy"/>), and the application layer, when the
+    /// fragment just sent asked for a confirmation of its own
+    /// (<see cref="Association.AwaitingConfirm"/>). Both gate on state the rest
+    /// of the session already maintains — the stack for the first,
+    /// <see cref="OnConfirm"/> and <see cref="CheckConfirmTimeout"/> for the
+    /// second — so this only needs to check them.
+    /// </remarks>
+    private void AdvanceResponse(Association a)
+    {
+        if (a.PendingBodies is not { Count: > 0 } bodies)
+        {
+            return;
+        }
+
+        if (a.AwaitingConfirm || a.Stack.Busy)
+        {
+            return;
+        }
+
+        if (a.PendingIndex >= bodies.Count)
+        {
+            FinishResponse(a);
+            return;
+        }
+
+        var i = a.PendingIndex;
+        var last = i == bodies.Count - 1;
+
+        // Intermediate fragments must be confirmed or the master cannot pace
+        // the series; the final one only needs it when it carries events.
+        var needConfirm = !last || a.PendingHasEvents;
+
+        var ctrl = new AppControl(
+            Fir: i == 0,
+            Fin: last,
+            Con: needConfirm,
+            Uns: false,
+            Seq: a.PendingSeq);
+
+        var frag = new List<byte>(AppConstants.ResponseHeaderSize + bodies[i].Length);
+        HeaderCodec.AppendHeader(frag, new AppHeader(ctrl, FuncCode.Response, CurrentIin(a)));
+        frag.AddRange(bodies[i]);
+
+        a.Stack.SendTo(a.Sink, a.PendingDest, [.. frag]);
+
+        lock (_gate)
+        {
+            _stats.FragmentsSent++;
+        }
+
+        if (a.Stack.Pending)
+        {
+            a.LinkDeadline = _appl.Now() + _cfg.LinkTimeout;
+        }
+
+        a.PendingIndex++;
+
+        if (needConfirm)
+        {
+            a.AwaitingConfirm = true;
+            a.ConfirmSeq = ctrl.Seq;
+            a.ConfirmDeadline = _appl.Now() + _cfg.ConfirmTimeout;
+            return;
+        }
+
+        FinishResponse(a);
+    }
+
+    /// <summary>
+    /// Closes out a response once every fragment has gone out and none is still
+    /// awaiting confirmation.
+    /// </summary>
+    /// <remarks>
+    /// Only now is it safe to drop the events it carried, however many trailing
+    /// fragments they ended up spread across, since only now do we know the
+    /// master has everything.
+    /// </remarks>
+    private void FinishResponse(Association a)
+    {
+        var hasEvents = a.PendingHasEvents;
+        a.PendingBodies = null;
+        a.PendingIndex = 0;
+
+        if (hasEvents)
+        {
+            var n = a.Events.Confirm();
+            a.Log.Log(Dnp3LogLevel.Debug, "events confirmed", ("count", n));
         }
 
         lock (_gate)
@@ -1695,6 +2044,55 @@ public sealed partial class OutstationSession
         // The broadcast indication reports only the request that arrived by
         // broadcast, so it is cleared once reported.
         a.Iin = a.Iin.Clear(Iin.Broadcast);
+    }
+
+    /// <summary>
+    /// Reports whether this is the request the association last acted on, sent
+    /// again because the master did not see the response.
+    /// </summary>
+    /// <remarks>
+    /// The whole fragment is compared, not just the sequence number: a master
+    /// that reuses a sequence number for genuinely new work must have its new
+    /// request executed, and only the octets can tell the two apart.
+    /// </remarks>
+    private static bool IsRepeatRequest(Association a, Received r, Fragment frag) =>
+        a.LastReqValid &&
+        r.Source == a.LastReqSource &&
+        frag.Header.Control.Seq == a.LastReqSeq &&
+        a.LastReqFrag is { } previous &&
+        r.Fragment.Span.SequenceEqual(previous);
+
+    /// <summary>Records a request as the one to compare repeats against.</summary>
+    private static void RememberRequest(Association a, Received r, Fragment frag)
+    {
+        a.LastReqValid = true;
+        a.LastReqSource = r.Source;
+        a.LastReqSeq = frag.Header.Control.Seq;
+
+        // Copied rather than aliased: the fragment points into the stack's
+        // reassembly buffer, which the next segment overwrites.
+        a.LastReqFrag = r.Fragment.ToArray();
+    }
+
+    /// <summary>Re-sends the response a repeated request already produced.</summary>
+    private void ReplayResponse(Association a, Received r, AppHeader req)
+    {
+        if (r.Broadcast || a.LastRespBodies is not { Count: > 0 } bodies)
+        {
+            // A broadcast is executed but never answered, and a request that
+            // produced no response has nothing to repeat.
+            return;
+        }
+
+        // This supersedes any part of that same response still in flight with
+        // an identical send from its first fragment. The events it carries stay
+        // selected rather than going back to the queue, because they are the
+        // very events this replay is about to carry again.
+        a.AwaitingConfirm = false;
+        a.PendingBodies = null;
+        a.PendingIndex = 0;
+
+        SendFragments(a, r, req, bodies, a.LastRespEvents);
     }
 
     /// <summary>

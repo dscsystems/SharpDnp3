@@ -99,6 +99,27 @@ public static class LinkConstants
         address is >= ReservedLow and <= ReservedHigh;
 
     /// <summary>
+    /// Reports whether <paramref name="address"/> can be the source of a frame.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A source address is the sending station's own, so none of the addresses
+    /// no station may hold can appear there: the reserved range, the
+    /// self-address a master uses to reach an outstation whose address it does
+    /// not know, and the three broadcast addresses. Together they are the whole
+    /// of 0xFFF0-0xFFFF.
+    /// </para>
+    /// <para>
+    /// A frame claiming one has to be discarded rather than answered, because a
+    /// reply is addressed to the source it came from. Answering a request that
+    /// claims a broadcast source produces a broadcast-addressed reply, which
+    /// every station on the line accepts as its own.
+    /// </para>
+    /// </remarks>
+    public static bool IsValidSource(ushort address) =>
+        !IsReserved(address) && !IsBroadcast(address) && address != SelfAddress;
+
+    /// <summary>
     /// Returns the on-the-wire octet count of a payload of <paramref name="n"/>
     /// octets once it has been split into CRC-protected blocks.
     /// </summary>

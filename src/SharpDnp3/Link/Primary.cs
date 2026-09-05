@@ -121,7 +121,8 @@ internal sealed class Primary
     private bool _linkUp;
     private bool _fcb;
     private int _retries;
-    private byte[]? _pending;
+    private ReadOnlyMemory<byte> _pending;
+    private bool _hasPending;
     private LinkFrame _lastSent;
     private bool _dfc;
 
@@ -135,7 +136,8 @@ internal sealed class Primary
         _linkUp = false;
         _fcb = false;
         _retries = 0;
-        _pending = null;
+        _pending = default;
+        _hasPending = false;
         _dfc = false;
     }
 
@@ -172,10 +174,8 @@ internal sealed class Primary
     /// later call returns <see cref="LinkAction.Complete"/> or
     /// <see cref="LinkAction.Failed"/>.
     /// </remarks>
-    public (LinkFrame Frame, LinkAction Action) Send(byte[] payload)
+    public (LinkFrame Frame, LinkAction Action) Send(ReadOnlyMemory<byte> payload)
     {
-        ArgumentNullException.ThrowIfNull(payload);
-
         if (payload.Length > LinkConstants.MaxPayload)
         {
             throw LinkDecodeStatus.PayloadTooLong.ToException(
@@ -190,6 +190,16 @@ internal sealed class Primary
                 _state.ToDisplayString()));
         }
 
+        if (_dfc)
+        {
+            // The peer's last reply said its buffers are full; sending more
+            // user data now would be exactly what data flow control exists to
+            // prevent. ProtocolStack.Pump checks DataFlowControl itself before
+            // ever reaching here for a queued continuation segment, so this
+            // only turns away a caller starting something new while paused.
+            throw new DataFlowControlException();
+        }
+
         _retries = 0;
 
         if (!UseConfirms)
@@ -200,10 +210,11 @@ internal sealed class Primary
         }
 
         _pending = payload;
+        _hasPending = true;
         if (!_linkUp)
         {
             _state = PrimaryState.WaitLinkReset;
-            var f = BuildFrame(LinkFunction.ResetLinkStates, fcb: false, fcv: false, null);
+            var f = BuildFrame(LinkFunction.ResetLinkStates, fcb: false, fcv: false, default);
             _lastSent = f;
             return (f, LinkAction.Transmit);
         }
@@ -227,7 +238,7 @@ internal sealed class Primary
 
         _state = PrimaryState.WaitStatus;
         _retries = 0;
-        var f = BuildFrame(LinkFunction.RequestLinkStatus, fcb: false, fcv: false, null);
+        var f = BuildFrame(LinkFunction.RequestLinkStatus, fcb: false, fcv: false, default);
         _lastSent = f;
         return (f, LinkAction.Transmit);
     }
@@ -236,7 +247,8 @@ internal sealed class Primary
     private (LinkFrame Frame, LinkAction Action) SendPending()
     {
         _state = PrimaryState.WaitConfirm;
-        var f = BuildFrame(LinkFunction.ConfirmedUserData, _fcb, fcv: true, _pending);
+        var f = BuildFrame(
+            LinkFunction.ConfirmedUserData, _fcb, fcv: true, _hasPending ? _pending : default);
         _lastSent = f;
         return (f, LinkAction.Transmit);
     }
@@ -282,7 +294,8 @@ internal sealed class Primary
                     case LinkFunction.Ack:
                         _fcb = !_fcb;
                         _state = PrimaryState.Idle;
-                        _pending = null;
+                        _pending = default;
+                        _hasPending = false;
                         _retries = 0;
                         return (default, LinkAction.Complete);
 
@@ -293,7 +306,8 @@ internal sealed class Primary
                         _linkUp = false;
                         _state = PrimaryState.WaitLinkReset;
                         _retries = 0;
-                        var next = BuildFrame(LinkFunction.ResetLinkStates, fcb: false, fcv: false, null);
+                        var next = BuildFrame(
+                            LinkFunction.ResetLinkStates, fcb: false, fcv: false, default);
                         _lastSent = next;
                         return (next, LinkAction.Transmit);
 
@@ -358,14 +372,16 @@ internal sealed class Primary
     {
         _state = PrimaryState.Idle;
         _linkUp = false;
-        _pending = null;
+        _pending = default;
+        _hasPending = false;
         _retries = 0;
         return (default, LinkAction.Failed);
     }
 
-    private LinkFrame BuildFrame(LinkFunction fn, bool fcb, bool fcv, byte[]? payload)
+    private LinkFrame BuildFrame(
+        LinkFunction fn, bool fcb, bool fcv, ReadOnlyMemory<byte> payload)
     {
-        var length = LinkConstants.MinLength + (payload?.Length ?? 0);
+        var length = LinkConstants.MinLength + payload.Length;
         return new LinkFrame
         {
             Header = new LinkHeader(
@@ -378,7 +394,7 @@ internal sealed class Primary
                 Dest: RemoteAddr,
                 Src: LocalAddr,
                 Length: (byte)length),
-            Payload = payload ?? ReadOnlyMemory<byte>.Empty,
+            Payload = payload,
         };
     }
 }

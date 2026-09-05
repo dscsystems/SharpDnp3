@@ -32,6 +32,12 @@ public sealed class PlantConfig
     /// <summary>The counters.</summary>
     public List<CounterSim> Counters { get; set; } = [];
 
+    /// <summary>What the outstation says about itself over group 0.</summary>
+    public DeviceConfig Device { get; set; } = DeviceConfig.Default();
+
+    /// <summary>What a master may read and write over group 70.</summary>
+    public FilesConfig Files { get; set; } = new();
+
     /// <summary>The faults to inject. Not read from YAML; set from flags.</summary>
     [YamlIgnore]
     public Injection Inject { get; set; } = new();

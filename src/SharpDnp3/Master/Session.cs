@@ -50,6 +50,18 @@ public sealed class MasterConfig
     public int MaxRxFragment { get; set; }
 
     /// <summary>
+    /// The largest file block this master will ask for. Zero derives one from
+    /// the fragment caps.
+    /// </summary>
+    /// <remarks>
+    /// Both caps bound it, because one block size covers both directions: a
+    /// read block arrives in a response and a write block goes out in a
+    /// request, and a master that sized only for what it can receive would
+    /// negotiate a block it could not then send.
+    /// </remarks>
+    public ushort FileBlockSize { get; set; }
+
+    /// <summary>
     /// Enables link-layer confirmation, normally off over TCP.
     /// </summary>
     public bool UseLinkConfirms { get; set; }
@@ -134,6 +146,11 @@ public record struct MasterStats
 
     /// <summary>Unsolicited responses received.</summary>
     public ulong Unsolicited;
+
+    /// <summary>
+    /// Response fragments dropped for not continuing the series in flight.
+    /// </summary>
+    public ulong FragmentsDiscarded;
 
     /// <summary>Connections established.</summary>
     public ulong Connections;
@@ -707,6 +724,12 @@ public sealed partial class MasterSession
         }
 
         t.Seq = _seq;
+
+        // A periodic task is the same object run again, so the series state
+        // from its previous run has to be cleared or the first fragment of this
+        // run's response looks like a repeat of the last one's.
+        t.Started = false;
+
         lock (_gate)
         {
             _stats.TasksRun++;
@@ -894,6 +917,47 @@ public sealed partial class MasterSession
                 ("got", frag.Header.Control.Seq), ("want", t.Seq));
             return;
         }
+
+        // A fragment is only delivered if it belongs where the series actually
+        // is: the first one must carry FIR and every later one must not. A FIR
+        // fragment arriving once the series has started is the outstation
+        // repeating a fragment whose confirm it never saw, and a fragment
+        // without FIR arriving before any has started continues a series that
+        // never began. Delivering the first would report the same measurements
+        // twice; delivering the second would report part of a response as the
+        // whole of one.
+        if (frag.Header.Control.Fir == t.Started)
+        {
+            lock (_gate)
+            {
+                _stats.FragmentsDiscarded++;
+            }
+
+            _log.Log(
+                Dnp3LogLevel.Debug,
+                "discarding a response fragment that does not continue the series",
+                ("fir", frag.Header.Control.Fir),
+                ("started", t.Started),
+                ("seq", frag.Header.Control.Seq));
+
+            // The confirm still goes out. A repeat is sent precisely because
+            // the outstation did not see the confirm the first time, and
+            // withholding it now would only have the outstation repeat itself
+            // again.
+            if (frag.Header.Control.Con)
+            {
+                SendConfirm(frag.Header.Control.Seq, unsolicited: false);
+            }
+
+            // The task is deliberately not completed, whatever this fragment's
+            // FIN says: nothing valid has been received for it, so letting it
+            // time out reports that honestly rather than reporting success on a
+            // response that was thrown away.
+            t.Deadline = _time.GetUtcNow() + _cfg.ResponseTimeout;
+            return;
+        }
+
+        t.Started = true;
 
         Deliver(frag, unsolicited: false);
         t.OnFragment?.Invoke(frag);

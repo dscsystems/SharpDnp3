@@ -100,13 +100,25 @@ IDnp3Logger log = new TextWriterDnp3Logger(Console.Error, level);
 // reports the outcome and exits.
 if (rest.Count > 0)
 {
-    if (rest[0] != "operate")
-    {
-        Console.Error.WriteLine($"dnp3-master: unknown command \"{rest[0]}\"; see -help");
-        return 1;
-    }
+    var operands = rest.Skip(1).ToList();
 
-    return await OperateAsync(rest.Skip(1).ToList()).ConfigureAwait(false);
+    switch (rest[0])
+    {
+        case "operate":
+            return await OperateAsync(operands).ConfigureAwait(false);
+
+        case "attributes":
+        case "ls":
+        case "get":
+        case "put":
+        case "rm":
+        case "stat":
+            return await DeviceCommandAsync(rest[0], operands).ConfigureAwait(false);
+
+        default:
+            Console.Error.WriteLine($"dnp3-master: unknown command \"{rest[0]}\"; see -help");
+            return 1;
+    }
 }
 
 SitesConfig cfg;
@@ -236,6 +248,190 @@ SitesConfig BuildConfig()
         },
     ];
     return c;
+}
+
+// Runs one device-inspection command — device attributes or file transfer —
+// against a single outstation and exits.
+//
+// They share OperateAsync's shape rather than its code: connect, do one thing,
+// report it, leave. What they do not share is select-before-operate, because
+// none of them moves any plant.
+async Task<int> DeviceCommandAsync(string verb, List<string> operands)
+{
+    if (string.IsNullOrEmpty(host) && string.IsNullOrEmpty(serialDevice))
+    {
+        Console.Error.WriteLine($"dnp3-master: {verb} needs -host or -serial");
+        return 1;
+    }
+
+    // Every one of these but "attributes" names a path.
+    if (verb != "attributes" && operands.Count < 1)
+    {
+        Console.Error.WriteLine($"dnp3-master: {verb} needs a path");
+        return 1;
+    }
+
+    var site = new Site
+    {
+        Name = verb,
+        Host = host ?? "",
+        Serial = serialDevice ?? "",
+        Baud = baud,
+        Local = local,
+        Address = remote,
+        Timeout = timeout,
+    };
+
+    using var cmdCts = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        cmdCts.Cancel();
+    };
+
+    using var channel = Runner.BuildChannel(site);
+
+    var session = new MasterSession(new MasterConfig
+    {
+        LocalAddr = local,
+        RemoteAddr = remote,
+        ResponseTimeout = timeout,
+        Log = log,
+    });
+
+    var run = session.RunAsync(channel, cmdCts.Token);
+
+    try
+    {
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(15);
+        while (DateTimeOffset.UtcNow < deadline && !session.Connected)
+        {
+            await Task.Delay(20, cmdCts.Token).ConfigureAwait(false);
+        }
+
+        if (!session.Connected)
+        {
+            Console.Error.WriteLine($"dnp3-master: could not connect to {site.Describe()}");
+            return 1;
+        }
+
+        using var opTimeout = CancellationTokenSource.CreateLinkedTokenSource(cmdCts.Token);
+
+        // A firmware image over a slow serial line is minutes of the wire, so
+        // this is deliberately far longer than a control's window.
+        opTimeout.CancelAfter(TimeSpan.FromMinutes(10));
+        var ct = opTimeout.Token;
+
+        switch (verb)
+        {
+            case "attributes":
+            {
+                var attrs = await session.ReadAttributesAsync(ct).ConfigureAwait(false);
+                if (attrs.Count == 0)
+                {
+                    Console.WriteLine("the outstation reports no device attributes");
+                    return 0;
+                }
+
+                foreach (var a in attrs)
+                {
+                    Console.WriteLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "{0,-32} {1}", a.Name(), a.ValueText()));
+                }
+
+                return 0;
+            }
+
+            case "ls":
+            {
+                var entries = await session.ReadDirectoryAsync(operands[0], ct)
+                    .ConfigureAwait(false);
+                foreach (var e in entries)
+                {
+                    Console.WriteLine(e.ToString());
+                }
+
+                return 0;
+            }
+
+            case "stat":
+            {
+                var info = await session.FileInfoAsync(operands[0], ct).ConfigureAwait(false);
+                Console.WriteLine(info.ToString());
+                return 0;
+            }
+
+            case "get":
+            {
+                // A second operand writes to that path; without one the file
+                // goes to standard output, which is what makes this pipeable.
+                if (operands.Count > 1)
+                {
+                    await using var dst = File.Create(operands[1]);
+                    var n = await session.ReadFileAsync(operands[0], dst, ct)
+                        .ConfigureAwait(false);
+                    Console.Error.WriteLine(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "{0}: {1} octets -> {2}", operands[0], n, operands[1]));
+                }
+                else
+                {
+                    await using var stdout = Console.OpenStandardOutput();
+                    await session.ReadFileAsync(operands[0], stdout, ct).ConfigureAwait(false);
+                }
+
+                return 0;
+            }
+
+            case "put":
+            {
+                if (operands.Count < 2)
+                {
+                    Console.Error.WriteLine(
+                        "dnp3-master: put needs a local file: put <remote> <local>");
+                    return 1;
+                }
+
+                var content = await File.ReadAllBytesAsync(operands[1], ct)
+                    .ConfigureAwait(false);
+                await session.WriteFileBytesAsync(operands[0], content, ct)
+                    .ConfigureAwait(false);
+
+                Console.Error.WriteLine(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0}: {1} octets written", operands[0], content.Length));
+                return 0;
+            }
+
+            case "rm":
+                await session.DeleteFileAsync(operands[0], ct).ConfigureAwait(false);
+                Console.Error.WriteLine($"{operands[0]}: deleted");
+                return 0;
+
+            default:
+                Console.Error.WriteLine($"dnp3-master: unknown command \"{verb}\"");
+                return 1;
+        }
+    }
+    catch (Exception ex) when (
+        ex is Dnp3Exception or OperationCanceledException or IOException)
+    {
+        Console.Error.WriteLine($"dnp3-master: {verb}: {ex.Message}");
+        return 1;
+    }
+    finally
+    {
+        await cmdCts.CancelAsync().ConfigureAwait(false);
+        try
+        {
+            await run.ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or Dnp3Exception or IOException)
+        {
+            // The session was told to stop; how it noticed is not news.
+        }
+    }
 }
 
 // Issues a single control and reports the outcome.
@@ -401,6 +597,14 @@ static void Usage() => Console.Error.Write(
       -listen ADDR     serve live values over HTTP
       -v / -q          more or less logging
 
+    Device inspection (each connects, does one thing, and exits):
+      attributes       read what the device says about itself (group 0)
+      ls PATH          list a directory on the outstation
+      stat PATH        describe one file without transferring it
+      get PATH [DEST]  read a file; without DEST it goes to standard output
+      put PATH LOCAL   write a local file to the outstation
+      rm PATH          delete a file
+
     Controls (operate connects, issues one control, and exits):
       latch-on N       latch a binary output on
       latch-off N      latch it off
@@ -417,6 +621,9 @@ static void Usage() => Console.Error.Write(
       dnp3-master -host 127.0.0.1:20000 -record ./data -listen :8080
       dnp3-master -config sites.yaml -v
       dnp3-master -host 127.0.0.1:20000 operate trip 0
+      dnp3-master -host 127.0.0.1:20000 attributes
+      dnp3-master -host 127.0.0.1:20000 ls /
+      dnp3-master -host 127.0.0.1:20000 get /device.txt
 
     """);
 

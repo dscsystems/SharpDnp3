@@ -214,6 +214,39 @@ public static class FuncCodeExtensions
     };
 
     /// <summary>
+    /// Reports whether a request with this function code is meaningless without
+    /// at least one object header.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A read that names nothing to read, a control that names nothing to
+    /// operate. An outstation answers one carrying no objects with
+    /// IIN2.PARAMETER_ERROR and a null response, rather than with the empty
+    /// success it would otherwise look like.
+    /// </para>
+    /// <para>
+    /// Codes that legitimately carry nothing are absent: CONFIRM, the restarts,
+    /// DELAY_MEASURE and RECORD_CURRENT_TIME take no objects at all, and an
+    /// empty freeze means every counter rather than none.
+    /// </para>
+    /// <para>
+    /// The file and authentication codes are absent too, for a different
+    /// reason. They do require their objects, but their handlers parse those
+    /// objects themselves and report a more precise failure than this blanket
+    /// check could — a file request on an outstation with no file handler
+    /// should be told the function is unsupported, not that its parameters were
+    /// wrong.
+    /// </para>
+    /// </remarks>
+    public static bool RequiresObjects(this FuncCode f) => f is
+        FuncCode.Read or FuncCode.Write or
+        FuncCode.Select or FuncCode.Operate or
+        FuncCode.DirectOperate or FuncCode.DirectOperateNR or
+        FuncCode.FreezeAtTime or FuncCode.FreezeAtTimeNR or
+        FuncCode.EnableUnsolicited or FuncCode.DisableUnsolicited or
+        FuncCode.AssignClass;
+
+    /// <summary>
     /// Reports whether the code operates output points, which is the set an
     /// outstation may want to gate behind authorisation.
     /// </summary>

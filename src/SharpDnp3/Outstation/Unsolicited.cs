@@ -37,6 +37,18 @@ internal sealed class UnsolState
     public int Retries;
 
     /// <summary>
+    /// The exact fragment last transmitted, kept so a retry can repeat it octet
+    /// for octet.
+    /// </summary>
+    /// <remarks>
+    /// A master tells a retransmission apart from new data purely by the
+    /// sequence number, so a retry that keeps the sequence number — as it must
+    /// — has to carry the same data too, or the master matches genuinely new
+    /// events as a duplicate and discards them.
+    /// </remarks>
+    public byte[]? LastFrag;
+
+    /// <summary>
     /// The earliest a further unsolicited response may be sent, which is how a
     /// device that has given up retrying backs off.
     /// </summary>
@@ -58,6 +70,7 @@ internal sealed class UnsolState
         AwaitSeq = 0;
         Deadline = default;
         Retries = 0;
+        LastFrag = null;
         NextAllowed = default;
         FirstEventAt = null;
     }
@@ -156,6 +169,18 @@ public sealed partial class OutstationSession
             return;
         }
 
+        // A retry repeats the fragment the master did not confirm, exactly as
+        // it went out the first time. Building a fresh one from whatever is
+        // queued now would put events the master has never seen behind the
+        // sequence number of a transmission it has already seen, so it would
+        // match them as a duplicate, deliver none of them, and confirm them
+        // away regardless.
+        if (a.Unsol.Retries > 0 && a.Unsol.LastFrag is { Length: > 0 })
+        {
+            RetryUnsolicited(a, now);
+            return;
+        }
+
         // The null unsolicited response comes first and comes before any data.
         //
         // Its job is to tell a master that has just connected — or reconnected
@@ -218,20 +243,23 @@ public sealed partial class OutstationSession
             _stats.UnsolicitedTimeouts++;
         }
 
-        // The events go back in the queue whether or not we retry. If we give
-        // up, the master's next poll collects them — losing them because
-        // unsolicited delivery failed would defeat the point of the
-        // confirmation.
-        var requeued = a.Events.Unselect();
-
         if (a.Unsol.Retries > _cfg.Unsolicited.MaxRetries)
         {
+            // Only now do the events go back in the queue, for the master's
+            // next poll to collect: losing them because unsolicited delivery
+            // failed would defeat the point of the confirmation. Returning them
+            // any earlier, while a retry still owes them, would let the retry
+            // sweep up whatever else has arrived since and send the lot under
+            // the original sequence number.
+            var requeued = a.Events.Unselect();
+
             a.Log.Log(
                 Dnp3LogLevel.Warn,
                 "giving up on unsolicited reporting until the master polls",
                 ("retries", a.Unsol.Retries), ("events_requeued", requeued));
 
             a.Unsol.Retries = 0;
+            a.Unsol.LastFrag = null;
             a.Unsol.NextAllowed = now + _cfg.Unsolicited.ConfirmTimeout;
             return;
         }
@@ -239,7 +267,40 @@ public sealed partial class OutstationSession
         a.Log.Log(
             Dnp3LogLevel.Debug,
             "unsolicited response unconfirmed; retrying",
-            ("attempt", a.Unsol.Retries), ("events_requeued", requeued));
+            ("attempt", a.Unsol.Retries));
+    }
+
+    /// <summary>Retransmits the unconfirmed response verbatim.</summary>
+    private void RetryUnsolicited(Association a, DateTimeOffset now)
+    {
+        try
+        {
+            a.Stack.SendTo(a.Sink, a.RemoteAddr, a.Unsol.LastFrag!);
+        }
+        catch (Dnp3Exception ex)
+        {
+            // The events stay selected; the retry path keeps hold of them until
+            // the transmission is either confirmed or given up on.
+            a.Log.Log(
+                Dnp3LogLevel.Warn,
+                "unsolicited retransmission failed",
+                ("err", ex.Message));
+            return;
+        }
+
+        a.Unsol.Awaiting = true;
+        a.Unsol.AwaitSeq = a.Unsol.Seq;
+        a.Unsol.Deadline = now + _cfg.Unsolicited.ConfirmTimeout;
+
+        lock (_gate)
+        {
+            _stats.UnsolicitedSent++;
+        }
+
+        a.Log.Log(
+            Dnp3LogLevel.Debug,
+            "unsolicited response retransmitted",
+            ("seq", a.Unsol.Seq), ("attempt", a.Unsol.Retries));
     }
 
     /// <summary>Transmits one unsolicited response.</summary>
@@ -264,21 +325,28 @@ public sealed partial class OutstationSession
         // asked for it.
         var body = bodies[0];
 
+        // Every transmission through here is a new one, carrying data the
+        // master has not been offered before, so it takes the next sequence
+        // number. A retry does not come through here at all: it goes through
+        // RetryUnsolicited, which repeats the stored fragment under the
+        // sequence number it already had, because that is the only thing a
+        // master's duplicate detection matches on.
         a.Unsol.Seq = (byte)((a.Unsol.Seq + 1) % AppConstants.SeqModulus);
 
-        var frag = new List<byte>(AppConstants.ResponseHeaderSize + body.Length);
-        HeaderCodec.AppendHeader(frag, new AppHeader(
+        var builder = new List<byte>(AppConstants.ResponseHeaderSize + body.Length);
+        HeaderCodec.AppendHeader(builder, new AppHeader(
             new AppControl(Fir: true, Fin: true, Con: true, Uns: true, Seq: a.Unsol.Seq),
             FuncCode.UnsolicitedResponse,
             CurrentIin(a)));
-        frag.AddRange(body);
+        builder.AddRange(body);
+        var frag = builder.ToArray();
 
         try
         {
             // Addressed rather than sent to the configured master: with several
             // attached, each one's unsolicited responses have to go to its own
             // link address.
-            a.Stack.SendTo(a.Sink, a.RemoteAddr, [.. frag]);
+            a.Stack.SendTo(a.Sink, a.RemoteAddr, frag);
         }
         catch (Dnp3Exception ex)
         {
@@ -291,6 +359,9 @@ public sealed partial class OutstationSession
         a.Unsol.AwaitSeq = a.Unsol.Seq;
         a.Unsol.Deadline = now + _cfg.Unsolicited.ConfirmTimeout;
         a.Unsol.NullSent = a.Unsol.NullSent || isNull;
+
+        // Kept whole for a retry to repeat.
+        a.Unsol.LastFrag = frag;
 
         lock (_gate)
         {
@@ -317,6 +388,7 @@ public sealed partial class OutstationSession
 
         a.Unsol.Awaiting = false;
         a.Unsol.Retries = 0;
+        a.Unsol.LastFrag = null;
 
         if (!a.Unsol.NullConfirmed)
         {

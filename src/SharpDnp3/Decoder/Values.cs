@@ -100,6 +100,25 @@ public static class ValueDecoder
             return true;
         }
 
+        // File transfer likewise: its objects are self-describing and carry no
+        // point index, so there is no descriptor row to look up and nothing the
+        // measurement path below could do with them.
+        if (h.Group == 70)
+        {
+            values = DecodeFileObjects(h);
+            return values.Count > 0;
+        }
+
+        // And device attributes, where the variation is the attribute's
+        // identity rather than an encoding: there is no row to look up because
+        // there is no table that could hold one per attribute a device might
+        // invent.
+        if (h.Group == 0)
+        {
+            values = DecodeAttributes(h);
+            return values.Count > 0;
+        }
+
         if (!ObjectRegistry.TryLookup(gv, out var d))
         {
             return false;
@@ -430,6 +449,244 @@ public static class ValueDecoder
     /// bytes are not printable — a serial number is usually ASCII, but nothing
     /// in the protocol says it must be.
     /// </summary>
+    /// <summary>Renders the group 70 objects a header carries.</summary>
+    /// <remarks>
+    /// Group 70 renders differently from everything else here because it is not
+    /// measurements. A file exchange is a conversation, and what an engineer
+    /// needs out of a capture is the thread of it: which file, which handle,
+    /// which block, and what the outstation said about it.
+    /// <para>
+    /// The index a <see cref="Value"/> carries is the object's position in the
+    /// header rather than a point index — group 70 has no point indexes — which
+    /// is what keeps a header carrying several descriptors readable.
+    /// </para>
+    /// </remarks>
+    private static List<Value> DecodeFileObjects(ObjectHeader h)
+    {
+        List<ReadOnlyMemory<byte>> objects;
+        try
+        {
+            objects = FreeFormat.Objects(h);
+        }
+        catch (MalformedException)
+        {
+            return [];
+        }
+
+        var output = new List<Value>(objects.Count);
+        for (var i = 0; i < objects.Count; i++)
+        {
+            if (TryFileObjectText(h.Variation, objects[i], out var text))
+            {
+                output.Add(new Value { Index = (ushort)i, Text = text });
+            }
+        }
+
+        return output;
+    }
+
+    /// <summary>Renders one group 70 object.</summary>
+    /// <remarks>
+    /// A malformed one is reported as such rather than dropped: a capture
+    /// exists to show what arrived, and the fact that a device sent something
+    /// undecodable is the most interesting thing on the line when it happens.
+    /// </remarks>
+    private static bool TryFileObjectText(
+        byte variation, ReadOnlyMemory<byte> obj, out string text)
+    {
+        const string dateFormat = "yyyy-MM-dd HH:mm:ss";
+
+        try
+        {
+            switch (variation)
+            {
+                case 2:
+                {
+                    var a = FileObjects.ParseAuth(obj.Span);
+
+                    // The password is deliberately not rendered. A capture is a
+                    // file that gets pasted into tickets.
+                    text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "auth user=\"{0}\" key=0x{1:X8}", a.User, a.Key);
+                    return true;
+                }
+
+                case 3:
+                {
+                    var c = FileObjects.ParseCommand(obj.Span);
+                    var s = new StringBuilder();
+                    s.AppendFormat(
+                        CultureInfo.InvariantCulture,
+                        "{0} \"{1}\" req={2}",
+                        c.Mode.ToString().ToLowerInvariant(), c.Name, c.RequestId);
+
+                    if (c.Size > 0)
+                    {
+                        s.AppendFormat(CultureInfo.InvariantCulture, " size={0}", c.Size);
+                    }
+
+                    if (c.MaxBlockSize > 0)
+                    {
+                        s.AppendFormat(
+                            CultureInfo.InvariantCulture, " block={0}", c.MaxBlockSize);
+                    }
+
+                    text = s.ToString();
+                    return true;
+                }
+
+                case 4:
+                {
+                    var st = FileObjects.ParseCommandStatus(obj.Span);
+                    var s = new StringBuilder();
+                    s.AppendFormat(
+                        CultureInfo.InvariantCulture,
+                        "handle=0x{0:X8} req={1} → {2}",
+                        st.Handle, st.RequestId, st.Status.ToDisplayString());
+
+                    if (st.Size > 0)
+                    {
+                        s.AppendFormat(CultureInfo.InvariantCulture, " size={0}", st.Size);
+                    }
+
+                    if (st.MaxBlockSize > 0)
+                    {
+                        s.AppendFormat(
+                            CultureInfo.InvariantCulture, " block={0}", st.MaxBlockSize);
+                    }
+
+                    s.Append(OptionalText(st.Text));
+                    text = s.ToString();
+                    return true;
+                }
+
+                case 5:
+                {
+                    var t = FileObjects.ParseTransport(obj);
+
+                    // The data itself is summarised, not dumped: a capture of a
+                    // firmware image would otherwise be megabytes of hex nobody
+                    // reads.
+                    text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "handle=0x{0:X8} block={1}{2} data={3}B",
+                        t.Handle, t.Block, t.Last ? " last" : string.Empty, t.Data.Length);
+                    return true;
+                }
+
+                case 6:
+                {
+                    var st = FileObjects.ParseTransportStatus(obj.Span);
+                    text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "handle=0x{0:X8} block={1}{2} → {3}{4}",
+                        st.Handle, st.Block, st.Last ? " last" : string.Empty,
+                        st.Status.ToDisplayString(), OptionalText(st.Text));
+                    return true;
+                }
+
+                case 7:
+                {
+                    var d = FileObjects.ParseDescriptor(obj.Span);
+                    var s = new StringBuilder();
+                    s.AppendFormat(
+                        CultureInfo.InvariantCulture,
+                        "{0} \"{1}\" {2} {3} octets",
+                        d.Type.ToString().ToLowerInvariant(),
+                        d.Name,
+                        d.Permissions.ToDisplayString(),
+                        d.Size);
+
+                    if (d.Created != default)
+                    {
+                        s.Append(' ');
+                        s.Append(d.Created.ToString(dateFormat, CultureInfo.InvariantCulture));
+                    }
+
+                    text = s.ToString();
+                    return true;
+                }
+
+                case 8:
+                    text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "file specification \"{0}\"",
+                        Encoding.ASCII.GetString(obj.Span).TrimEnd('\0'));
+                    return true;
+
+                default:
+                    text = string.Empty;
+                    return false;
+            }
+        }
+        catch (MalformedException ex)
+        {
+            text = "malformed: " + ex.Message;
+            return true;
+        }
+    }
+
+    private static string OptionalText(string? s) =>
+        string.IsNullOrEmpty(s) ? string.Empty : " (" + s + ")";
+
+    /// <summary>Renders the group 0 objects a header carries.</summary>
+    /// <remarks>
+    /// A device attribute renders as what it says rather than as a value at an
+    /// index, because that is what it is: the variation names the attribute and
+    /// the range names the set, so a capture reads "product name and model:
+    /// RTU-9000" instead of a number nobody can look up mid-investigation.
+    /// </remarks>
+    private static List<Value> DecodeAttributes(ObjectHeader h)
+    {
+        var count = (int)h.Count;
+        if (count == 0)
+        {
+            count = 1;
+        }
+
+        var output = new List<Value>(count);
+        var off = 0;
+        for (var i = 0; i < count; i++)
+        {
+            if (off >= h.Data.Length)
+            {
+                break;
+            }
+
+            var set = (byte)h.Range.IndexOf((uint)i);
+
+            if (!AttributeObjects.TryParse(
+                    set, h.Variation, h.Data.Span[off..], out var a, out var n, out var error))
+            {
+                // A capture exists to show what arrived. An attribute that will
+                // not decode is the most interesting thing on the line when it
+                // happens, so it is reported rather than dropped.
+                output.Add(new Value
+                {
+                    Index = h.Variation,
+                    Text = "malformed: " + error,
+                });
+                break;
+            }
+
+            off += n;
+
+            // The index column carries the variation, which for group 0 is the
+            // attribute's identity — the nearest thing it has to a point index.
+            output.Add(new Value
+            {
+                Index = a.Variation,
+                Text = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0} = {1} [{2}]",
+                    a.Name(), a.ValueText(), a.Type.ToDisplayString()),
+            });
+        }
+
+        return output;
+    }
+
     private static List<Value> DecodeOctetStrings(ObjectHeader h)
     {
         var output = new List<Value>();

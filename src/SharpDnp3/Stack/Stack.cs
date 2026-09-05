@@ -257,12 +257,31 @@ internal sealed class ProtocolStack
     {
         while (_seg.Pending)
         {
+            if (_pri.DataFlowControl)
+            {
+                // The peer's last reply said its buffers are full: what is left
+                // of this fragment stays queued rather than being sent through
+                // that, or lost by consuming it here anyway. Sending resumes on
+                // its own once some later reply clears DFC — Drain calls Pump
+                // again after every LinkAction.Complete, including the ACK to a
+                // SendLinkStatusRequest probe, whose own gate deliberately lets
+                // it go out while paused like this so there is something to
+                // elicit that later reply in the first place.
+                return;
+            }
+
             if (!_seg.TryNext(_txSeg, out var segLen))
             {
                 break;
             }
 
-            var segment = _txSeg.AsSpan(0, segLen).ToArray();
+            // The segment aliases _txSeg rather than being copied out of it.
+            // Nothing overwrites _txSeg until the next TryNext, and that only
+            // happens once this segment has been acknowledged — the loop
+            // returns below while a confirmed frame is in flight — so the
+            // primary's retransmission copy stays valid for as long as it is
+            // needed.
+            var segment = _txSeg.AsMemory(0, segLen);
 
             var saved = _pri.RemoteAddr;
             _pri.RemoteAddr = _dest;
@@ -366,6 +385,20 @@ internal sealed class ProtocolStack
                 continue;
             }
 
+            // The destination says the frame is ours to look at; the source
+            // says whether it can have come from anywhere at all. An address no
+            // station may hold cannot be a sender, and a reply goes back to
+            // whatever source it was given — so answering one would put that
+            // impossible address on the wire as a destination.
+            //
+            // This belongs here rather than in the parser: a frame like this is
+            // exactly what an operator wants the decoder to show them, so it is
+            // dropped where the protocol is acted on, not where it is read.
+            if (!LinkConstants.IsValidSource(f.Header.Src))
+            {
+                continue;
+            }
+
             if (f.Header.Control.Prm)
             {
                 var res = _sec.OnFrame(f);
@@ -384,7 +417,16 @@ internal sealed class ProtocolStack
                 continue;
             }
 
-            // A secondary frame is a reply to something we sent.
+            // A secondary frame answers something we sent as primary, and must
+            // come from the station we are actually exchanging with — _dest,
+            // the address the fragment in flight was sent to — or it could
+            // complete or advance an exchange it has nothing to do with, forged
+            // or merely misrouted from some other station on the line.
+            if (f.Header.Src != _dest)
+            {
+                continue;
+            }
+
             var (next, action) = _pri.OnFrame(f);
             switch (action)
             {
@@ -453,9 +495,14 @@ internal sealed class ProtocolStack
     /// </remarks>
     public void SendLinkStatusRequest(IByteSink sink)
     {
-        if (Busy)
+        if (_awaiting)
         {
-            // There is traffic in flight; the link is demonstrably alive.
+            // A confirmed frame is genuinely in flight; do not interleave.
+            //
+            // This gates on _awaiting rather than Busy deliberately. A fragment
+            // paused mid-way by data flow control leaves segments queued, so
+            // Busy stays set — and the probe is exactly what has to go out to
+            // elicit the reply that clears DFC and lets those segments move.
             return;
         }
 

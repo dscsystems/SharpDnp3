@@ -141,11 +141,13 @@ testing](#building-and-testing).
 | **Events** | Class 1/2/3 assignment, deadbands, confirmation-backed event buffer, unsolicited reporting |
 | **Controls** | CROB and analog output setpoints, direct operate, select-before-operate, no-reply operate |
 | **Time** | LAN and serial (delay-measured) synchronisation, `NEED_TIME` handling, relative-time (CTO) objects |
-| **Objects** | Groups 1–4, 10–13, 20–23, 30–34, 40–43, 50–52, 60, 80, 110–111, generated from a declarative spec |
+| **Files** | Group 70 transfer: read, write, delete, directory listing, file info, with a rooted directory handler |
+| **Attributes** | Group 70's counterpart — group 0 device attributes, derived point counts included |
+| **Multidrop** | Several sessions sharing one serial line, with half-duplex turn taking and a bus registry |
+| **Objects** | Groups 0, 1–4, 10–13, 20–23, 30–34, 40–43, 50–52, 60, 70, 80, 110–111, generated from a declarative spec |
 | **Tooling** | Structured protocol decoder, four working command-line programs |
 
-Deliberately out of scope: Secure Authentication v5 (use TLS), file transfer and
-datasets.
+Deliberately out of scope: Secure Authentication v5 (use TLS) and datasets.
 
 ---
 
@@ -166,7 +168,8 @@ datasets.
 | `docs/` | The reference documentation |
 
 Inside the library, one directory per protocol layer: `Link/`, `Transport/`,
-`App/`, `Objects/`, then `Master/`, `Outstation/`, `Channel/`, `Decoder/`.
+`App/`, `Objects/`, then `Master/`, `Outstation/`, `Channel/`, `Decoder/` and
+`Multidrop/`.
 
 ---
 

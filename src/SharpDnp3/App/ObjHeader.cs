@@ -130,6 +130,20 @@ internal static class ObjectHeaderCodec
         length = 0;
         var prefix = qualifier.IndexPrefix;
 
+        // A size prefix makes the data self-describing, so it can be walked
+        // without knowing anything about the group — and, unlike everything
+        // below, without knowing the function code either.
+        //
+        // That exception is what file transfer needs. A READ request carries no
+        // object data by the general rule, but a read of a file block carries a
+        // group 70 object holding the handle and the block number; so do the
+        // delete and file-info requests. The object says how long it is, so
+        // there is nothing to infer and nothing to get wrong.
+        if (prefix.IsSize() && range.Count > 0 && variation != 0)
+        {
+            return WalkSizePrefixed(prefix.Octets(), range.Count, buf, out length);
+        }
+
         if (!carriesData)
         {
             return AppParseStatus.Ok;
@@ -154,12 +168,18 @@ internal static class ObjectHeaderCodec
             return AppParseStatus.Ok;
         }
 
-        // A size prefix makes the data self-describing, so it can be walked
-        // without knowing anything about the group. This is how variable-length
-        // objects such as file transfer are carried.
-        if (prefix.IsSize())
+        // A group 0 device attribute carries its own data type and length, so
+        // it is walkable without a size table — which is just as well, because
+        // its variation is not an encoding at all but the number of the
+        // attribute being reported, and no table could enumerate what a device
+        // might say about itself.
+        //
+        // Unlike the free-format case above this does depend on the function
+        // code: in a read request the same header names an attribute and stops
+        // there.
+        if (group == 0)
         {
-            return WalkSizePrefixed(prefix.Octets(), range.Count, buf, out length);
+            return WalkAttributes(range.Count, buf, out length);
         }
 
         if (!sizer.TrySizeBits(group, variation, out var bits))
@@ -194,6 +214,40 @@ internal static class ObjectHeaderCodec
 
         var total = (ulong)range.Count * ((ulong)prefixOctets + ((ulong)bits / 8));
         return CheckFits(total, buf, out length);
+    }
+
+    /// <summary>
+    /// Advances over <paramref name="count"/> device attributes, each of which
+    /// is a one-octet data type, a one-octet length, and that many octets of
+    /// value.
+    /// </summary>
+    private static AppParseStatus WalkAttributes(
+        uint count,
+        ReadOnlySpan<byte> buf,
+        out int length)
+    {
+        const int header = 2; // the data type and the length
+
+        length = 0;
+        var off = 0;
+        for (uint i = 0; i < count; i++)
+        {
+            if (off + header > buf.Length)
+            {
+                return AppParseStatus.Truncated;
+            }
+
+            var size = buf[off + 1];
+            if (off + header + size > buf.Length)
+            {
+                return AppParseStatus.Truncated;
+            }
+
+            off += header + size;
+        }
+
+        length = off;
+        return AppParseStatus.Ok;
     }
 
     /// <summary>

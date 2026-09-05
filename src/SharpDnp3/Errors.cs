@@ -80,6 +80,18 @@ public class TaskFailedException : Dnp3Exception
         : base(message, innerException) { }
 }
 
+/// <summary>
+/// The peer's last reply signalled DFC — its buffers are full — so the link
+/// layer refuses to queue more user data until a later reply clears it.
+/// </summary>
+public class DataFlowControlException : Dnp3Exception
+{
+    /// <summary>Creates the exception with a message.</summary>
+    public DataFlowControlException(
+        string message = "link: peer has signalled data flow control")
+        : base(message) { }
+}
+
 /// <summary>The channel has no established connection.</summary>
 public class NoConnectionException : Dnp3Exception
 {

@@ -17,6 +17,9 @@ For the exhaustive list of types and signatures, see the
 - [Events, classes and deadbands](#events-classes-and-deadbands)
 - [Controls](#controls)
 - [Time synchronisation](#time-synchronisation)
+- [Device attributes](#device-attributes)
+- [File transfer](#file-transfer)
+- [Multidrop: several sessions on one line](#multidrop-several-sessions-on-one-line)
 - [Testing without hardware](#testing-without-hardware)
 - [Decoding traffic](#decoding-traffic)
 - [The example tools](#the-example-tools)
@@ -810,6 +813,170 @@ one. A device with a GPS clock should refuse.
 
 ---
 
+## Device attributes
+
+Group 0 is what a device says about itself: who made it, what it is, what
+firmware it runs, and how many points of each kind it has. A master
+commissioning an unfamiliar panel reads them instead of trusting a drawing.
+
+```csharp
+foreach (var a in await master.ReadAttributesAsync(ct))
+{
+    Console.WriteLine($"{a.Name()}: {a.ValueText()}");
+}
+
+// Or one at a time, when you know what you want.
+var model = await master.ReadAttributeAsync(AttributeNumbers.StandardSet, 250, ct);
+```
+
+Group 0 is unlike every other object in the protocol: the variation is not an
+encoding, it is the attribute's *identity*. Variation 242 **is** the software
+version. That is why an attribute a device invents for itself parses as well as
+one the standard named — the value carries its own type and length — and why
+`DeviceAttribute` exposes `Name()` and `ValueText()` rather than a typed field
+per attribute.
+
+On the outstation side, list what only the application can know. The point
+counts and fragment sizes are derived from the running database, so they cannot
+drift from what a master is about to poll:
+
+```csharp
+var config = new OutstationConfig { /* ... */ };
+config.Attributes.Add(DeviceAttribute.String(252, "DSC Systems"));
+config.Attributes.Add(DeviceAttribute.String(250, "RTU-9000"));
+config.Attributes.Add(DeviceAttribute.String(248, "SN-0001"));
+
+var outstation = new OutstationSession(config);   // read once, at construction
+```
+
+A configured attribute replaces a derived one with the same number, so a device
+that has been told its own point count reports that.
+
+---
+
+## File transfer
+
+Group 70 moves whole files: configuration, firmware images, event logs, and the
+directory listings that say what is there. It is unlike the rest of DNP3 —
+nothing is addressed by point index, and a transfer is a conversation rather
+than a request.
+
+```csharp
+var entries = await master.ReadDirectoryAsync("/", ct);
+foreach (var e in entries)
+{
+    Console.WriteLine(e);           // -rw-r--r--      788 config.yaml
+}
+
+var bytes = await master.ReadFileBytesAsync("/config.yaml", ct);
+await master.WriteFileBytesAsync("/config.yaml", updated, ct);
+await master.DeleteFileAsync("/old.log", ct);
+
+var info = await master.FileInfoAsync("/config.yaml", ct);
+```
+
+For anything large, stream it rather than holding it in memory —
+`ReadFileBytesAsync` caps at `MasterSession.MaxFileSize` precisely so a device
+reporting an implausible size cannot exhaust the master:
+
+```csharp
+await using var dst = File.Create("firmware.bin");
+var octets = await master.ReadFileAsync("/firmware.bin", dst, ct);
+```
+
+A transfer holds the session for its whole duration: polls queued behind a
+firmware image wait for it, which on a serial link is minutes of the line. That
+is deliberate — a poll landing between two blocks would put the outstation's
+inactivity timer at risk, and it is holding a handle throughout.
+
+A failure part way through still closes the file. An outstation left holding a
+handle refuses the next transfer until its own timeout expires, so a master that
+did not close would have locked itself out.
+
+### Serving files
+
+File transfer is off until a handler is set. Handing a master a path into the
+device's filesystem is authority no outstation should grant by default:
+
+```csharp
+var config = new OutstationConfig
+{
+    Files = new FileConfig
+    {
+        Handler = new DirectoryFileHandler("/var/lib/rtu/files") { ReadOnly = true },
+        MaxBlockSize = 1024,
+        Timeout = TimeSpan.FromSeconds(60),
+    },
+};
+```
+
+`DirectoryFileHandler` serves one directory and nothing above it. Path traversal
+is the obvious attack here, and the defence is not string sanitising: a name is
+first collapsed against the served directory as though it were the whole
+filesystem — which is what a device does and what a master expects, since DNP3
+names are usually absolute — and the resolved path is then compared against the
+root's real location, symbolic links included. Anything that lands outside is
+refused.
+
+Implement `IFileHandler` for anything else. Every method reports a `FileStatus`
+rather than throwing, because the status is what goes on the wire: a master
+distinguishes a missing file from a denied one, and flattening both into
+"failed" leaves it unable to tell whether retrying could ever work.
+
+---
+
+## Multidrop: several sessions on one line
+
+A session owns its channel, which is right over TCP and impossible on an RS-485
+line: one pair carries every station, and a serial port cannot be opened twice.
+A `Bus` sits between them, opening the shared channel once and handing each
+session a channel of its own.
+
+```csharp
+using var port = new SerialChannel(cfg, Retry.Default);
+using var bus = new Bus(port, new BusConfig { Turnaround = TimeSpan.FromSeconds(2) });
+
+foreach (ushort addr in new ushort[] { 10, 11, 12 })
+{
+    var ch = bus.Add(new Station { LocalAddr = 1, RemoteAddr = addr, IsMaster = true });
+    var m = new MasterSession(new MasterConfig
+    {
+        LocalAddr = 1, RemoteAddr = addr, UseLinkConfirms = true,
+    }, handler);
+
+    _ = m.RunAsync(ch, ct);
+}
+```
+
+Nothing above the bus changes: each session still connects, reconnects and owns
+its stack. The bus routes inbound frames to the station they are addressed to,
+serialises what goes out so two stations' frames cannot interleave, and — because
+the line is half duplex — keeps one master's exchange from starting while
+another's is still in flight. The same arrangement covers a terminal server:
+several RTUs behind one TCP connection to a serial gateway is the same line with
+a longer wire.
+
+What the bus does *not* do is schedule the sessions against each other. Each
+master polls on its own clock; three of them polling a slow line every second
+will spend their time waiting for each other. Pace the polls.
+
+`Turnaround` bounds the damage a silent outstation does: the line is idle for
+that long before another master may transmit. Too short and a slow device's reply
+collides with the next request; too long and one dead station paces the line.
+
+When two independent parts of a program might reach the same device, neither
+aware of the other, each doing the right thing alone reproduces the problem the
+bus exists to solve — two buses, two opens, the second refused by the OS. A
+`BusRegistry` is where they meet:
+
+```csharp
+var bus = registry.Open(new SerialChannel(cfg, Retry.Default));
+// ... later, once every caller that opened it has released it, the line closes.
+registry.Release(bus);
+```
+
+---
+
 ## Testing without hardware
 
 `Pipe.Create` connects a full master to a full outstation in memory: the real
@@ -994,6 +1161,18 @@ is worse than one that writes a little more slowly.
 
 `-listen` serves `/status`, `/points` and `/healthz`.
 
+Alongside `operate`, six subcommands connect, do one thing and exit — what you
+reach for when commissioning rather than monitoring:
+
+```console
+$ dnp3-master -host 10.0.0.5:20000 attributes        # what the device says it is
+$ dnp3-master -host 10.0.0.5:20000 ls /              # what files it has
+$ dnp3-master -host 10.0.0.5:20000 stat /config.yaml
+$ dnp3-master -host 10.0.0.5:20000 get /config.yaml  # to stdout, or name a file
+$ dnp3-master -host 10.0.0.5:20000 put /config.yaml ./new.yaml
+$ dnp3-master -host 10.0.0.5:20000 rm /old.log
+```
+
 ### The outstation — a simulated RTU
 
 ```console
@@ -1006,6 +1185,33 @@ $ dotnet run --project src/SharpDnp3.Tools.Outstation -- -max-masters 4         
 
 The points behave like plant: a breaker stays open once tripped and takes time to
 travel, an analog ramps rather than jumping, and a control closes the loop.
+
+It also answers the two things a master asks about a device rather than about
+its plant. Group 0 attributes come from the `device:` section of the
+configuration, with the point counts and fragment sizes derived from the running
+database so they cannot disagree with it. File transfer serves a small
+filesystem synthesised in memory — a device description, the point list, a
+configuration file and a log — so a master's file support can be exercised
+without preparing anything:
+
+```yaml
+device:
+  vendor: DSC Systems
+  model: RTU-9000
+  serial: SN-0001
+  location: Bay 3
+  attributes:                  # anything the named fields do not cover
+    - {variation: 206, type: uint, value: 1}
+
+files:
+  directory: ./served          # empty serves the in-memory filesystem
+  read_only: true              # refuse writes and deletes
+  disabled: false              # true answers the file codes as unsupported
+```
+
+Naming a directory serves that directory and only that directory: the handler is
+rooted, so a master asking for `../../etc/passwd` — or following a symlink out —
+is refused rather than served.
 
 ### The decoder — offline frame decoder
 
@@ -1150,6 +1356,10 @@ started. Move it into `Session.Update`.
   never answered, as the standard requires.
 - Use TLS with mutual authentication for anything that leaves a locked cabinet.
   Secure Authentication v5 is out of scope.
+- File transfer hands a master a path into the device's filesystem over a
+  protocol with no authentication of its own. It is off until you set a handler;
+  leave it off unless you need it, prefer `ReadOnly`, and serve the narrowest
+  directory that will do.
 - Size the event buffer for the worst burst, and alarm on the overflow
   indication.
 - Keep polling even with unsolicited reporting enabled.

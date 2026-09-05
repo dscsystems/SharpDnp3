@@ -205,6 +205,24 @@ internal sealed class Harness : IAsyncDisposable
     }
 
     /// <summary>
+    /// Transmits a request with a caller-chosen application control octet,
+    /// which is how a test builds a fragment a master would never send.
+    /// </summary>
+    /// <remarks>
+    /// It does not advance <see cref="Seq"/>, so a caller can repeat a
+    /// sequence number deliberately.
+    /// </remarks>
+    public async Task SendWithControlAsync(
+        AppControl control,
+        FuncCode fc,
+        params ObjectHeader[] objects)
+    {
+        var frag = FragmentFactory.BuildRequest(control, fc, objects);
+        _txStack.Send(_sink, frag);
+        await FlushAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Transmits a request to a specific link address, for broadcast tests.
     /// </summary>
     public async Task SendToAsync(ushort dest, FuncCode fc, params ObjectHeader[] objects)
@@ -220,11 +238,11 @@ internal sealed class Harness : IAsyncDisposable
     /// <summary>
     /// Acknowledges a response so the outstation may drop its events.
     /// </summary>
-    public async Task SendConfirmAsync(byte seq)
+    public async Task SendConfirmAsync(byte seq, bool unsolicited = false)
     {
         var dst = new List<byte>(AppConstants.RequestHeaderSize);
         HeaderCodec.AppendHeader(dst, new AppHeader(
-            new AppControl(Fir: true, Fin: true, Con: false, Uns: false, seq),
+            new AppControl(Fir: true, Fin: true, Con: false, Uns: unsolicited, seq),
             FuncCode.Confirm,
             Iin.None));
 

@@ -90,6 +90,12 @@ internal sealed class MasterTask
     public byte Seq { get; set; }
 
     /// <summary>
+    /// Set once a fragment of this task's response series has been accepted,
+    /// which is what tells a first fragment apart from a repeat of one.
+    /// </summary>
+    public bool Started { get; set; }
+
+    /// <summary>
     /// Receives the outcome, for callers waiting on a one-shot task.
     /// </summary>
     public TaskCompletionSource<bool>? Done { get; set; }

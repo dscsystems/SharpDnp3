@@ -308,8 +308,20 @@ public static class Pipe
     public static (IChannel A, IChannel B) Create()
     {
         var pair = new PipePair();
-        return (new PipeEnd(pair, 0), new PipeEnd(pair, 1));
+        var id = Interlocked.Increment(ref _pipes);
+        return (new PipeEnd(pair, id, 0), new PipeEnd(pair, id, 1));
     }
+
+    /// <summary>
+    /// Numbers the pipes, so two of them in one process describe themselves
+    /// differently.
+    /// </summary>
+    /// <remarks>
+    /// A channel's description is its identity: it is what a log line names and
+    /// what <c>BusRegistry</c> compares to decide two callers mean the same
+    /// line. Two pipes are two lines, so they must not share one.
+    /// </remarks>
+    private static int _pipes;
 
     private sealed class PipePair
     {
@@ -380,7 +392,7 @@ public static class Pipe
         }
     }
 
-    private sealed class PipeEnd(PipePair pair, int side) : IChannel
+    private sealed class PipeEnd(PipePair pair, int id, int side) : IChannel
     {
         public Task<Stream> ConnectAsync(CancellationToken cancellationToken)
         {
@@ -393,7 +405,7 @@ public static class Pipe
         public void Dispose() => Close();
 
         public override string ToString() =>
-            string.Format(CultureInfo.InvariantCulture, "pipe-{0}", side);
+            string.Format(CultureInfo.InvariantCulture, "pipe{0}-{1}", id, side);
     }
 }
 

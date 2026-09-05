@@ -283,17 +283,41 @@ public struct TransportStats
     /// <summary>Segments dropped for any reason.</summary>
     public ulong SegmentsDiscarded;
 
-    /// <summary>Per-reason discard counters, indexed by <see cref="DiscardReason"/>.</summary>
-    public ulong[] Discards;
+    /// <summary>The number of distinct <see cref="DiscardReason"/> values.</summary>
+    internal const int DiscardReasonCount = 6;
 
-    /// <summary>Creates a zeroed set of counters.</summary>
-    public TransportStats() => Discards = new ulong[6];
+    /// <summary>Per-reason discard counters, indexed by <see cref="DiscardReason"/>.</summary>
+    /// <remarks>
+    /// An inline array rather than a heap one, so copying the struct copies the
+    /// counters. A snapshot that shared the array with the live reassembler
+    /// would keep changing under the caller, which defeats the point of taking
+    /// one — two snapshots could not be subtracted to find what happened in
+    /// between.
+    /// </remarks>
+    private DiscardCounters _discards;
 
     /// <summary>Returns the count for one discard reason.</summary>
     public readonly ulong Discarded(DiscardReason reason)
     {
         var i = (int)reason;
-        return Discards is not null && i < Discards.Length ? Discards[i] : 0;
+        return (uint)i < DiscardReasonCount ? _discards[i] : 0;
+    }
+
+    /// <summary>Adds one to the counter for <paramref name="reason"/>.</summary>
+    internal void Bump(DiscardReason reason)
+    {
+        var i = (int)reason;
+        if ((uint)i < DiscardReasonCount)
+        {
+            _discards[i]++;
+        }
+    }
+
+    /// <summary>Storage for the per-reason counters.</summary>
+    [System.Runtime.CompilerServices.InlineArray(DiscardReasonCount)]
+    private struct DiscardCounters
+    {
+        private ulong _element0;
     }
 }
 
@@ -340,7 +364,7 @@ internal sealed class Reassembler
     private int _len;
     private byte _expect;
     private bool _assembly;
-    private TransportStats _stats = new();
+    private TransportStats _stats;
 
     /// <summary>
     /// Creates a reassembler with the given fragment cap. Pass zero for
@@ -407,7 +431,7 @@ internal sealed class Reassembler
             {
                 reported = DiscardReason.UnexpectedFir;
                 _stats.SegmentsDiscarded++;
-                _stats.Discards[(int)DiscardReason.UnexpectedFir]++;
+                _stats.Bump(DiscardReason.UnexpectedFir);
             }
 
             _len = 0;
@@ -485,7 +509,7 @@ internal sealed class Reassembler
     private TransportResult Discard(DiscardReason reason)
     {
         _stats.SegmentsDiscarded++;
-        _stats.Discards[(int)reason]++;
+        _stats.Bump(reason);
         return new TransportResult { Discarded = reason };
     }
 }

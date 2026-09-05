@@ -20,10 +20,11 @@ internal readonly struct SecResult
     public ReadOnlyMemory<byte> Payload { get; init; }
 
     /// <summary>
-    /// Set when a frame carried user data that was dropped. The usual cause is
-    /// a frame count bit mismatch, meaning the peer retransmitted something
+    /// Set when a received frame was dropped. The usual cause is a frame count
+    /// bit mismatch on user data, meaning the peer retransmitted something
     /// already accepted, which is correct behaviour rather than an error — but
-    /// worth counting.
+    /// worth counting. It is also set for a frame whose control field is not a
+    /// valid combination.
     /// </summary>
     public bool Discarded { get; init; }
 
@@ -54,6 +55,35 @@ internal sealed class Secondary
     private bool _expectFcb;
 
     /// <summary>
+    /// Reports whether a primary frame's control field is one of the
+    /// combinations the standard's control-code validity matrix allows.
+    /// </summary>
+    /// <remarks>
+    /// FCV says whether the frame count bit carries meaning, so it is fixed by
+    /// the function code: set for the two functions that use the FCB, clear for
+    /// those that do not. A frame whose FCV contradicts its function code is
+    /// not safe to act on — most sharply for confirmed user data, where the FCB
+    /// is what decides whether a payload is new or a duplicate of one already
+    /// delivered. Acting on a bit the sender has declared meaningless can drop
+    /// live data and acknowledge it as received.
+    /// </remarks>
+    private static bool ValidControl(Control c) => c.Func switch
+    {
+        LinkFunction.TestLinkStates or LinkFunction.ConfirmedUserData => c.Fcv,
+
+        // ResetLinkStates and Ack share the value 0, as do UnconfirmedUserData
+        // and NotSupported's neighbours; this switch only ever sees primary
+        // frames, so the primary reading is the right one.
+        LinkFunction.ResetLinkStates or
+        LinkFunction.UnconfirmedUserData or
+        LinkFunction.RequestLinkStatus => !c.Fcv,
+
+        // Not an FCV question: an unrecognised function code is answered with
+        // NOT_SUPPORTED rather than discarded.
+        _ => true,
+    };
+
+    /// <summary>
     /// Returns the secondary to its unreset state. A session calls this when
     /// the underlying connection is re-established, because link state does not
     /// survive a socket.
@@ -81,6 +111,20 @@ internal sealed class Secondary
         if (!f.Header.Control.Prm)
         {
             return default;
+        }
+
+        // A control field that is not a valid combination is discarded
+        // outright, without a reply: answering it would confirm a frame we are
+        // refusing to act on, and the peer's own timeout is what should tell it
+        // something is wrong.
+        if (!ValidControl(f.Header.Control))
+        {
+            return new SecResult { Discarded = true };
+        }
+
+        if (LinkConstants.IsBroadcast(f.Header.Dest))
+        {
+            return OnBroadcast(f);
         }
 
         var src = f.Header.Src;
@@ -150,6 +194,34 @@ internal sealed class Secondary
                 return new SecResult { Reply = BuildReply(LinkFunction.NotSupported, src) };
         }
     }
+
+    /// <summary>
+    /// Handles a frame addressed to every station on the line.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Nothing here ever replies. A broadcast reaches every outstation at once,
+    /// so answering one would have all of them transmit at the same moment —
+    /// the collision the application layer above already goes to some length to
+    /// avoid. That rules out the functions whose whole purpose is to be
+    /// answered: link status, and the link-state reset and test. What is left
+    /// is user data, which is what a broadcast address is for, and its payload
+    /// goes up.
+    /// </para>
+    /// <para>
+    /// The frame count bit is deliberately not touched, for confirmed user data
+    /// as much as for unconfirmed. That state belongs to the confirmed exchange
+    /// with one particular station, established by a reset handshake this frame
+    /// is no part of; letting a broadcast advance it would leave the next frame
+    /// from the real peer judged against a bit somebody else moved.
+    /// </para>
+    /// </remarks>
+    private static SecResult OnBroadcast(LinkFrame f) => f.Header.Control.Func switch
+    {
+        LinkFunction.ConfirmedUserData or LinkFunction.UnconfirmedUserData =>
+            new SecResult { Payload = f.Payload },
+        _ => new SecResult { Discarded = true },
+    };
 
     /// <summary>Builds a secondary-to-primary frame back to <paramref name="dest"/>.</summary>
     private LinkFrame BuildReply(LinkFunction fn, ushort dest) => new()
