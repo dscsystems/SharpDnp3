@@ -327,8 +327,9 @@ public class MultiMasterTests
 
         fx.Outstation.Restart();
 
-        // Small delay to ensure restart state is established before polling
-        await Task.Delay(100);
+        // Larger delay to ensure restart state is established before polling.
+        // 100ms is insufficient on slower CI runners.
+        await Task.Delay(500);
 
         // The first master polls, is told, and clears the indication it was
         // given. The second has not polled yet, so it must still be told when
