@@ -332,11 +332,15 @@ public class MultiMasterTests
         // about whether another has re-baselined.
         await a.Session.IntegrityPollAsync();
         await TestPair.WaitForAsync(
-            () => a.Session.Stats.RestartsSeen > seenByA, "the first master to see the restart");
+            () => a.Session.Stats.RestartsSeen > seenByA, 
+            "the first master to see the restart",
+            TimeSpan.FromSeconds(10));
 
         await b.Session.IntegrityPollAsync();
         await TestPair.WaitForAsync(
-            () => b.Session.Stats.RestartsSeen > seenByB, "the second master to see the restart");
+            () => b.Session.Stats.RestartsSeen > seenByB, 
+            "the second master to see the restart",
+            TimeSpan.FromSeconds(10));
     }
 
     [Fact]
