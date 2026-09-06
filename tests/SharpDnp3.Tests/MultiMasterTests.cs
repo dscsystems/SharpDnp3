@@ -314,10 +314,25 @@ public class MultiMasterTests
         var b = fx.AddMaster(2, m => m.IntegrityOnStartup = true);
         await MultiMasterFixture.WaitConnectedAsync(a, b);
 
+        // Both associations have to exist before the restart is raised. A
+        // master reports itself connected as soon as it has a stream, which is
+        // before the outstation has accepted it — raising the restart in that
+        // gap marks an association that is not there yet.
+        await TestPair.WaitForAsync(
+            () => fx.Outstation.MastersAttached == 2,
+            "both masters to attach at the outstation",
+            TimeSpan.FromSeconds(10));
+
         // Both masters answer the restart the outstation asserts at startup by
         // clearing it, so what is counted below is the new restart only.
+        //
+        // The `!= default` matters: an indication nobody has reported yet is
+        // zero, and zero does not have the restart bit. Without it this waits
+        // for nothing and runs on before either master has seen a response.
         await TestPair.WaitForAsync(
-            () => !a.Handler.Read(h => h.LastIin).Has(Iin.DeviceRestart) &&
+            () => a.Handler.Read(h => h.LastIin) != default &&
+                  b.Handler.Read(h => h.LastIin) != default &&
+                  !a.Handler.Read(h => h.LastIin).Has(Iin.DeviceRestart) &&
                   !b.Handler.Read(h => h.LastIin).Has(Iin.DeviceRestart),
             "both masters to clear the startup restart indication",
             TimeSpan.FromSeconds(10));
