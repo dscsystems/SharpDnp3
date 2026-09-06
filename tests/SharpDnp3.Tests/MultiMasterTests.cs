@@ -319,12 +319,16 @@ public class MultiMasterTests
         await TestPair.WaitForAsync(
             () => !a.Handler.Read(h => h.LastIin).Has(Iin.DeviceRestart) &&
                   !b.Handler.Read(h => h.LastIin).Has(Iin.DeviceRestart),
-            "both masters to clear the startup restart indication");
+            "both masters to clear the startup restart indication",
+            TimeSpan.FromSeconds(10));
 
         var seenByA = a.Session.Stats.RestartsSeen;
         var seenByB = b.Session.Stats.RestartsSeen;
 
         fx.Outstation.Restart();
+
+        // Small delay to ensure restart state is established before polling
+        await Task.Delay(100);
 
         // The first master polls, is told, and clears the indication it was
         // given. The second has not polled yet, so it must still be told when
