@@ -221,6 +221,18 @@ public sealed partial class MasterSession
     private bool _startupActive;
 
     /// <summary>
+    /// Set while the outstation is still echoing the restart the running
+    /// startup sequence was raised to handle.
+    /// </summary>
+    /// <remarks>
+    /// It is what tells that echo apart from a device that has restarted
+    /// again since. The echo ends at the first response without the
+    /// indication, which is the outstation confirming the sequence's clear
+    /// landed.
+    /// </remarks>
+    private bool _restartUnacknowledged;
+
+    /// <summary>
     /// Creates a master session. Pass a null handler for
     /// <see cref="NopHandler"/>.
     /// </summary>
@@ -404,6 +416,11 @@ public sealed partial class MasterSession
         }
 
         _startupActive = true;
+
+        // Until the outstation stops asserting it, every response still
+        // carries the restart this sequence is answering.
+        _restartUnacknowledged = true;
+
         Enqueue(steps[0]);
     }
 
@@ -867,15 +884,26 @@ public sealed partial class MasterSession
 
         if (!iin.Has(Iin.DeviceRestart))
         {
+            // The outstation has stopped asserting it, which is proof the
+            // clear this startup sequence sent has landed. Anything that
+            // asserts it again is a new restart rather than an echo of the one
+            // being handled.
+            _restartUnacknowledged = false;
             return;
         }
 
-        if (_startupActive)
+        if (_startupActive && _restartUnacknowledged)
         {
             // The sequence already running is the response to this. Its first
             // step is the write that clears the indication, so every fragment
             // until then still carries it — reacting again would restart the
             // sequence on its own output, indefinitely.
+            //
+            // Only until then, though. The sequence takes several round trips
+            // after the clear, and a device that restarts during them has to be
+            // heard: suppressing that would leave the master holding a stale
+            // picture with nothing left to tell it so, because this sequence's
+            // own clear has already taken the indication away.
             return;
         }
 

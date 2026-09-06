@@ -327,22 +327,24 @@ public class MultiMasterTests
 
         fx.Outstation.Restart();
 
-        // Small delay to ensure restart state is established before polling
-        await Task.Delay(100);
-
+        // No delay is needed before polling. Restart latches a flag on every
+        // attached association, and an association applies it at the top of
+        // the next request it handles as well as on its own tick, so the poll
+        // below cannot outrun it.
+        //
         // The first master polls, is told, and clears the indication it was
         // given. The second has not polled yet, so it must still be told when
         // it does: the clear is a handshake with one master and says nothing
         // about whether another has re-baselined.
         await a.Session.IntegrityPollAsync();
         await TestPair.WaitForAsync(
-            () => a.Session.Stats.RestartsSeen > seenByA, 
+            () => a.Session.Stats.RestartsSeen > seenByA,
             "the first master to see the restart",
             TimeSpan.FromSeconds(10));
 
         await b.Session.IntegrityPollAsync();
         await TestPair.WaitForAsync(
-            () => b.Session.Stats.RestartsSeen > seenByB, 
+            () => b.Session.Stats.RestartsSeen > seenByB,
             "the second master to see the restart",
             TimeSpan.FromSeconds(10));
     }
