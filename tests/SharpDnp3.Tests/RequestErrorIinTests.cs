@@ -71,6 +71,21 @@ public sealed class RequestErrorIinTests
     }
 
     [Fact]
+    public async Task OutOfRangeReadSetsParameterError()
+    {
+        var (master, cts) = await StartAsync();
+        using (cts)
+        {
+            var bad = await master.SendRequestAsync(FuncCode.Read, [FragmentFactory.ReadRange(1, 0, 2, 9)], cancellationToken: cts.Token);
+            Assert.True(bad.Iin.Has(Iin.ParameterError));
+
+            var good = await master.SendRequestAsync(FuncCode.Read, [FragmentFactory.ReadRange(1, 0, 0, 3)], cancellationToken: cts.Token);
+            Assert.False(good.Iin.HasError());
+            cts.Cancel();
+        }
+    }
+
+    [Fact]
     public async Task ExtensionRequestsAreAccepted()
     {
         var (master, cts) = await StartAsync();

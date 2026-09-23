@@ -1491,8 +1491,17 @@ public sealed partial class OutstationSession
             ushort stop = 0xFFFF;
             if (h.Range.Spec.IsStartStop())
             {
-                start = (ushort)h.Range.Start;
-                stop = (ushort)h.Range.Stop;
+                // A range reaching past the last configured point asks for
+                // points that do not exist. The ones that do exist are still
+                // returned, but the master is told part of its request was out
+                // of range rather than being left to guess from a short answer.
+                if (h.Range.Stop >= (uint)ResponseWriter.TypeCount(_db.Counts(), pt) || h.Range.Stop > ushort.MaxValue)
+                {
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
+                }
+
+                start = (ushort)Math.Min(h.Range.Start, ushort.MaxValue);
+                stop = (ushort)Math.Min(h.Range.Stop, ushort.MaxValue);
             }
 
             _writer.BuildStaticRange(b, pt, h.Variation, start, stop);
