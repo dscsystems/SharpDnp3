@@ -133,27 +133,54 @@ internal sealed class ResponseWriter
             return;
         }
 
-        if (variation == 0)
+        for (var idx = start; idx <= stop;)
         {
             // Variation zero means "use your default", which is the per-point
-            // static variation the configuration set.
-            if (!TryPointConfig(pt, start, out var cfg))
+            // static variation the configuration set. Points may differ, so the
+            // range is cut wherever it changes: encoding the whole range in the
+            // first point's variation would truncate a float point that follows
+            // an integer one.
+            var runStop = stop;
+            var v = variation;
+            if (v == 0)
+            {
+                if (!TryPointConfig(pt, idx, out var cfg))
+                {
+                    return;
+                }
+
+                v = cfg.StaticVariation;
+                for (var i = idx; i < stop; i++)
+                {
+                    if (!TryPointConfig(pt, (ushort)(i + 1), out var next) || next.StaticVariation != v)
+                    {
+                        runStop = i;
+                        break;
+                    }
+                }
+            }
+
+            if (!BuildStaticRun(b, pt, Database.StaticGroupVar(pt, v), idx, runStop) || runStop == ushort.MaxValue)
             {
                 return;
             }
 
-            variation = cfg.StaticVariation;
+            idx = (ushort)(runStop + 1);
         }
+    }
 
-        var gv = Database.StaticGroupVar(pt, variation);
+    /// <summary>Appends points sharing one encoding, splitting at fragment boundaries.</summary>
+    /// <returns>False when nothing more can be written.</returns>
+    private bool BuildStaticRun(ResponseBuilder b, PointType pt, GroupVar gv, ushort start, ushort stop)
+    {
         if (!ObjectRegistry.TryLookup(gv, out var d))
         {
-            return;
+            return false;
         }
 
         if (!d.TrySizeOctets(out var size) || size == 0)
         {
-            return;
+            return false;
         }
 
         // Worst-case 16-bit range.
@@ -171,7 +198,7 @@ internal sealed class ResponseWriter
                 if (avail < size)
                 {
                     // A single object does not fit an empty fragment.
-                    return;
+                    return false;
                 }
             }
 
@@ -188,11 +215,13 @@ internal sealed class ResponseWriter
 
             if (last == ushort.MaxValue)
             {
-                return;
+                return true;
             }
 
             idx = (ushort)(last + 1);
         }
+
+        return true;
     }
 
     /// <summary>Appends one point's static encoding.</summary>

@@ -339,6 +339,34 @@ public class IntegrationTests
         Assert.Equal(1234.5, pair.Handler.Read(h => h.Analogs[2].Value));
     }
 
+    /// <summary>
+    /// An integrity poll asks for Class 1, 2, 3 and then 0, and the answer must
+    /// keep that order: the master applies objects as they come, so a buffered
+    /// event placed after the static data would roll the point back. The
+    /// deadband makes the event and the current value differ.
+    /// </summary>
+    [Fact]
+    public async Task IntegrityPollEndsOnTheCurrentValue()
+    {
+        await using var pair = new TestPair();
+        await pair.WaitConnectedAsync();
+
+        pair.Outstation.Database.Configure(PointType.Analog, 3, new PointConfig
+        {
+            Class = Class.Class1,
+            StaticVariation = 5,
+            EventVariation = 5,
+            Deadband = 1,
+        });
+
+        pair.Outstation.Update(db => db.UpdateAnalog(3, new Analog(10, Flags.Online, Now())));
+        pair.Outstation.Update(db => db.UpdateAnalog(3, new Analog(10.5, Flags.Online, Now())));
+
+        await pair.Master.IntegrityPollAsync();
+
+        Assert.Equal(10.5, pair.Handler.Read(h => h.Analogs[3].Value));
+    }
+
     [Fact]
     public async Task EventsArriveOnAClassPoll()
     {
