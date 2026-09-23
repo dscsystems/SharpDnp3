@@ -260,8 +260,8 @@ public readonly struct ControlCode : IEquatable<ControlCode>
 
     // Trip/close modifiers, which pair with an operation type to drive the two
     // coils of a breaker.
-    public static ControlCode Close { get; }    // 0x80
-    public static ControlCode Trip  { get; }    // 0x40
+    public static ControlCode Close { get; }    // 0x40 (trip-close code 1)
+    public static ControlCode Trip  { get; }    // 0x80 (trip-close code 2)
 
     public ControlCode OpType();
     public bool IsTrip();
