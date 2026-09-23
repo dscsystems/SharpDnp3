@@ -323,18 +323,27 @@ public class MultiMasterTests
             "both masters to attach at the outstation",
             TimeSpan.FromSeconds(10));
 
-        // Both masters answer the restart the outstation asserts at startup by
-        // clearing it, so what is counted below is the new restart only.
+        // Both startup sequences have to be finished, not merely past their
+        // first step. This configuration produces two tasks — clear the
+        // restart indication the outstation asserts at startup, then the
+        // integrity poll — and until both have run the master still has work
+        // queued or in flight.
         //
-        // The `!= default` matters: an indication nobody has reported yet is
-        // zero, and zero does not have the restart bit. Without it this waits
-        // for nothing and runs on before either master has seen a response.
+        // Waiting on the indication alone is not enough, and gets it wrong
+        // twice over. An indication nobody has reported yet is zero, and zero
+        // does not have the restart bit, so the wait passes before a single
+        // response has arrived; and even once the clear has landed the second
+        // step is still to come. A restart raised in that window is seen —
+        // correctly — and re-runs the sequence, and re-running it drops
+        // whatever is queued and fails the caller waiting on it. The poll
+        // below would then be collateral rather than the thing under test.
+        // RestartDuringStartupTests covers that window deliberately.
         await TestPair.WaitForAsync(
-            () => a.Handler.Read(h => h.LastIin) != default &&
-                  b.Handler.Read(h => h.LastIin) != default &&
+            () => a.Session.Stats.TasksSucceeded >= 2 &&
+                  b.Session.Stats.TasksSucceeded >= 2 &&
                   !a.Handler.Read(h => h.LastIin).Has(Iin.DeviceRestart) &&
                   !b.Handler.Read(h => h.LastIin).Has(Iin.DeviceRestart),
-            "both masters to clear the startup restart indication",
+            "both masters to finish their startup sequences",
             TimeSpan.FromSeconds(10));
 
         var seenByA = a.Session.Stats.RestartsSeen;
