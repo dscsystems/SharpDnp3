@@ -2042,8 +2042,16 @@ public sealed partial class OutstationSession
         }
 
         // The broadcast indication reports only the request that arrived by
-        // broadcast, so it is cleared once reported.
-        a.Iin = a.Iin.Clear(Iin.Broadcast);
+        // broadcast, so it is cleared once reported. So are the request-error
+        // indications: NO_FUNC_CODE_SUPPORT, OBJECT_UNKNOWN and PARAMETER_ERROR
+        // describe the request this response answers (or, for one that could
+        // not be answered, the first response after it). Left latched, one bad
+        // request would make every later response report an error the master
+        // never caused.
+        a.Iin = a.Iin.Clear(Iin.Broadcast)
+            .Clear(Iin.NoFuncCodeSupport)
+            .Clear(Iin.ObjectUnknown)
+            .Clear(Iin.ParameterError);
     }
 
     /// <summary>
