@@ -316,11 +316,15 @@ public readonly struct ControlCode : IEquatable<ControlCode>
     private const byte ClearBit = 0x20;
     private const byte TripCloseMask = 0xC0;
 
-    /// <summary>Sets the close coil field.</summary>
-    public static ControlCode Close => new(0x80);
+    // The trip-close code occupies the top two bits: 1 is CLOSE and 2 is TRIP
+    // (IEEE 1815-2012, 12.2.2.3.1), so CLOSE/PULSE_ON is 0x41 and TRIP/PULSE_ON
+    // is 0x81. Swapping them sends the opposite coil to the one asked for.
 
-    /// <summary>Sets the trip coil field.</summary>
-    public static ControlCode Trip => new(0x40);
+    /// <summary>Sets the close coil field (trip-close code 1).</summary>
+    public static ControlCode Close => new(0x40);
+
+    /// <summary>Sets the trip coil field (trip-close code 2).</summary>
+    public static ControlCode Trip => new(0x80);
 
     /// <summary>Returns the operation type nibble.</summary>
     public ControlCode OpType() => new((byte)(Value & OpTypeMask));
