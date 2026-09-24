@@ -156,7 +156,10 @@ public readonly record struct Update
     public PointType Type { get; init; }
 
     /// <summary>The point index.</summary>
-    public ushort Index { get; init; }
+    /// <remarks>
+    /// As wide as <see cref="Indexed{T}"/>'s, for the same reason.
+    /// </remarks>
+    public uint Index { get; init; }
 
     /// <summary>Set when <see cref="Type"/> is <see cref="PointType.Binary"/>.</summary>
     public Binary Binary { get; init; }

@@ -244,7 +244,7 @@ public sealed class Recorder : IDisposable
 // ---------- Live snapshot ----------
 
 /// <summary>Identifies a point within a site.</summary>
-public readonly record struct PointKey(PointType Type, ushort Index);
+public readonly record struct PointKey(PointType Type, uint Index);
 
 /// <summary>One point as the snapshot holds it.</summary>
 public sealed class PointValue
@@ -259,7 +259,7 @@ public sealed class PointValue
 
     /// <summary>The point index.</summary>
     [JsonPropertyName("index")]
-    public ushort Index { get; init; }
+    public uint Index { get; init; }
 
     /// <summary>The latest value, rendered.</summary>
     [JsonPropertyName("value")]

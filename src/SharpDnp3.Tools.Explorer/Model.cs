@@ -58,7 +58,22 @@ public static class ScreenExtensions
 }
 
 /// <summary>Identifies a point in the model's tables.</summary>
-public readonly record struct PointKey(PointType Type, ushort Index);
+public readonly record struct PointKey(PointType Type, uint Index)
+{
+    /// <summary>
+    /// Returns the index a command to this point would be addressed with.
+    /// </summary>
+    /// <remarks>
+    /// A point can be reported at a 32-bit index but commands carry 16-bit
+    /// ones, so a point above 65535 cannot be commanded — and narrowing its
+    /// index to fit would address the command to a different point.
+    /// </remarks>
+    public bool TryCommandIndex(out ushort index)
+    {
+        index = (ushort)Index;
+        return Index <= 0xFFFF;
+    }
+}
 
 /// <summary>One measurement as the UI knows it.</summary>
 public sealed class PointState
@@ -698,7 +713,29 @@ public sealed partial class Model
             return null;
         }
 
-        return IssueControl(ControlOp.Latch(key.Index, closing));
+        if (!TryCommandable(key, out var latchIndex))
+        {
+            return null;
+        }
+
+        return IssueControl(ControlOp.Latch(latchIndex, closing));
+    }
+
+    /// <summary>
+    /// Resolves the index a command to <paramref name="k"/> would carry,
+    /// telling the operator when there is none.
+    /// </summary>
+    private bool TryCommandable(PointKey k, out ushort index)
+    {
+        if (k.TryCommandIndex(out index))
+        {
+            return true;
+        }
+
+        var msg = PointLabel(k) + " is above index 65535 and cannot be commanded";
+        AddLog("warn", msg);
+        Toast.Show("warn", msg, Now);
+        return false;
     }
 
     /// <summary>Either asks first or sends, depending on the confirm setting.</summary>
@@ -1214,7 +1251,12 @@ public sealed partial class Model
             case PromptKind.Analog:
                 try
                 {
-                    var (command, desc) = ParseAnalogWrite(p.Target.Index, p.Input);
+                    if (!TryCommandable(p.Target, out var analogIndex))
+                    {
+                        return null;
+                    }
+
+                    var (command, desc) = ParseAnalogWrite(analogIndex, p.Input);
                     return IssueControl(new ControlOp(desc, command));
                 }
                 catch (FormatException ex)
@@ -1231,10 +1273,15 @@ public sealed partial class Model
                     return null;
                 }
 
+                if (!TryCommandable(p.Target, out var deadbandIndex))
+                {
+                    return null;
+                }
+
                 AddLog("info", string.Format(
                     CultureInfo.InvariantCulture,
-                    "writing deadband {0} to AI {1}", v, p.Target.Index));
-                return Conn.WriteDeadband(p.Target.Index, v);
+                    "writing deadband {0} to AI {1}", v, deadbandIndex));
+                return Conn.WriteDeadband(deadbandIndex, v);
 
             case PromptKind.Range:
                 try
@@ -1413,7 +1460,12 @@ public sealed partial class Model
                 return null;
 
             case ModalKind.Control:
-                var idx = Modal.Target.Index;
+                if (!TryCommandable(Modal.Target, out var idx))
+                {
+                    Modal = new ModalState();
+                    return null;
+                }
+
                 ControlOp op;
                 switch (key)
                 {

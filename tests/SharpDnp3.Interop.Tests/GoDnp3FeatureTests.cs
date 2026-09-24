@@ -78,8 +78,12 @@ public class GoDnp3FeatureTests
 
             // The counts the peer derives from its own database, which is what
             // proves the numbers came out as numbers rather than as octets.
-            var binaries = attrs.SingleOrDefault(a => a.Variation == 226);
-            Assert.True(binaries.Variation == 226, "the peer should report its binary input count");
+            const byte binaryInputCount = SharpDnp3.Outstation.DerivedAttributeNumbers
+                .BinaryInputCount;
+            var binaries = attrs.SingleOrDefault(a => a.Variation == binaryInputCount);
+            Assert.True(
+                binaries.Variation == binaryInputCount,
+                "the peer should report its binary input count");
             Assert.Equal(AttributeType.UnsignedInt, binaries.Type);
             Assert.True(binaries.Number > 0);
 
@@ -91,7 +95,7 @@ public class GoDnp3FeatureTests
 
             // Reading one by name must agree with reading them all.
             var one = await master.ReadAttributeAsync(
-                AttributeNumbers.StandardSet, 226, cts.Token);
+                AttributeNumbers.StandardSet, binaryInputCount, cts.Token);
             Assert.Equal(binaries.Number, one.Number);
         }
         finally

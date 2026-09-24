@@ -133,18 +133,77 @@ internal sealed class ResponseWriter
             return;
         }
 
-        if (variation == 0)
+        if (variation != 0)
         {
-            // Variation zero means "use your default", which is the per-point
-            // static variation the configuration set.
-            if (!TryPointConfig(pt, start, out var cfg))
+            // An explicit variation is the master's choice, and every point in
+            // the range is reported as what it asked for.
+            BuildStaticRun(b, pt, variation, start, stop);
+            return;
+        }
+
+        // Variation zero means "each point's own default" — the static
+        // variation its configuration set, which can differ from one point to
+        // the next. An object header carries exactly one variation, so points
+        // that disagree cannot share one: the range is reported as runs of
+        // consecutive points that agree, each under its own header.
+        //
+        // Resolving the variation once from the first point and applying it to
+        // the rest reports every later point in a variation it did not ask
+        // for. For a float analog following an integer one, that means through
+        // the integer codec, and the master reads back a truncated value it has
+        // no way to know is wrong.
+        //
+        // The loop counts in int so a range ending at 0xFFFF cannot wrap.
+        for (var idx = (int)start; idx <= stop;)
+        {
+            if (!TryStaticVariation(pt, (ushort)idx, out var v))
             {
                 return;
             }
 
+            var end = idx;
+            while (end < stop)
+            {
+                if (!TryStaticVariation(pt, (ushort)(end + 1), out var next) || next != v)
+                {
+                    break;
+                }
+
+                end++;
+            }
+
+            BuildStaticRun(b, pt, v, (ushort)idx, (ushort)end);
+            idx = end + 1;
+        }
+    }
+
+    /// <summary>
+    /// Returns the static variation a point is configured to be reported in.
+    /// </summary>
+    private bool TryStaticVariation(PointType pt, ushort index, out byte variation)
+    {
+        if (TryPointConfig(pt, index, out var cfg))
+        {
             variation = cfg.StaticVariation;
+            return true;
         }
 
+        variation = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Reports points <paramref name="start"/> through <paramref name="stop"/>,
+    /// all in one variation, splitting across fragments as the space in each
+    /// allows.
+    /// </summary>
+    private void BuildStaticRun(
+        ResponseBuilder b,
+        PointType pt,
+        byte variation,
+        ushort start,
+        ushort stop)
+    {
         var gv = Database.StaticGroupVar(pt, variation);
         if (!ObjectRegistry.TryLookup(gv, out var d))
         {
@@ -449,7 +508,7 @@ internal sealed class ResponseWriter
     /// </remarks>
     public void BuildEvents(ResponseBuilder b, IReadOnlyList<Event> events)
     {
-        const int HeaderOverhead = ObjectHeader.ObjectHeaderSize + 1;
+
 
         for (var i = 0; i < events.Count;)
         {
@@ -493,28 +552,59 @@ internal sealed class ResponseWriter
                 j++;
             }
 
-            // A one-octet index prefix plus the object.
-            var perObject = 1 + size;
+            // Each event carries its point index as a prefix, and the prefix
+            // has to be wide enough for every index in the run. A one-octet
+            // prefix holds only 0-255: writing index 300 into it reports the
+            // event against point 44, and the master has no way to know. One
+            // octet is kept where it fits, which is the common case and the
+            // smaller encoding; a run reaching past 255 moves to two octets,
+            // and so to a two-octet count.
+            var prefix = IndexPrefix.Index1;
+            var spec = RangeSpec.Count8;
+            var maxCount = 0xFF;
+            for (var k = i; k < j; k++)
+            {
+                if (events[k].Index > 0xFF)
+                {
+                    prefix = IndexPrefix.Index2;
+                    spec = RangeSpec.Count16;
+                    maxCount = 0xFFFF;
+                    break;
+                }
+            }
+
+            var prefixLen = prefix.Octets();
+            var perObject = prefixLen + size;
+            var headerOverhead = ObjectHeader.ObjectHeaderSize + spec.Octets();
 
             while (i < j)
             {
-                var avail = b.Room - HeaderOverhead;
+                var avail = b.Room - headerOverhead;
                 if (avail < perObject)
                 {
                     b.Flush();
-                    avail = b.Room - HeaderOverhead;
+                    avail = b.Room - headerOverhead;
                     if (avail < perObject)
                     {
                         return;
                     }
                 }
 
-                var runLen = Math.Min(Math.Min(avail / perObject, j - i), 255);
+                var runLen = Math.Min(Math.Min(avail / perObject, j - i), maxCount);
                 var data = new List<byte>(runLen * perObject);
                 for (var k = 0; k < runLen; k++)
                 {
                     var e = events[i + k];
-                    data.Add((byte)e.Index);
+                    if (prefixLen == 1)
+                    {
+                        data.Add((byte)e.Index);
+                    }
+                    else
+                    {
+                        data.Add((byte)e.Index);
+                        data.Add((byte)(e.Index >> 8));
+                    }
+
                     EncodeEvent(data, gv, e, b.Ctx);
                 }
 
@@ -522,8 +612,8 @@ internal sealed class ResponseWriter
                 {
                     Group = gv.Group,
                     Variation = gv.Variation,
-                    Qualifier = Qualifier.Make(IndexPrefix.Index1, RangeSpec.Count8),
-                    Range = new ObjectRange { Spec = RangeSpec.Count8, Count = (uint)runLen },
+                    Qualifier = Qualifier.Make(prefix, spec),
+                    Range = new ObjectRange { Spec = spec, Count = (uint)runLen },
                     Data = data.ToArray(),
                 });
 

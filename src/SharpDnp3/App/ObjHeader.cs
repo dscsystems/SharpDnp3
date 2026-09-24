@@ -146,6 +146,17 @@ internal static class ObjectHeaderCodec
 
         if (!carriesData)
         {
+            // No object data follows, but a list of point indexes may. A
+            // request naming individual points — a read of points 3 and 7 —
+            // uses a count qualifier with an index prefix, and the prefixes are
+            // on the wire even though nothing comes after them. Skipping them
+            // would take the first index for the next object header and reject
+            // the request.
+            if (prefix.IsIndex() && range.Spec.IsCount())
+            {
+                return CheckFits((ulong)range.Count * (ulong)prefix.Octets(), buf, out length);
+            }
+
             return AppParseStatus.Ok;
         }
 

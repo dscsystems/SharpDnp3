@@ -852,6 +852,23 @@ var outstation = new OutstationSession(config);   // read once, at construction
 A configured attribute replaces a derived one with the same number, so a device
 that has been told its own point count reports that.
 
+The numbering is IEEE 1815-2012's set 0 — the same table Wireshark's dissector
+uses. It is worth checking a number against that table rather than against
+memory: the counts sit at 239 (binary inputs), 236 (double-bit), 229 (counters),
+233 (analog inputs), 224 (binary outputs) and 221 (analog outputs), with the
+fragment sizes at 240 and 241.
+
+Variation 255 asks which attributes a device has rather than what they say, and
+is answered with a single list object:
+
+```csharp
+var listed = await master.ReadAttributeAsync(AttributeNumbers.StandardSet, 255, ct);
+foreach (var item in listed.List())
+{
+    Console.WriteLine($"{item.Variation}{(item.Writable ? " (writable)" : "")}");
+}
+```
+
 ---
 
 ## File transfer
@@ -1201,7 +1218,7 @@ device:
   serial: SN-0001
   location: Bay 3
   attributes:                  # anything the named fields do not cover
-    - {variation: 206, type: uint, value: 1}
+    - {variation: 219, type: uint, value: 1}   # analog output events supported
 
 files:
   directory: ./served          # empty serves the in-memory filesystem

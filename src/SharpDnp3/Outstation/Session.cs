@@ -1341,7 +1341,7 @@ public sealed partial class OutstationSession
 
             case FuncCode.ImmedFreeze:
             case FuncCode.ImmedFreezeNR:
-                _db.FreezeCounters();
+                OnFreeze(a, frag);
                 if (frag.Header.Func.NoReply() || r.Broadcast)
                 {
                     return;
@@ -1487,24 +1487,30 @@ public sealed partial class OutstationSession
                 continue;
             }
 
-            ushort start = 0;
-            ushort stop = 0xFFFF;
             if (h.Range.Spec.IsStartStop())
             {
                 // A range reaching past the last configured point asks for
                 // points that do not exist. The ones that do exist are still
                 // returned, but the master is told part of its request was out
                 // of range rather than being left to guess from a short answer.
-                if (h.Range.Stop >= (uint)ResponseWriter.TypeCount(_db.Counts(), pt) || h.Range.Stop > ushort.MaxValue)
+                if (h.Range.Stop >= (uint)ResponseWriter.TypeCount(_db.Counts(), pt) ||
+                    h.Range.Stop > ushort.MaxValue)
                 {
                     a.Iin = a.Iin.Set(Iin.ParameterError);
                 }
-
-                start = (ushort)Math.Min(h.Range.Start, ushort.MaxValue);
-                stop = (ushort)Math.Min(h.Range.Stop, ushort.MaxValue);
             }
 
-            _writer.BuildStaticRange(b, pt, h.Variation, start, stop);
+            var header = h;
+            void Build(ushort start, ushort stop) =>
+                _writer.BuildStaticRange(b, pt, header.Variation, start, stop);
+
+            if (!TryForEachPointRun(h, Build))
+            {
+                // A count with no index prefix says how many points but not
+                // which. It has always been answered with every point, and
+                // still is.
+                Build(0, 0xFFFF);
+            }
         }
 
         if (selected.Count > 0)
@@ -1871,13 +1877,22 @@ public sealed partial class OutstationSession
                 continue;
             }
 
-            if (TryPointTypeForGroup(h.Group, out var assigned))
-            {
-                _db.AssignClass(assigned, cls);
-            }
-            else
+            if (!TryPointTypeForGroup(h.Group, out var assigned))
             {
                 a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                continue;
+            }
+
+            // Only the points the header names change class. Assigning the
+            // whole type regardless would move every other point too — a
+            // request to put two analogs in class 1 silently reclassifying all
+            // of them.
+            var assignedClass = cls;
+            if (!TryForEachPointRun(
+                    h, (start, stop) => _db.AssignClass(assigned, assignedClass, start, stop)))
+            {
+                // A count with no index prefix does not say which points.
+                a.Iin = a.Iin.Set(Iin.ParameterError);
             }
         }
 
@@ -2147,6 +2162,127 @@ public sealed partial class OutstationSession
         }
 
         return iin;
+    }
+
+    /// <summary>
+    /// Calls <paramref name="fn"/> for each run of consecutive point indexes a
+    /// request header names.
+    /// </summary>
+    /// <returns>
+    /// Whether the header names points in a form the outstation understands:
+    /// all objects (every point), a start-stop range (that range), or a count
+    /// with an index prefix (the listed indexes, consecutive ones merged into
+    /// one run). A count with no index prefix says how many points but not
+    /// which, and is left to the caller.
+    /// </returns>
+    /// <remarks>
+    /// Indexes above the 16-bit point space name no point: a range starting
+    /// there is empty, one ending there stops at the top, and a listed one is
+    /// skipped. Narrowing them instead would wrap each onto a point that does
+    /// exist.
+    /// </remarks>
+    private static bool TryForEachPointRun(ObjectHeader h, Action<ushort, ushort> fn)
+    {
+        var spec = h.Range.Spec;
+
+        if (spec == RangeSpec.AllObjects)
+        {
+            fn(0, 0xFFFF);
+            return true;
+        }
+
+        if (spec.IsStartStop())
+        {
+            if (h.Range.Start <= 0xFFFF)
+            {
+                fn((ushort)h.Range.Start, (ushort)Math.Min(h.Range.Stop, 0xFFFF));
+            }
+
+            return true;
+        }
+
+        if (spec.IsCount() && h.Qualifier.IndexPrefix.IsIndex())
+        {
+            var width = h.Qualifier.IndexPrefix.Octets();
+            var data = h.Data.Span;
+            uint first = 0;
+            uint last = 0;
+            var open = false;
+
+            for (var off = 0; off + width <= data.Length; off += width)
+            {
+                var idx = ReadPrefix(data[off..], width);
+                if (idx > 0xFFFF)
+                {
+                    continue;
+                }
+
+                if (open && idx == last + 1)
+                {
+                    last = idx;
+                    continue;
+                }
+
+                if (open)
+                {
+                    fn((ushort)first, (ushort)last);
+                }
+
+                first = idx;
+                last = idx;
+                open = true;
+            }
+
+            if (open)
+            {
+                fn((ushort)first, (ushort)last);
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Copies the counters a freeze request names into their frozen
+    /// counterparts.
+    /// </summary>
+    /// <remarks>
+    /// A request with no objects freezes every counter. One naming counters by
+    /// a group 20 header freezes only those: freezing the lot regardless
+    /// overwrites frozen values the master never asked to change.
+    /// </remarks>
+    private void OnFreeze(Association a, Fragment frag)
+    {
+        // Every counter frozen by one request shares the one moment of the
+        // freeze, taken from the application's clock and only as trustworthy as
+        // that clock: synchronized once the master has set it, unsynchronized
+        // until.
+        var now = _appl.Now();
+        var at = _synchronized ? Timestamp.Now(now) : Timestamp.Unsynchronized(now);
+
+        void Freeze(ushort start, ushort stop) => _db.FreezeCounters(start, stop, at);
+
+        if (frag.Objects.Count == 0)
+        {
+            Freeze(0, 0xFFFF);
+            return;
+        }
+
+        foreach (var h in frag.Objects)
+        {
+            if (h.Group != 20)
+            {
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                continue;
+            }
+
+            if (!TryForEachPointRun(h, Freeze))
+            {
+                a.Iin = a.Iin.Set(Iin.ParameterError);
+            }
+        }
     }
 
     /// <summary>Maps a static object group to its measurement type.</summary>

@@ -17,17 +17,17 @@ internal sealed class RecordingHandler : NopHandler
 {
     private readonly Lock _gate = new();
 
-    public Dictionary<ushort, Binary> Binaries { get; } = [];
+    public Dictionary<uint, Binary> Binaries { get; } = [];
 
-    public Dictionary<ushort, Analog> Analogs { get; } = [];
+    public Dictionary<uint, Analog> Analogs { get; } = [];
 
-    public Dictionary<ushort, Counter> Counters { get; } = [];
+    public Dictionary<uint, Counter> Counters { get; } = [];
 
-    public Dictionary<ushort, BinaryOutputStatus> BinaryOutputs { get; } = [];
+    public Dictionary<uint, BinaryOutputStatus> BinaryOutputs { get; } = [];
 
-    public Dictionary<ushort, byte[]> OctetStrings { get; } = [];
+    public Dictionary<uint, byte[]> OctetStrings { get; } = [];
 
-    public List<(ushort Index, Binary Value)> BinaryEvents { get; } = [];
+    public List<(uint Index, Binary Value)> BinaryEvents { get; } = [];
 
     public int Fragments { get; private set; }
 

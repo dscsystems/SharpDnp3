@@ -37,7 +37,7 @@ public sealed record UpdateMsg : IMsg
     public PointType Type { get; init; }
 
     /// <summary>The point index.</summary>
-    public ushort Index { get; init; }
+    public uint Index { get; init; }
 
     /// <summary>The value, rendered.</summary>
     public string Value { get; init; } = "";

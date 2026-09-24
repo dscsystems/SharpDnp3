@@ -125,11 +125,13 @@ public class AttributeTests
         long ValueOf(byte variation) =>
             attrs.Single(a => a.Variation == variation).Number;
 
-        Assert.Equal(db.Binary, ValueOf(226));
-        Assert.Equal(db.Analog, ValueOf(220));
-        Assert.Equal(db.Counter, ValueOf(216));
-        Assert.Equal(db.BinaryOutputStatus, ValueOf(211));
-        Assert.Equal(db.AnalogOutputStatus, ValueOf(208));
+        Assert.Equal(db.Binary, ValueOf(DerivedAttributeNumbers.BinaryInputCount));
+        Assert.Equal(db.Analog, ValueOf(DerivedAttributeNumbers.AnalogInputCount));
+        Assert.Equal(db.Counter, ValueOf(DerivedAttributeNumbers.CounterCount));
+        Assert.Equal(
+            db.BinaryOutputStatus, ValueOf(DerivedAttributeNumbers.BinaryOutputCount));
+        Assert.Equal(
+            db.AnalogOutputStatus, ValueOf(DerivedAttributeNumbers.AnalogOutputCount));
     }
 
     /// <summary>
@@ -148,9 +150,12 @@ public class AttributeTests
             FuncCode.Read, Read(AttributeNumbers.StandardSet, AttributeNumbers.All));
         var attrs = AttributesOf(resp);
 
-        Assert.Contains(attrs, a => a.Variation == 226);
-        Assert.DoesNotContain(attrs, a => a.Variation == 220);
-        Assert.DoesNotContain(attrs, a => a.Variation == 216);
+        Assert.Contains(
+            attrs, a => a.Variation == DerivedAttributeNumbers.BinaryInputCount);
+        Assert.DoesNotContain(
+            attrs, a => a.Variation == DerivedAttributeNumbers.AnalogInputCount);
+        Assert.DoesNotContain(
+            attrs, a => a.Variation == DerivedAttributeNumbers.CounterCount);
     }
 
     /// <summary>
@@ -161,11 +166,14 @@ public class AttributeTests
     public async Task ConfiguredAttributesOverrideDerivedOnes()
     {
         var cfg = new OutstationConfig { Database = Requests.SmallDatabase() };
-        cfg.Attributes.Add(DeviceAttribute.Uint(226, 999));
+        cfg.Attributes.Add(
+            DeviceAttribute.Uint(DerivedAttributeNumbers.BinaryInputCount, 999));
 
         await using var h = new Harness(cfg);
 
-        var resp = await h.RequestAsync(FuncCode.Read, Read(AttributeNumbers.StandardSet, 226));
+        var resp = await h.RequestAsync(
+            FuncCode.Read,
+            Read(AttributeNumbers.StandardSet, DerivedAttributeNumbers.BinaryInputCount));
         var a = Assert.Single(AttributesOf(resp));
         Assert.Equal(999, a.Number);
     }
@@ -195,17 +203,44 @@ public class AttributeTests
     }
 
     /// <summary>
-    /// Reporting which attributes exist is a distinct encoding this
-    /// implementation does not have, and answering it with the attributes
-    /// themselves would be a different answer to the question asked.
+    /// Variation 255 asks which attributes exist rather than what they say, so
+    /// the answer is one list object naming the set's variations — not the
+    /// attributes themselves, which would be a different answer to the question
+    /// asked.
     /// </summary>
     [Fact]
-    public async Task ListRequestIsRefused()
+    public async Task ListRequestNamesTheVariationsTheDeviceHas()
     {
         await using var h = new Harness(Config());
 
+        var everything = AttributesOf(await h.RequestAsync(
+            FuncCode.Read, Read(AttributeNumbers.StandardSet, AttributeNumbers.All)));
+
         var resp = await h.RequestAsync(
             FuncCode.Read, Read(AttributeNumbers.StandardSet, AttributeNumbers.List));
+
+        Assert.False(resp.Header.Iin.Has(Iin.ObjectUnknown));
+
+        var listed = Assert.Single(AttributesOf(resp));
+        Assert.Equal(AttributeNumbers.List, listed.Variation);
+        Assert.Equal(AttributeType.AttributeList, listed.Type);
+
+        // Every variation the device has, and nothing else. Nothing here
+        // accepts a write, so none is marked writable.
+        var items = listed.List();
+        Assert.Equal(
+            everything.Select(a => a.Variation).Order(),
+            items.Select(i => i.Variation).Order());
+        Assert.All(items, i => Assert.False(i.Writable));
+    }
+
+    /// <summary>A set the device does not use has no list to give.</summary>
+    [Fact]
+    public async Task ListRequestForAnUnknownSetIsRefused()
+    {
+        await using var h = new Harness(Config());
+
+        var resp = await h.RequestAsync(FuncCode.Read, Read(7, AttributeNumbers.List));
 
         Assert.True(resp.Header.Iin.Has(Iin.ObjectUnknown));
         Assert.Empty(AttributesOf(resp));

@@ -66,7 +66,14 @@ public static class AttributeObjects
         }
 
         var type = (AttributeType)buf[0];
-        var size = buf[1];
+        int size = buf[1];
+        if (type == AttributeType.ExtAttributeList)
+        {
+            // The extended list exists because the plain one tops out at 255
+            // octets; its length octet counts from 256.
+            size += 256;
+        }
+
         var end = AttributeHeaderSize + size;
         if (end > buf.Length)
         {
@@ -235,6 +242,44 @@ public static class AttributeObjects
                 CommandObjects.AppendTime48(value, new Timestamp { Time = a.Time });
                 break;
 
+            case AttributeType.AttributeList:
+            case AttributeType.ExtAttributeList:
+            {
+                var octets = a.Octets.Span;
+                if (octets.Length % 2 != 0)
+                {
+                    throw new AttributeException(string.Format(
+                        CultureInfo.InvariantCulture,
+                        "g0v{0} list of {1} octets is not a whole number of entries",
+                        a.Variation, octets.Length));
+                }
+
+                // The type follows the length rather than the caller: a list
+                // that fits the plain form is sent in it, and one that does not
+                // in the extended form, whose length octet counts from 256.
+                if (octets.Length > MaxAttributeValue)
+                {
+                    if (octets.Length > MaxAttributeValue + 256)
+                    {
+                        throw new AttributeException(string.Format(
+                            CultureInfo.InvariantCulture,
+                            "g0v{0} list is {1} octets, and the extended length holds {2}",
+                            a.Variation, octets.Length, MaxAttributeValue + 256));
+                    }
+
+                    dst.Add((byte)AttributeType.ExtAttributeList);
+                    dst.Add((byte)(octets.Length - 256));
+                }
+                else
+                {
+                    dst.Add((byte)AttributeType.AttributeList);
+                    dst.Add((byte)octets.Length);
+                }
+
+                dst.AddRange(octets);
+                return;
+            }
+
             default:
                 value.AddRange(a.Octets.Span);
                 break;
@@ -251,6 +296,28 @@ public static class AttributeObjects
         dst.Add((byte)a.Type);
         dst.Add((byte)value.Count);
         dst.AddRange(value);
+    }
+
+    /// <summary>
+    /// Builds the list of attributes a device implements, the value of g0v255.
+    /// </summary>
+    public static DeviceAttribute ListAttribute(IReadOnlyList<AttributeListItem> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+
+        var octets = new byte[items.Count * 2];
+        for (var i = 0; i < items.Count; i++)
+        {
+            octets[i * 2] = items[i].Variation;
+            octets[(i * 2) + 1] = items[i].Writable ? (byte)0x01 : (byte)0x00;
+        }
+
+        return new DeviceAttribute
+        {
+            Variation = AttributeNumbers.List,
+            Type = AttributeType.AttributeList,
+            Octets = octets,
+        };
     }
 
     /// <summary>The encoded size of an attribute, header included.</summary>

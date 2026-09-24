@@ -30,6 +30,30 @@ namespace SharpDnp3.Interop.Tests;
 /// </remarks>
 public static class Peers
 {
+    /// <summary>
+    /// Why the cross-implementation control checks are skipped against
+    /// go-dnp3 as it stands.
+    /// </summary>
+    /// <remarks>
+    /// go-dnp3 has the trip-close code inverted: <c>types.go</c> defines
+    /// <c>ControlClose = 0x80</c> and <c>ControlTrip = 0x40</c>. IEEE 1815-2012
+    /// puts the trip-close code in bits 6 and 7 with 1 meaning CLOSE and 2
+    /// meaning TRIP, so CLOSE is 0x40 and TRIP is 0x80 — which is what
+    /// opendnp3 sends (PULSE_CLOSE 0x41, PULSE_TRIP 0x81) and what
+    /// <c>ControlCodeTests</c> pins here.
+    /// <para>
+    /// Each side therefore reads the other's trip as a close. That is not
+    /// something to paper over in an assertion: until the peer is fixed there
+    /// is no agreed encoding to test against, so the control checks are
+    /// skipped rather than made tolerant. Delete this and the skips once
+    /// go-dnp3 corrects it.
+    /// </para>
+    /// </remarks>
+    public const string GoTripCloseDefect =
+        "go-dnp3 has TRIP and CLOSE inverted (types.go: ControlClose = 0x80, " +
+        "ControlTrip = 0x40); IEEE 1815-2012 and opendnp3 both put CLOSE at " +
+        "0x40 and TRIP at 0x80, so the two ends disagree on which coil to fire";
+
     /// <summary>The directory holding the go-dnp3 binaries, if configured.</summary>
     public static string? GoDnp3Dir => Environment.GetEnvironmentVariable("GO_DNP3_BIN");
 

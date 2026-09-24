@@ -79,63 +79,114 @@ public static class ObjectConvert
     //
     // That matters here. An analog point configured as 16-bit whose reading
     // drifts past 32767 would encode as -32768: a value at the opposite end of
-    // the scale, indistinguishable from a real reading. Saturating is not
-    // perfect either, but a pegged reading is recognisable as a pegged reading,
-    // and the OVER_RANGE quality bit is there to say so.
+    // the scale, indistinguishable from a real reading. Saturating is not enough
+    // on its own either, because a pegged 32767 looks exactly like a real 32767.
+    // So each helper also reports whether the value fell outside what the type
+    // can hold, and the generated writers set OVER_RANGE when it did — which is
+    // what the flag exists for: the value exceeds the range of the variation
+    // reported.
+    //
+    // NaN counts as out of range. It has no integer representation at all, and
+    // reporting it as a plain zero would pass a failed reading off as a real
+    // one.
 
     /// <summary>Converts to <see cref="short"/>, saturating rather than wrapping.</summary>
-    public static short ClampInt16(double v)
+    public static short ClampInt16(double v) => ClampInt16(v, out _);
+
+    /// <summary>
+    /// Converts to <see cref="short"/>, saturating rather than wrapping, and
+    /// reports whether <paramref name="v"/> fell outside the range.
+    /// </summary>
+    public static short ClampInt16(double v, out bool overRange)
     {
         // NaN never satisfies a relational pattern, so it is tested first
         // rather than folded into the switch below.
         if (double.IsNaN(v))
         {
+            overRange = true;
             return 0;
         }
 
+        overRange = v > short.MaxValue || v < short.MinValue;
         return v switch
         {
-            >= short.MaxValue => short.MaxValue,
-            <= short.MinValue => short.MinValue,
+            > short.MaxValue => short.MaxValue,
+            < short.MinValue => short.MinValue,
             _ => (short)v,
         };
     }
 
     /// <summary>Converts to <see cref="int"/>, saturating rather than wrapping.</summary>
-    public static int ClampInt32(double v)
+    public static int ClampInt32(double v) => ClampInt32(v, out _);
+
+    /// <summary>
+    /// Converts to <see cref="int"/>, saturating rather than wrapping, and
+    /// reports whether <paramref name="v"/> fell outside the range.
+    /// </summary>
+    public static int ClampInt32(double v, out bool overRange)
     {
+        // NaN never satisfies a relational pattern, so it is tested first
+        // rather than folded into the switch below.
         if (double.IsNaN(v))
         {
+            overRange = true;
             return 0;
         }
 
+        overRange = v > int.MaxValue || v < int.MinValue;
         return v switch
         {
-            >= int.MaxValue => int.MaxValue,
-            <= int.MinValue => int.MinValue,
+            > int.MaxValue => int.MaxValue,
+            < int.MinValue => int.MinValue,
             _ => (int)v,
         };
     }
 
     /// <summary>Converts to <see cref="ushort"/>, saturating rather than wrapping.</summary>
-    public static ushort ClampUInt16(double v)
+    public static ushort ClampUInt16(double v) => ClampUInt16(v, out _);
+
+    /// <summary>
+    /// Converts to <see cref="ushort"/>, saturating rather than wrapping, and
+    /// reports whether <paramref name="v"/> fell outside the range.
+    /// </summary>
+    public static ushort ClampUInt16(double v, out bool overRange)
     {
-        if (double.IsNaN(v) || v <= 0)
+        if (double.IsNaN(v))
+        {
+            overRange = true;
+            return 0;
+        }
+
+        overRange = v > ushort.MaxValue || v < 0;
+        if (v < 0)
         {
             return 0;
         }
 
-        return v >= ushort.MaxValue ? ushort.MaxValue : (ushort)v;
+        return v > ushort.MaxValue ? ushort.MaxValue : (ushort)v;
     }
 
     /// <summary>Converts to <see cref="uint"/>, saturating rather than wrapping.</summary>
-    public static uint ClampUInt32(double v)
+    public static uint ClampUInt32(double v) => ClampUInt32(v, out _);
+
+    /// <summary>
+    /// Converts to <see cref="uint"/>, saturating rather than wrapping, and
+    /// reports whether <paramref name="v"/> fell outside the range.
+    /// </summary>
+    public static uint ClampUInt32(double v, out bool overRange)
     {
-        if (double.IsNaN(v) || v <= 0)
+        if (double.IsNaN(v))
+        {
+            overRange = true;
+            return 0;
+        }
+
+        overRange = v > uint.MaxValue || v < 0;
+        if (v < 0)
         {
             return 0;
         }
 
-        return v >= uint.MaxValue ? uint.MaxValue : (uint)v;
+        return v > uint.MaxValue ? uint.MaxValue : (uint)v;
     }
 }

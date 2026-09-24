@@ -176,7 +176,12 @@ internal sealed class Selection
 }
 
 /// <summary>The status assigned to one command object.</summary>
-internal readonly record struct CommandOutcome(ushort Index, CommandStatus Status);
+/// <summary>The status assigned to one command object.</summary>
+/// <param name="Index">
+/// The index as the request gave it, which may be wider than any point.
+/// </param>
+/// <param name="Status">What the outstation made of it.</param>
+internal readonly record struct CommandOutcome(uint Index, CommandStatus Status);
 
 public sealed partial class OutstationSession
 {
@@ -328,16 +333,25 @@ public sealed partial class OutstationSession
                     break;
                 }
 
-                var index = (ushort)ReadPrefix(data[off..], prefixLen);
+                var wide = ReadPrefix(data[off..], prefixLen);
                 var raw = data.Slice(off + prefixLen, size);
 
+                // A four-octet prefix can name an index no point has. Narrowing
+                // it would wrap it onto one that does — a command for point
+                // 65541 operating point 5 — so it is refused here, before any
+                // handler sees it, the same way an unimplemented point is.
+                var index = (ushort)wide;
                 var status = selectStatus;
-                if (status.OK())
+                if (wide > 0xFFFF)
+                {
+                    status = CommandStatus.NotSupported;
+                }
+                else if (status.OK())
                 {
                     status = RunCommand(h.Group, h.Variation, index, raw, selecting, opType);
                 }
 
-                outcomes.Add(new CommandOutcome(index, status));
+                outcomes.Add(new CommandOutcome(wide, status));
 
                 echo.AddRange(data.Slice(off, prefixLen + size));
 

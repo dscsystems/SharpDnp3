@@ -111,6 +111,23 @@ internal sealed class Point<T>
             return true;
         }
 
+        // Every comparison against NaN is false, so the deadband check below
+        // can neither see a reading become NaN nor recover from one: a point
+        // whose last reported value was NaN would never report again. A move
+        // into or out of NaN is a change by definition; NaN to NaN is not.
+        var nowNaN = double.IsNaN(v);
+        var wasNaN = double.IsNaN(Reported);
+        if (nowNaN || wasNaN)
+        {
+            if (nowNaN == wasNaN)
+            {
+                return false;
+            }
+
+            Reported = v;
+            return true;
+        }
+
         var delta = Math.Abs(v - Reported);
         if (delta > Config.Deadband)
         {
@@ -378,30 +395,43 @@ public sealed class Database
     /// Sets the event class of every point of a type, which is what the
     /// ASSIGN_CLASS function code does.
     /// </summary>
-    public void AssignClass(PointType pt, Class cls)
+    public void AssignClass(PointType pt, Class cls) =>
+        AssignClass(pt, cls, 0, 0xFFFF);
+
+    /// <summary>
+    /// Sets the event class of the points of a type from
+    /// <paramref name="start"/> through <paramref name="stop"/>, which is what
+    /// an ASSIGN_CLASS request naming those points asks for. Indexes past the
+    /// last point are ignored.
+    /// </summary>
+    public void AssignClass(PointType pt, Class cls, ushort start, ushort stop)
     {
         lock (_gate)
         {
             switch (pt)
             {
-                case PointType.Binary: AssignClass(_binary, cls); break;
-                case PointType.DoubleBitBinary: AssignClass(_doubleBit, cls); break;
-                case PointType.Counter: AssignClass(_counter, cls); break;
-                case PointType.FrozenCounter: AssignClass(_frozen, cls); break;
-                case PointType.Analog: AssignClass(_analog, cls); break;
-                case PointType.BinaryOutputStatus: AssignClass(_binaryOut, cls); break;
-                case PointType.AnalogOutputStatus: AssignClass(_analogOut, cls); break;
-                case PointType.OctetString: AssignClass(_octet, cls); break;
+                case PointType.Binary: AssignClass(_binary, cls, start, stop); break;
+                case PointType.DoubleBitBinary:
+                    AssignClass(_doubleBit, cls, start, stop); break;
+                case PointType.Counter: AssignClass(_counter, cls, start, stop); break;
+                case PointType.FrozenCounter: AssignClass(_frozen, cls, start, stop); break;
+                case PointType.Analog: AssignClass(_analog, cls, start, stop); break;
+                case PointType.BinaryOutputStatus:
+                    AssignClass(_binaryOut, cls, start, stop); break;
+                case PointType.AnalogOutputStatus:
+                    AssignClass(_analogOut, cls, start, stop); break;
+                case PointType.OctetString: AssignClass(_octet, cls, start, stop); break;
                 default: break;
             }
         }
     }
 
-    private static void AssignClass<T>(Point<T>[] pts, Class cls)
+    private static void AssignClass<T>(Point<T>[] pts, Class cls, ushort start, ushort stop)
     {
-        foreach (var p in pts)
+        // Counted in int so a stop of 0xFFFF cannot wrap the loop.
+        for (var i = (int)start; i <= stop && i < pts.Length; i++)
         {
-            p.Config = p.Config with { Class = cls };
+            pts[i].Config = pts[i].Config with { Class = cls };
         }
     }
 
@@ -530,20 +560,7 @@ public sealed class Database
                 return;
             }
 
-            var p = _frozen[index];
-            var changed = p.Value.Value != v.Value || p.Value.Flags != v.Flags;
-            p.Value = v;
-            if (changed)
-            {
-                Raise(p.Config, new Event
-                {
-                    Type = PointType.FrozenCounter,
-                    Index = index,
-                    Variation = p.Config.EventVariation,
-                    FrozenCounter = v,
-                    Time = v.Time,
-                });
-            }
+            SetFrozen(index, v);
         }
     }
 
@@ -773,18 +790,67 @@ public sealed class Database
     }
 
     /// <summary>
-    /// Copies every counter into its frozen counterpart, which is what the
-    /// freeze function codes do.
+    /// Stores a frozen counter value and raises an event if it changed.
     /// </summary>
-    public void FreezeCounters()
+    /// <remarks>
+    /// Shared by <see cref="UpdateFrozenCounter"/> and the freeze functions so
+    /// the two cannot disagree about when a frozen counter reports. The caller
+    /// holds the lock.
+    /// </remarks>
+    private void SetFrozen(int i, FrozenCounter v)
+    {
+        var p = _frozen[i];
+        var changed = p.Value.Value != v.Value || p.Value.Flags != v.Flags;
+        p.Value = v;
+        if (!changed)
+        {
+            return;
+        }
+
+        Raise(p.Config, new Event
+        {
+            Type = PointType.FrozenCounter,
+            Index = (ushort)i,
+            Variation = p.Config.EventVariation,
+            FrozenCounter = v,
+            Time = v.Time,
+        });
+    }
+
+    /// <summary>
+    /// Copies every counter into its frozen counterpart, which is what the
+    /// freeze function codes do. The frozen values are stamped with the current
+    /// time; see <see cref="FreezeCounters(ushort, ushort, Timestamp)"/>.
+    /// </summary>
+    public void FreezeCounters() =>
+        FreezeCounters(0, 0xFFFF, Timestamp.Unsynchronized(DateTimeOffset.UtcNow));
+
+    /// <summary>
+    /// Freezes the counters from <paramref name="start"/> through
+    /// <paramref name="stop"/>, which is what a freeze request naming those
+    /// counters asks for. Indexes past the last counter are ignored.
+    /// </summary>
+    /// <remarks>
+    /// A frozen value is a snapshot, and <paramref name="at"/> is when it was
+    /// taken: the time the frozen counter variations that carry one report,
+    /// rather than whenever the running counter last happened to change. Each
+    /// frozen counter that changes raises an event just as an application
+    /// update would, which is how a master polling events learns a freeze
+    /// produced something new — writing the value in place, as this once did,
+    /// left event-driven masters to discover it only by reading the frozen
+    /// counters outright.
+    /// </remarks>
+    public void FreezeCounters(ushort start, ushort stop, Timestamp at)
     {
         lock (_gate)
         {
             var n = Math.Min(_counter.Length, _frozen.Length);
-            for (var i = 0; i < n; i++)
+
+            // Counted in int so a stop of 0xFFFF cannot wrap the loop.
+            for (var i = (int)start; i <= stop && i < n; i++)
             {
                 var c = _counter[i].Value;
-                _frozen[i].Value = new FrozenCounter(c.Value, c.Flags, c.Time);
+                SetFrozen(i, new FrozenCounter(c.Value, c.Flags, at));
             }
         }
     }

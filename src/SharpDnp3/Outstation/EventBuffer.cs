@@ -89,6 +89,20 @@ public sealed class EventBuffer
     private readonly int _max;
     private bool _overflow;
 
+    /// <summary>Counts events discarded to overflow.</summary>
+    private ulong _drops;
+
+    /// <summary>
+    /// What <see cref="_drops"/> was when events were last selected for a
+    /// response.
+    /// </summary>
+    /// <remarks>
+    /// Comparing the two on confirmation says whether anything was lost after
+    /// the confirmed response was built — a loss the master has not yet been
+    /// told about.
+    /// </remarks>
+    private ulong _dropsAtSelect;
+
     /// <summary>Creates an event buffer.</summary>
     public EventBuffer(EventBufferConfig? config = null)
     {
@@ -114,6 +128,7 @@ public sealed class EventBuffer
             {
                 _events.RemoveFirst();
                 _overflow = true;
+                _drops++;
             }
 
             _events.AddLast(e);
@@ -183,8 +198,10 @@ public sealed class EventBuffer
     }
 
     /// <summary>
-    /// Resets the overflow flag, which a master does implicitly by reading the
-    /// events that remain.
+    /// Resets the overflow flag. The outstation clears it itself once the
+    /// master confirms events reported after the overflow (see
+    /// <see cref="Confirm"/>); this is for an application that needs to clear
+    /// it some other way.
     /// </summary>
     public void ClearOverflow()
     {
@@ -206,6 +223,8 @@ public sealed class EventBuffer
     {
         lock (_gate)
         {
+            _dropsAtSelect = _drops;
+
             if (limit <= 0)
             {
                 return [];
@@ -275,6 +294,16 @@ public sealed class EventBuffer
                 }
 
                 node = next;
+            }
+
+            // The master has now received events sent after the overflow, on a
+            // response whose internal indications reported it, so the
+            // indication has done its job. It stays set if more were lost after
+            // that response was built: the master has not heard about those
+            // yet.
+            if (removed > 0 && _drops == _dropsAtSelect)
+            {
+                _overflow = false;
             }
 
             return removed;

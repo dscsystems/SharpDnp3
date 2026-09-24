@@ -148,10 +148,10 @@ internal static class Dispatcher
                 break;
             }
 
-            var index = (ushort)h.Range.IndexOf((uint)i);
+            var index = h.Range.IndexOf((uint)i);
             if (prefixLen > 0)
             {
-                index = (ushort)ReadPrefix(data[off..], prefixLen);
+                index = ReadPrefix(data[off..], prefixLen);
                 off += prefixLen;
             }
 
@@ -185,7 +185,7 @@ internal static class Dispatcher
                 var output = new List<Indexed<Binary>>(raw.Count);
                 for (var i = 0; i < raw.Count; i++)
                 {
-                    output.Add(new Indexed<Binary>((ushort)(start + (uint)i), raw[i]));
+                    output.Add(new Indexed<Binary>(start + (uint)i, raw[i]));
                 }
 
                 handler.HandleBinary(info, output);
@@ -199,7 +199,7 @@ internal static class Dispatcher
                 var output = new List<Indexed<DoubleBitBinary>>(raw.Count);
                 for (var i = 0; i < raw.Count; i++)
                 {
-                    output.Add(new Indexed<DoubleBitBinary>((ushort)(start + (uint)i), raw[i]));
+                    output.Add(new Indexed<DoubleBitBinary>(start + (uint)i, raw[i]));
                 }
 
                 handler.HandleDoubleBit(info, output);
@@ -213,7 +213,7 @@ internal static class Dispatcher
                 var output = new List<Indexed<BinaryOutputStatus>>(raw.Count);
                 for (var i = 0; i < raw.Count; i++)
                 {
-                    output.Add(new Indexed<BinaryOutputStatus>((ushort)(start + (uint)i), raw[i]));
+                    output.Add(new Indexed<BinaryOutputStatus>(start + (uint)i, raw[i]));
                 }
 
                 handler.HandleBinaryOutputStatus(info, output);
@@ -267,10 +267,10 @@ internal static class Dispatcher
                 break;
             }
 
-            var index = (ushort)h.Range.IndexOf((uint)i);
+            var index = h.Range.IndexOf((uint)i);
             if (prefixLen > 0)
             {
-                index = (ushort)ReadPrefix(data[off..], prefixLen);
+                index = ReadPrefix(data[off..], prefixLen);
                 off += prefixLen;
             }
 

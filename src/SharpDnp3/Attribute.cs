@@ -17,6 +17,7 @@
 // anything about them.
 
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
 namespace SharpDnp3;
@@ -47,6 +48,19 @@ public enum AttributeType : byte
 
     /// <summary>A 48-bit DNP3 timestamp.</summary>
     Time = 7,
+
+    /// <summary>
+    /// A list of (variation, properties) pairs: the answer to
+    /// <see cref="AttributeNumbers.List"/>.
+    /// </summary>
+    /// <remarks>Its length octet counts octets, two per entry.</remarks>
+    AttributeList = 254,
+
+    /// <summary>
+    /// The same list when it runs past 255 octets: the length octet then counts
+    /// octets beyond the first 256.
+    /// </summary>
+    ExtAttributeList = 255,
 }
 
 /// <summary>Naming helpers for <see cref="AttributeType"/>.</summary>
@@ -62,6 +76,7 @@ public static class AttributeTypeExtensions
         AttributeType.OctetString => "octets",
         AttributeType.BitString => "bits",
         AttributeType.Time => "time",
+        AttributeType.AttributeList or AttributeType.ExtAttributeList => "list",
         _ => string.Format(CultureInfo.InvariantCulture, "AttributeType({0})", (byte)t),
     };
 }
@@ -90,50 +105,61 @@ public static class AttributeNumbers
     /// The standard set's attribute names.
     /// </summary>
     /// <remarks>
-    /// These names are for display and nothing else. The wire carries numbers,
-    /// this library never routes on a name, and an entry that is wrong
-    /// mislabels a row in a listing without affecting a single octet — which is
-    /// the only reason it is safe to ship a table transcribed from the
-    /// standard's set 0 rather than one verified against a device.
+    /// These names are for display and nothing else: the wire carries numbers
+    /// and this library never routes on a name. The numbering is IEEE
+    /// 1815-2012's set 0, the same table Wireshark's DNP3 dissector uses.
     /// <para>
     /// A device's own attributes, and any set other than 0, come back numbered.
     /// </para>
     /// </remarks>
     private static readonly Dictionary<byte, string> Names = new()
     {
-        [196] = "secure authentication statistics per association",
-        [197] = "number of security statistics per association",
-        [198] = "user-specific attributes supported",
-        [199] = "master-defined data set prototypes",
-        [200] = "outstation-defined data set prototypes",
-        [201] = "master-defined data sets",
-        [202] = "outstation-defined data sets",
-        [203] = "max binary outputs per request",
-        [204] = "local timing accuracy",
-        [205] = "duration of time accuracy",
-        [206] = "analog output events supported",
-        [207] = "max analog output index",
-        [208] = "number of analog outputs",
-        [209] = "binary output events supported",
-        [210] = "max binary output index",
-        [211] = "number of binary outputs",
-        [212] = "frozen counter events supported",
-        [213] = "frozen counters supported",
-        [214] = "counter events supported",
-        [215] = "max counter index",
-        [216] = "number of counters",
-        [217] = "frozen analog inputs supported",
-        [218] = "analog input events supported",
-        [219] = "max analog input index",
-        [220] = "number of analog inputs",
-        [221] = "double-bit binary input events supported",
-        [222] = "max double-bit binary input index",
-        [223] = "number of double-bit binary inputs",
-        [224] = "binary input events supported",
-        [225] = "max binary input index",
-        [226] = "number of binary inputs",
-        [227] = "max transmit fragment size",
-        [228] = "max receive fragment size",
+        [196] = "configuration ID",
+        [197] = "configuration version",
+        [198] = "configuration build date",
+        [199] = "configuration last change date",
+        [200] = "configuration signature",
+        [201] = "configuration signature algorithm",
+        [202] = "master resource ID (mRID)",
+        [203] = "device location altitude",
+        [204] = "device location longitude",
+        [205] = "device location latitude",
+        [206] = "secondary operator name",
+        [207] = "primary operator name",
+        [208] = "system name",
+        [209] = "secure authentication version",
+        [210] = "number of security statistics per association",
+        [211] = "user-specific attribute sets",
+        [212] = "master-defined data set prototypes",
+        [213] = "outstation-defined data set prototypes",
+        [214] = "master-defined data sets",
+        [215] = "outstation-defined data sets",
+        [216] = "max binary outputs per request",
+        [217] = "local timing accuracy",
+        [218] = "duration of time accuracy",
+        [219] = "analog output events supported",
+        [220] = "max analog output index",
+        [221] = "number of analog outputs",
+        [222] = "binary output events supported",
+        [223] = "max binary output index",
+        [224] = "number of binary outputs",
+        [225] = "frozen counter events supported",
+        [226] = "frozen counters supported",
+        [227] = "counter events supported",
+        [228] = "max counter index",
+        [229] = "number of counters",
+        [230] = "frozen analog inputs supported",
+        [231] = "analog input events supported",
+        [232] = "max analog input index",
+        [233] = "number of analog inputs",
+        [234] = "double-bit binary input events supported",
+        [235] = "max double-bit binary input index",
+        [236] = "number of double-bit binary inputs",
+        [237] = "binary input events supported",
+        [238] = "max binary input index",
+        [239] = "number of binary inputs",
+        [240] = "max transmit fragment size",
+        [241] = "max receive fragment size",
         [242] = "software version",
         [243] = "hardware version",
         [244] = "owner name",
@@ -158,6 +184,14 @@ public static class AttributeNumbers
     public static bool TryName(byte variation, out string name) =>
         Names.TryGetValue(variation, out name!);
 }
+
+/// <summary>
+/// One entry of a device's list of attributes: which variation it implements,
+/// and whether a master may write it.
+/// </summary>
+/// <param name="Variation">The attribute's number.</param>
+/// <param name="Writable">Whether a master may write it.</param>
+public readonly record struct AttributeListItem(byte Variation, bool Writable);
 
 /// <summary>One thing a device says about itself.</summary>
 /// <remarks>
@@ -225,9 +259,37 @@ public readonly record struct DeviceAttribute
         Number = value,
     };
 
+    /// <summary>The property bit that marks an attribute writable.</summary>
+    private const byte PropWritable = 0x01;
+
+    /// <summary>Decodes an attribute list.</summary>
+    /// <returns>An empty list for any other type.</returns>
+    public IReadOnlyList<AttributeListItem> List()
+    {
+        if (Type is not (AttributeType.AttributeList or AttributeType.ExtAttributeList))
+        {
+            return [];
+        }
+
+        var octets = Octets.Span;
+        var output = new List<AttributeListItem>(octets.Length / 2);
+        for (var i = 0; i + 1 < octets.Length; i += 2)
+        {
+            output.Add(new AttributeListItem(octets[i], (octets[i + 1] & PropWritable) != 0));
+        }
+
+        return output;
+    }
+
     /// <summary>Renders the value as text, whatever its type.</summary>
     public string ValueText() => Type switch
     {
+        AttributeType.AttributeList or AttributeType.ExtAttributeList =>
+            string.Join(
+                ' ',
+                List().Select(it => it.Writable
+                    ? it.Variation.ToString(CultureInfo.InvariantCulture) + "(w)"
+                    : it.Variation.ToString(CultureInfo.InvariantCulture))),
         AttributeType.VisibleString => Text ?? string.Empty,
         AttributeType.UnsignedInt or AttributeType.SignedInt =>
             Number.ToString(CultureInfo.InvariantCulture),

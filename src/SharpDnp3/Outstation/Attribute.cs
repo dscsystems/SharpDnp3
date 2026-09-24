@@ -28,18 +28,19 @@ internal readonly record struct AttributeKey(byte Set, byte Variation);
 /// <remarks>
 /// They are named here rather than left to the display table in
 /// <see cref="AttributeNumbers"/> because this is code that has to be right: a
-/// number used to answer a request is not a label.
+/// number used to answer a request is not a label. The numbers are IEEE
+/// 1815-2012's set 0.
 /// </remarks>
 internal static class DerivedAttributeNumbers
 {
-    public const byte AnalogOutputCount = 208;
-    public const byte BinaryOutputCount = 211;
-    public const byte CounterCount = 216;
-    public const byte AnalogInputCount = 220;
-    public const byte DoubleBitInputCount = 223;
-    public const byte BinaryInputCount = 226;
-    public const byte MaxTxFragment = 227;
-    public const byte MaxRxFragment = 228;
+    public const byte AnalogOutputCount = 221;
+    public const byte BinaryOutputCount = 224;
+    public const byte CounterCount = 229;
+    public const byte AnalogInputCount = 233;
+    public const byte DoubleBitInputCount = 236;
+    public const byte BinaryInputCount = 239;
+    public const byte MaxTxFragment = 240;
+    public const byte MaxRxFragment = 241;
 }
 
 public sealed partial class OutstationSession
@@ -156,19 +157,26 @@ public sealed partial class OutstationSession
             set = (byte)h.Range.Start;
         }
 
+        var attrs = AttributesFor(set, h.Variation);
+
         if (h.Variation == AttributeNumbers.List)
         {
-            // Reporting which attributes exist is a distinct encoding this
-            // implementation does not have, and answering it with the
-            // attributes themselves would be a different answer to the question
-            // asked.
-            a.Iin = a.Iin.Set(Iin.ObjectUnknown);
-            a.Log.Log(Dnp3LogLevel.Debug, "attribute list request refused; not implemented");
-            Respond(a, r, frag.Header, []);
-            return;
-        }
+            // Which attributes exist, rather than what they say: one list of
+            // the set's variations, none of them writable because nothing here
+            // accepts a write. A set with nothing in it has no list to give.
+            var all = AttributesFor(set, AttributeNumbers.All);
+            attrs = [];
+            if (all.Count > 0)
+            {
+                var items = new List<AttributeListItem>(all.Count);
+                foreach (var one in all)
+                {
+                    items.Add(new AttributeListItem(one.Variation, Writable: false));
+                }
 
-        var attrs = AttributesFor(set, h.Variation);
+                attrs = [AttributeObjects.ListAttribute(items) with { Set = set }];
+            }
+        }
         if (attrs.Count == 0)
         {
             a.Iin = a.Iin.Set(Iin.ObjectUnknown);

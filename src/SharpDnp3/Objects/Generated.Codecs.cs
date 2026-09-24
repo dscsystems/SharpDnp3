@@ -576,8 +576,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g30v1, AnalogInput32WithFlag.</summary>
     private static void WriteG30V1(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -593,8 +600,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g30v2, AnalogInput16WithFlag.</summary>
     private static void WriteG30V2(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -610,7 +624,8 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g30v3, AnalogInput32NoFlag.</summary>
     private static void WriteG30V3(List<byte> dst, Analog v, Context ctx)
     {
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -626,7 +641,8 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g30v4, AnalogInput16NoFlag.</summary>
     private static void WriteG30V4(List<byte> dst, Analog v, Context ctx)
     {
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -676,8 +692,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g31v1, FrozenAnalog32WithFlag.</summary>
     private static void WriteG31V1(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -693,8 +716,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g31v2, FrozenAnalog16WithFlag.</summary>
     private static void WriteG31V2(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -714,8 +744,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g31v3, FrozenAnalog32WithFlagTime.</summary>
     private static void WriteG31V3(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;
@@ -736,8 +773,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g31v4, FrozenAnalog16WithFlagTime.</summary>
     private static void WriteG31V4(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;
@@ -754,7 +798,8 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g31v5, FrozenAnalog32NoFlag.</summary>
     private static void WriteG31V5(List<byte> dst, Analog v, Context ctx)
     {
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -770,7 +815,8 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g31v6, FrozenAnalog16NoFlag.</summary>
     private static void WriteG31V6(List<byte> dst, Analog v, Context ctx)
     {
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -820,8 +866,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g32v1, AnalogEvent32WithFlag.</summary>
     private static void WriteG32V1(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -837,8 +890,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g32v2, AnalogEvent16WithFlag.</summary>
     private static void WriteG32V2(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -858,8 +918,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g32v3, AnalogEvent32WithFlagTime.</summary>
     private static void WriteG32V3(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;
@@ -880,8 +947,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g32v4, AnalogEvent16WithFlagTime.</summary>
     private static void WriteG32V4(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;
@@ -976,8 +1050,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g33v1, FrozenAnalogEvent32WithFlag.</summary>
     private static void WriteG33V1(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -993,8 +1074,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g33v2, FrozenAnalogEvent16WithFlag.</summary>
     private static void WriteG33V2(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -1014,8 +1102,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g33v3, FrozenAnalogEvent32WithFlagTime.</summary>
     private static void WriteG33V3(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;
@@ -1036,8 +1131,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g33v4, FrozenAnalogEvent16WithFlagTime.</summary>
     private static void WriteG33V4(List<byte> dst, Analog v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;
@@ -1248,8 +1350,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g40v1, AnalogOutputStatus32.</summary>
     private static void WriteG40V1(List<byte> dst, AnalogOutputStatus v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -1265,8 +1374,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g40v2, AnalogOutputStatus16.</summary>
     private static void WriteG40V2(List<byte> dst, AnalogOutputStatus v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -1316,8 +1432,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g42v1, AnalogOutputEvent32.</summary>
     private static void WriteG42V1(List<byte> dst, AnalogOutputStatus v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
 
         _ = ctx;
     }
@@ -1333,8 +1456,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g42v2, AnalogOutputEvent16.</summary>
     private static void WriteG42V2(List<byte> dst, AnalogOutputStatus v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
 
         _ = ctx;
     }
@@ -1354,8 +1484,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g42v3, AnalogOutputEvent32Time.</summary>
     private static void WriteG42V3(List<byte> dst, AnalogOutputStatus v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));
+        var n = ObjectConvert.ClampInt32(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt32(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;
@@ -1376,8 +1513,15 @@ public static partial class ObjectRegistry
     /// <summary>Encodes g42v4, AnalogOutputEvent16Time.</summary>
     private static void WriteG42V4(List<byte> dst, AnalogOutputStatus v, Context ctx)
     {
-        dst.Add(v.Flags.Value);
-        ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));
+        var n = ObjectConvert.ClampInt16(v.Value, out var over);
+        var flags = v.Flags;
+        if (over)
+        {
+            flags = flags.Set(Flags.OverRange);
+        }
+
+        dst.Add(flags.Value);
+        ObjectConvert.AppendInt16(dst, n);
         ObjectConvert.AppendTime48(dst, Dnp3Time.ToDnp3(v.Time.Time));
 
         _ = ctx;

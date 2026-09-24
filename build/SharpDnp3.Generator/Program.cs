@@ -416,6 +416,18 @@ namespace SharpDnp3.Generator
                 "    private static void Write{0}(List<byte> dst, {1} v, Context ctx)\n    {{\n",
                 o.CsName(), csType));
 
+            // An analog value narrowed into an integer field is clamped before
+            // anything is written, because whether it saturated decides the
+            // flags octet, and the flags come first on the wire.
+            var clamp = ClampOf(o);
+            if (clamp is not null)
+            {
+                b.Append(o.FlagsField() is not null
+                    ? Inv("        var n = ObjectConvert.{0}(v.Value, out var over);\n", clamp)
+                    // No flags octet to report it in; the value still saturates.
+                    : Inv("        var n = ObjectConvert.{0}(v.Value);\n", clamp));
+            }
+
             foreach (var f in o.Fields)
             {
                 switch (f.Type)
@@ -437,7 +449,20 @@ namespace SharpDnp3.Generator
                                 break;
 
                             default:
-                                b.Append("        dst.Add(v.Flags.Value);\n");
+                                if (clamp is not null)
+                                {
+                                    b.Append("        var flags = v.Flags;\n");
+                                    b.Append("        if (over)\n        {\n");
+                                    b.Append(
+                                        "            flags = flags.Set(Flags.OverRange);\n");
+                                    b.Append("        }\n\n");
+                                    b.Append("        dst.Add(flags.Value);\n");
+                                }
+                                else
+                                {
+                                    b.Append("        dst.Add(v.Flags.Value);\n");
+                                }
+
                                 break;
                         }
 
@@ -457,7 +482,8 @@ namespace SharpDnp3.Generator
                     default:
                         if (f.Name == "Value")
                         {
-                            b.Append("        " + WriteExpr(f.Type, o.Measurement) + "\n");
+                            b.Append(
+                                "        " + WriteExpr(f.Type, o.Measurement, clamp) + "\n");
                         }
 
                         break;
@@ -521,23 +547,52 @@ namespace SharpDnp3.Generator
         /// point's range would otherwise encode as an arbitrary value instead
         /// of a saturated one.
         /// </remarks>
-        private static string WriteExpr(string type, string measure)
+        /// <summary>
+        /// Names the helper that narrows an analog value into this object's
+        /// integer value field, or null when the field needs no narrowing.
+        /// </summary>
+        private static string? ClampOf(ObjectSpec o)
         {
-            var fromFloat = measure is "analog" or "analogoutput";
+            if (o.Measurement is not ("analog" or "analogoutput"))
+            {
+                return null;
+            }
+
+            return o.ValueField()?.Field.Type switch
+            {
+                "i16" => "ClampInt16",
+                "u16" => "ClampUInt16",
+                "i32" => "ClampInt32",
+                "u32" => "ClampUInt32",
+                _ => null,
+            };
+        }
+
+        /// <summary>Builds the statement that encodes a value field.</summary>
+        /// <remarks>
+        /// Narrowing an analog value into an integer field goes through the
+        /// clamp helpers rather than a bare cast (see <c>ClampOf</c> and
+        /// <c>EmitWrite</c>): an out-of-range double cast to an integer is
+        /// undefined. By the time this statement runs, <c>EmitWrite</c> has
+        /// already stored the narrowed value in <c>n</c>.
+        /// </remarks>
+        private static string WriteExpr(string type, string measure, string? clamp)
+        {
+            var narrowed = clamp is not null;
 
             return type switch
             {
-                "i16" => fromFloat
-                    ? "ObjectConvert.AppendInt16(dst, ObjectConvert.ClampInt16(v.Value));"
+                "i16" => narrowed
+                    ? "ObjectConvert.AppendInt16(dst, n);"
                     : "ObjectConvert.AppendInt16(dst, (short)v.Value);",
-                "u16" => fromFloat
-                    ? "ObjectConvert.AppendUInt16(dst, ObjectConvert.ClampUInt16(v.Value));"
+                "u16" => narrowed
+                    ? "ObjectConvert.AppendUInt16(dst, n);"
                     : "ObjectConvert.AppendUInt16(dst, (ushort)v.Value);",
-                "i32" => fromFloat
-                    ? "ObjectConvert.AppendInt32(dst, ObjectConvert.ClampInt32(v.Value));"
+                "i32" => narrowed
+                    ? "ObjectConvert.AppendInt32(dst, n);"
                     : "ObjectConvert.AppendInt32(dst, (int)v.Value);",
-                "u32" => fromFloat
-                    ? "ObjectConvert.AppendUInt32(dst, ObjectConvert.ClampUInt32(v.Value));"
+                "u32" => narrowed
+                    ? "ObjectConvert.AppendUInt32(dst, n);"
                     : "ObjectConvert.AppendUInt32(dst, (uint)v.Value);",
                 "f32" => "ObjectConvert.AppendSingle(dst, (float)v.Value);",
                 "f64" => "ObjectConvert.AppendDouble(dst, v.Value);",

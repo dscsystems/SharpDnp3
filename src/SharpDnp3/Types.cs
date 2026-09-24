@@ -217,10 +217,17 @@ public static class OctetString
 }
 
 /// <summary>Pairs a measurement with the point index it was reported at.</summary>
+/// <remarks>
+/// The index is 32 bits because that is what the protocol can carry: an object
+/// header may address points with a four-octet range or prefix. It was once 16,
+/// and a master narrowing what an outstation reported to fit it delivered point
+/// 70000 as point 4464 — a real measurement attributed to a different point,
+/// with nothing to say so.
+/// </remarks>
 /// <typeparam name="T">The measurement type.</typeparam>
 /// <param name="Index">The point index.</param>
 /// <param name="Value">The measurement.</param>
-public readonly record struct Indexed<T>(ushort Index, T Value);
+public readonly record struct Indexed<T>(uint Index, T Value);
 
 /// <summary>
 /// A bit mask over the DNP3 event classes plus class 0, the static data set.
