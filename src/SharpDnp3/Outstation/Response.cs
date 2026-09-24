@@ -137,7 +137,7 @@ internal sealed class ResponseWriter
         {
             // An explicit variation is the master's choice, and every point in
             // the range is reported as what it asked for.
-            BuildStaticRun(b, pt, variation, start, stop);
+            BuildStaticRun(b, pt, Database.StaticGroupVar(pt, variation), start, stop);
             return;
         }
 
@@ -172,7 +172,14 @@ internal sealed class ResponseWriter
                 end++;
             }
 
-            BuildStaticRun(b, pt, v, (ushort)idx, (ushort)end);
+            // A run that could not be written means the fragment has no room
+            // for even one object, and every run after it would fail the same
+            // way.
+            if (!BuildStaticRun(b, pt, Database.StaticGroupVar(pt, v), (ushort)idx, (ushort)end))
+            {
+                return;
+            }
+
             idx = end + 1;
         }
     }
@@ -194,25 +201,20 @@ internal sealed class ResponseWriter
 
     /// <summary>
     /// Reports points <paramref name="start"/> through <paramref name="stop"/>,
-    /// all in one variation, splitting across fragments as the space in each
+    /// all in one encoding, splitting across fragments as the space in each
     /// allows.
     /// </summary>
-    private void BuildStaticRun(
-        ResponseBuilder b,
-        PointType pt,
-        byte variation,
-        ushort start,
-        ushort stop)
+    /// <returns><see langword="false"/> when nothing more can be written.</returns>
+    private bool BuildStaticRun(ResponseBuilder b, PointType pt, GroupVar gv, ushort start, ushort stop)
     {
-        var gv = Database.StaticGroupVar(pt, variation);
         if (!ObjectRegistry.TryLookup(gv, out var d))
         {
-            return;
+            return false;
         }
 
         if (!d.TrySizeOctets(out var size) || size == 0)
         {
-            return;
+            return false;
         }
 
         // Worst-case 16-bit range.
@@ -230,7 +232,7 @@ internal sealed class ResponseWriter
                 if (avail < size)
                 {
                     // A single object does not fit an empty fragment.
-                    return;
+                    return false;
                 }
             }
 
@@ -247,11 +249,13 @@ internal sealed class ResponseWriter
 
             if (last == ushort.MaxValue)
             {
-                return;
+                return true;
             }
 
             idx = (ushort)(last + 1);
         }
+
+        return true;
     }
 
     /// <summary>Appends one point's static encoding.</summary>

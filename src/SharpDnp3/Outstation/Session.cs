@@ -1446,8 +1446,15 @@ public sealed partial class OutstationSession
                     case 2:
                     case 3:
                     case 4: // event classes 1, 2 and 3
+                        // Written where the class was asked for, not after
+                        // everything else: a master applies objects in order,
+                        // so in the usual Class 1,2,3,0 poll the events must
+                        // precede the static data, or an old buffered event
+                        // overwrites the current value it was read alongside.
                         var mask = (Class)((byte)Class.Class1 << (h.Variation - 2));
-                        selected.AddRange(a.Events.Select(mask, 512));
+                        var events = a.Events.Select(mask, 512);
+                        _writer.BuildEvents(b, events);
+                        selected.AddRange(events);
                         break;
 
                     default:
@@ -1511,11 +1518,6 @@ public sealed partial class OutstationSession
                 // still is.
                 Build(0, 0xFFFF);
             }
-        }
-
-        if (selected.Count > 0)
-        {
-            _writer.BuildEvents(b, selected);
         }
 
         SendFragments(a, r, frag.Header, b.Done(), selected.Count > 0);
