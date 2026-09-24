@@ -69,7 +69,7 @@ the encoding doing what it says, not a bug. See
 [Variations and precision](user-guide.md#variations-and-precision).
 
 ```csharp
-public readonly record struct Indexed<T>(ushort Index, T Value);
+public readonly record struct Indexed<T>(uint Index, T Value);
 ```
 
 `Indexed<T>` pairs a measurement with the point index it was reported at.
@@ -367,6 +367,7 @@ public readonly struct Iin : IEquatable<Iin>
     public static Iin None { get; }
     public static Iin EventClassMask { get; }
     public static Iin ErrorMask { get; }
+    public static Iin RequestErrorMask { get; }    // NO_FUNC_CODE_SUPPORT | OBJECT_UNKNOWN | PARAMETER_ERROR | ALREADY_EXECUTING
 
     public static Iin Parse(byte iin1, byte iin2);
     public (byte Iin1, byte Iin2) Octets();
@@ -910,7 +911,7 @@ public readonly record struct Update
     public ResponseInfo Fragment { get; init; }
 
     public PointType Type { get; init; } // selects which measurement property below is meaningful
-    public ushort Index { get; init; }
+    public uint Index { get; init; }
 
     public Binary Binary { get; init; }
     public DoubleBitBinary DoubleBit { get; init; }
@@ -1087,13 +1088,17 @@ public sealed class UnsolicitedConfig
     public int MaxEvents { get; set; }            // transmit at this many queued events regardless of hold time; zero means no threshold
     public TimeSpan ConfirmTimeout { get; set; }  // default 5s
     public int MaxRetries { get; set; }           // default 3
+    public bool UnlimitedRetries { get; set; }    // re-send for as long as it goes unconfirmed
+    public TimeSpan RetryDelay { get; set; }      // wait before a new series after one fails; default 5s
 }
 ```
 
 `Enabled` alone does not start unsolicited reporting: the master still has to
 enable the individual classes with ENABLE_UNSOLICITED. After `MaxRetries`
-unconfirmed re-sends the outstation gives up and waits for the master to poll
-instead.
+unconfirmed re-sends (or never, with `UnlimitedRetries`) the series ends: its
+events go back in the queue for the next poll, and a new series may start after
+`RetryDelay`. A read while a response awaits confirmation also ends the series
+at its next timeout, so a polling master is never kept from those events.
 
 ## Database
 
@@ -1471,7 +1476,7 @@ showing nothing.
 ```csharp
 public readonly record struct Value
 {
-    public ushort Index { get; init; }
+    public uint Index { get; init; }    // the full index the header carried, 32-bit ranges and prefixes included
     public PointType Type { get; init; }
     public string Text { get; init; }   // formatted, not typed
     public Flags Flags { get; init; }

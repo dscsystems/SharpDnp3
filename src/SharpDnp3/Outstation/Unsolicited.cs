@@ -37,6 +37,12 @@ internal sealed class UnsolState
     public int Retries;
 
     /// <summary>
+    /// Set when the master reads while an unsolicited response is awaiting
+    /// confirmation, which ends the series at its next timeout.
+    /// </summary>
+    public bool ReadSinceSent;
+
+    /// <summary>
     /// The exact fragment last transmitted, kept so a retry can repeat it octet
     /// for octet.
     /// </summary>
@@ -70,6 +76,7 @@ internal sealed class UnsolState
         AwaitSeq = 0;
         Deadline = default;
         Retries = 0;
+        ReadSinceSent = false;
         LastFrag = null;
         NextAllowed = default;
         FirstEventAt = null;
@@ -109,9 +116,29 @@ public sealed class UnsolicitedConfig
 
     /// <summary>
     /// How many times an unconfirmed response is re-sent before the outstation
-    /// gives up and waits for the master to poll instead.
+    /// gives up on the series. Zero means the default of three; see
+    /// <see cref="UnlimitedRetries"/> for no limit.
     /// </summary>
     public int MaxRetries { get; set; }
+
+    /// <summary>
+    /// Re-sends an unconfirmed response for as long as it goes unconfirmed,
+    /// ignoring <see cref="MaxRetries"/>.
+    /// </summary>
+    /// <remarks>
+    /// IEEE 1815-2012 allows the retry count to be infinite. The series still
+    /// ends when the master reads while it is awaiting confirmation: a master
+    /// that is polling is plainly there, and the events the series holds go
+    /// back in the queue for its next poll rather than being withheld from it
+    /// for ever.
+    /// </remarks>
+    public bool UnlimitedRetries { get; set; }
+
+    /// <summary>
+    /// How long to wait after a series ends unconfirmed before starting
+    /// another. Zero means the default of five seconds.
+    /// </summary>
+    public TimeSpan RetryDelay { get; set; }
 
     internal void ApplyDefaults()
     {
@@ -123,6 +150,11 @@ public sealed class UnsolicitedConfig
         if (MaxRetries <= 0)
         {
             MaxRetries = 3;
+        }
+
+        if (RetryDelay <= TimeSpan.Zero)
+        {
+            RetryDelay = TimeSpan.FromSeconds(5);
         }
     }
 }
@@ -243,7 +275,13 @@ public sealed partial class OutstationSession
             _stats.UnsolicitedTimeouts++;
         }
 
-        if (a.Unsol.Retries > _cfg.Unsolicited.MaxRetries)
+        // A read while the response awaited confirmation ends the series too:
+        // the master is there and polling, and repeating the same response at
+        // it would keep the events it holds out of every poll's reach.
+        var exhausted = !_cfg.Unsolicited.UnlimitedRetries &&
+            a.Unsol.Retries > _cfg.Unsolicited.MaxRetries;
+
+        if (exhausted || a.Unsol.ReadSinceSent)
         {
             // Only now do the events go back in the queue, for the master's
             // next poll to collect: losing them because unsolicited delivery
@@ -255,12 +293,15 @@ public sealed partial class OutstationSession
 
             a.Log.Log(
                 Dnp3LogLevel.Warn,
-                "giving up on unsolicited reporting until the master polls",
-                ("retries", a.Unsol.Retries), ("events_requeued", requeued));
+                "unsolicited series ended unconfirmed; events requeued",
+                ("retries", a.Unsol.Retries),
+                ("read_since_sent", a.Unsol.ReadSinceSent),
+                ("events_requeued", requeued));
 
             a.Unsol.Retries = 0;
+            a.Unsol.ReadSinceSent = false;
             a.Unsol.LastFrag = null;
-            a.Unsol.NextAllowed = now + _cfg.Unsolicited.ConfirmTimeout;
+            a.Unsol.NextAllowed = now + _cfg.Unsolicited.RetryDelay;
             return;
         }
 
@@ -359,6 +400,7 @@ public sealed partial class OutstationSession
         a.Unsol.AwaitSeq = a.Unsol.Seq;
         a.Unsol.Deadline = now + _cfg.Unsolicited.ConfirmTimeout;
         a.Unsol.NullSent = a.Unsol.NullSent || isNull;
+        a.Unsol.ReadSinceSent = false;
 
         // Kept whole for a retry to repeat.
         a.Unsol.LastFrag = frag;
@@ -388,6 +430,7 @@ public sealed partial class OutstationSession
 
         a.Unsol.Awaiting = false;
         a.Unsol.Retries = 0;
+        a.Unsol.ReadSinceSent = false;
         a.Unsol.LastFrag = null;
 
         if (!a.Unsol.NullConfirmed)

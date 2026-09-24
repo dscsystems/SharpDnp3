@@ -116,6 +116,24 @@ internal sealed class Association
     public bool PendingHasEvents;
 
     /// <summary>
+    /// Set by a broadcast to <see cref="Link.LinkConstants.BroadcastMandatoryConfirm"/>,
+    /// and held until the master confirms a response that asked it to.
+    /// </summary>
+    /// <remarks>
+    /// That address obliges the outstation to request confirmation of its next
+    /// solicited response, and to keep reporting the broadcast indication
+    /// until the confirmation arrives: only a confirmed response proves the
+    /// master has seen that every outstation received the broadcast.
+    /// </remarks>
+    public bool BroadcastConfirmOwed;
+
+    /// <summary>
+    /// Set when the response in flight asked for confirmation on behalf of
+    /// <see cref="BroadcastConfirmOwed"/>, so its confirmation discharges it.
+    /// </summary>
+    public bool BroadcastConfirmSought;
+
+    /// <summary>
     /// Set once <see cref="LastReqSource"/> and its companions describe a real
     /// request.
     /// </summary>
@@ -141,6 +159,13 @@ internal sealed class Association
 
     /// <summary>Whether that response carried events.</summary>
     public bool LastRespEvents;
+
+    /// <summary>
+    /// The request error indications that response carried. They are cleared
+    /// once reported, so a replay has to put them back: the repeat is owed the
+    /// same answer, refusal and all.
+    /// </summary>
+    public Iin LastRespErrors;
 
     /// <summary>
     /// This master's select-before-operate reservation. Keeping it private to

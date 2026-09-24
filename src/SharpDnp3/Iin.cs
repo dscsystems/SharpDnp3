@@ -100,6 +100,19 @@ public readonly struct Iin : IEquatable<Iin>
     public static Iin ErrorMask =>
         NoFuncCodeSupport | ObjectUnknown | ParameterError | AlreadyExecuting | ConfigCorrupt;
 
+    /// <summary>
+    /// The IIN2 bits that describe the request being answered rather than the
+    /// state of the device.
+    /// </summary>
+    /// <remarks>
+    /// They are reported once, on the response to the request that raised them
+    /// (or, for a request that gets no response, on the next one), and then
+    /// cleared. CONFIG_CORRUPT is left out: it is a condition of the device and
+    /// stays until the device is fixed.
+    /// </remarks>
+    public static Iin RequestErrorMask =>
+        NoFuncCodeSupport | ObjectUnknown | ParameterError | AlreadyExecuting;
+
     /// <summary>Decodes the two IIN octets in wire order.</summary>
     public static Iin Parse(byte iin1, byte iin2) => new((ushort)(iin1 | (iin2 << 8)));
 

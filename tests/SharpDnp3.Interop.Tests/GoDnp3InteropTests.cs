@@ -220,11 +220,6 @@ public class GoDnp3InteropTests
         // as good rather than pinning a number that moves.
         Assert.True(handler.Read(h => h.Analogs[0].Flags.Has(Flags.Online)));
 
-        // Everything above is what this test is really for: the peer's plant,
-        // read back through our master. The control below needs both ends to
-        // agree on the trip-close code, and they do not.
-        Assert.Skip(Peers.GoTripCloseDefect);
-
         // Operate it. Feeder 1's breaker is not interlocked, so this must be
         // accepted and must open the breaker.
         var result = await master.DirectOperateAsync([Command.Trip(0, 100)], cts.Token);
@@ -311,10 +306,6 @@ public class GoDnp3InteropTests
     [Fact]
     public async Task GoMasterAgainstOurOutstation()
     {
-        // The whole of this test is a control crossing between the two
-        // implementations, and they disagree about what a trip is.
-        Assert.Skip(Peers.GoTripCloseDefect);
-
         var masterBin = Peers.GoDnp3("dnp3-master");
         Assert.SkipUnless(
             masterBin is not null,

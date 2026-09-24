@@ -708,8 +708,10 @@ await master.DisableUnsolicitedAsync(Class.Class123, ct);
 
 Setting `HoldTime` to zero sends as soon as an event appears, which turns a
 100-point plant trip into 100 responses. After `MaxRetries` unconfirmed re-sends
-the outstation gives up and waits for the master to poll instead — so **keep
-polling even when you use unsolicited reporting**. Unsolicited is an
+the outstation gives up on that series, returns its events to the queue for the
+next poll, and waits `RetryDelay` before trying again. `UnlimitedRetries` keeps
+re-sending instead, though a poll still ends the series — so **keep polling
+even when you use unsolicited reporting**. Unsolicited is an
 optimisation, not a substitute for a poll schedule.
 
 ---
@@ -1370,7 +1372,9 @@ started. Move it into `Session.Update`.
   `MaxMasters`. If two SCADA systems poll the device, set it, and size the event
   buffer knowing each master holds its own.
 - Self-address (0xFFFC) is not supported. Broadcast is received and executed but
-  never answered, as the standard requires.
+  never answered, as the standard requires. After a broadcast to 0xFFFE the next
+  response asks for confirmation, and the BROADCAST indication stays set until a
+  response that asked is confirmed.
 - Use TLS with mutual authentication for anything that leaves a locked cabinet.
   Secure Authentication v5 is out of scope.
 - File transfer hands a master a path into the device's filesystem over a

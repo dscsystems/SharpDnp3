@@ -147,6 +147,56 @@ public class ConformanceTests
     }
 
     /// <summary>
+    /// A broadcast to 0xFFFE obliges the outstation to request confirmation of
+    /// its next response, and to keep reporting the broadcast until a response
+    /// that asked for it is confirmed.
+    /// </summary>
+    [Fact]
+    public async Task MandatoryConfirmBroadcastHoldsUntilConfirmed()
+    {
+        await using var h = new Harness(Config());
+
+        await h.SendToAsync(0xFFFE, FuncCode.Write, Requests.ClearRestart());
+        await Task.Delay(100);
+
+        var first = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.True(first.Header.Iin.Has(Iin.Broadcast), $"IIN = {first.Header.Iin}");
+        Assert.True(first.Header.Control.Con, "the response should ask for confirmation");
+
+        // Left unconfirmed, the obligation stands: the next response asks again.
+        var second = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.True(second.Header.Iin.Has(Iin.Broadcast), $"IIN = {second.Header.Iin}");
+        Assert.True(second.Header.Control.Con, "an unconfirmed obligation should be asked again");
+
+        await h.SendConfirmAsync(second.Header.Control.Seq);
+        await Task.Delay(100);
+
+        var third = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.False(third.Header.Iin.Has(Iin.Broadcast), $"IIN = {third.Header.Iin}");
+        Assert.False(third.Header.Control.Con, "a discharged obligation should not ask again");
+    }
+
+    /// <summary>
+    /// A broadcast to 0xFFFD leaves confirmation to the outstation: the next
+    /// response reports it once, without asking to be confirmed.
+    /// </summary>
+    [Fact]
+    public async Task OptionalConfirmBroadcastIsReportedOnce()
+    {
+        await using var h = new Harness(Config());
+
+        await h.SendToAsync(0xFFFD, FuncCode.Write, Requests.ClearRestart());
+        await Task.Delay(100);
+
+        var first = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.True(first.Header.Iin.Has(Iin.Broadcast), $"IIN = {first.Header.Iin}");
+        Assert.False(first.Header.Control.Con);
+
+        var second = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.False(second.Header.Iin.Has(Iin.Broadcast), $"IIN = {second.Header.Iin}");
+    }
+
+    /// <summary>
     /// DELAY_MEASURE is answered with a group 52 variation 2 time delay.
     /// </summary>
     [Fact]

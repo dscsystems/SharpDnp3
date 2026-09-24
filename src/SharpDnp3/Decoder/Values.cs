@@ -20,8 +20,12 @@ namespace SharpDnp3.Decoding;
 /// </remarks>
 public readonly record struct Value
 {
-    /// <summary>The point index the measurement was reported at.</summary>
-    public ushort Index { get; init; }
+    /// <summary>
+    /// The point index the measurement was reported at: the full 32-bit index
+    /// the object header carried. A decoder exists to show what was on the
+    /// wire, so it never narrows one to fit.
+    /// </summary>
+    public uint Index { get; init; }
 
     /// <summary>What kind of measurement it is.</summary>
     public PointType Type { get; init; }
@@ -165,10 +169,10 @@ public static class ValueDecoder
                 break;
             }
 
-            var index = (ushort)h.Range.IndexOf((uint)i);
+            var index = h.Range.IndexOf((uint)i);
             if (prefixLen > 0)
             {
-                index = (ushort)ReadPrefix(data[off..], prefixLen);
+                index = ReadPrefix(data[off..], prefixLen);
                 off += prefixLen;
             }
 
@@ -183,7 +187,7 @@ public static class ValueDecoder
     private static Value DecodeOne(
         GroupVar gv,
         Descriptor d,
-        ushort index,
+        uint index,
         ReadOnlySpan<byte> buf,
         Context ctx)
     {
@@ -261,7 +265,7 @@ public static class ValueDecoder
         return new Value { Index = index, Type = d.Measurement, Text = "" };
     }
 
-    private static Value Make(ushort index, Descriptor d, string text, Flags flags, Timestamp time) =>
+    private static Value Make(uint index, Descriptor d, string text, Flags flags, Timestamp time) =>
         new()
         {
             Index = index,
@@ -290,7 +294,7 @@ public static class ValueDecoder
                 {
                     output.Add(new Value
                     {
-                        Index = (ushort)h.Range.IndexOf((uint)i),
+                        Index = h.Range.IndexOf((uint)i),
                         Type = d.Measurement,
                         Text = raw[i].Value.ToDisplayString(),
                         Flags = raw[i].Flags,
@@ -308,7 +312,7 @@ public static class ValueDecoder
                 {
                     output.Add(new Value
                     {
-                        Index = (ushort)h.Range.IndexOf((uint)i),
+                        Index = h.Range.IndexOf((uint)i),
                         Type = d.Measurement,
                         Text = BoolText(raw[i].Value),
                         Flags = raw[i].Flags,
@@ -326,7 +330,7 @@ public static class ValueDecoder
                 {
                     output.Add(new Value
                     {
-                        Index = (ushort)h.Range.IndexOf((uint)i),
+                        Index = h.Range.IndexOf((uint)i),
                         Type = d.Measurement,
                         Text = BoolText(raw[i].Value),
                         Flags = raw[i].Flags,
@@ -366,10 +370,10 @@ public static class ValueDecoder
                 break;
             }
 
-            var index = (ushort)h.Range.IndexOf(i);
+            var index = h.Range.IndexOf(i);
             if (prefixLen > 0)
             {
-                index = (ushort)ReadPrefix(data[off..], prefixLen);
+                index = ReadPrefix(data[off..], prefixLen);
                 off += prefixLen;
             }
 
@@ -478,7 +482,7 @@ public static class ValueDecoder
         {
             if (TryFileObjectText(h.Variation, objects[i], out var text))
             {
-                output.Add(new Value { Index = (ushort)i, Text = text });
+                output.Add(new Value { Index = (uint)i, Text = text });
             }
         }
 
@@ -710,10 +714,10 @@ public static class ValueDecoder
                 break;
             }
 
-            var index = (ushort)h.Range.IndexOf(i);
+            var index = h.Range.IndexOf(i);
             if (prefixLen > 0)
             {
-                index = (ushort)ReadPrefix(data[off..], prefixLen);
+                index = ReadPrefix(data[off..], prefixLen);
                 off += prefixLen;
             }
 

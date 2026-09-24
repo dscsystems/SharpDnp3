@@ -7,6 +7,7 @@ using System.Globalization;
 using System.Threading.Channels;
 using SharpDnp3.App;
 using SharpDnp3.Channels;
+using SharpDnp3.Link;
 using SharpDnp3.Objects;
 using SharpDnp3.Stack;
 
@@ -1128,6 +1129,10 @@ public sealed partial class OutstationSession
         a.PendingBodies = null;
         a.PendingIndex = 0;
 
+        // An unconfirmed response discharges no broadcast confirmation; the
+        // next response asks again.
+        a.BroadcastConfirmSought = false;
+
         var n = a.Events.Unselect();
 
         lock (_gate)
@@ -1169,10 +1174,42 @@ public sealed partial class OutstationSession
 
             a.Log.Log(Dnp3LogLevel.Warn, "malformed request", ("err", error));
 
-            // A fragment we cannot parse cannot be answered meaningfully: we do
-            // not know its sequence number's validity or what it asked for. The
-            // parameter-error indication rides on the next response instead.
-            a.Iin = a.Iin.Set(Iin.ParameterError);
+            // An object the outstation cannot size is one it does not know;
+            // anything else wrong with the objects is a parameter error.
+            a.Iin = a.Iin.Set(status == AppParseStatus.UnknownObject ? Iin.ObjectUnknown : Iin.ParameterError);
+
+            // When the application header itself was readable, the master is
+            // waiting on a sequence number we know, so it is answered at once
+            // with a null response carrying the error: left to time out, it
+            // learns nothing about why. Anything that would not have been
+            // answered had it parsed — a confirm, a response, a no-reply
+            // function, a broadcast, one fragment of a series — is not
+            // answered now either, and the indication rides on the next
+            // response instead.
+            if (status != AppParseStatus.ShortFragment &&
+                frag.Header.Control is { Fir: true, Fin: true } &&
+                frag.Header.Func != FuncCode.Confirm &&
+                !frag.Header.Func.IsResponse() &&
+                !frag.Header.Func.NoReply() &&
+                !r.Broadcast)
+            {
+                // Remembered like any other request, so a retransmission of it
+                // is answered from the same null response, error and all.
+                if (IsRepeatRequest(a, r, frag))
+                {
+                    lock (_gate)
+                    {
+                        _stats.RepeatedRequests++;
+                    }
+
+                    ReplayResponse(a, r, frag.Header);
+                    return;
+                }
+
+                RememberRequest(a, r, frag);
+                Respond(a, r, frag.Header, []);
+            }
+
             return;
         }
 
@@ -1231,6 +1268,16 @@ public sealed partial class OutstationSession
             // outstation answering at once would collide. The next response
             // carries the broadcast indication instead.
             a.Iin = a.Iin.Set(Iin.Broadcast);
+
+            // Sent to the mandatory-confirm address, it also obliges the next
+            // response to be confirmed. A new obligation is not discharged by
+            // the confirmation of a response already in flight, which reported
+            // an earlier broadcast.
+            if (r.Dest == LinkConstants.BroadcastMandatoryConfirm)
+            {
+                a.BroadcastConfirmOwed = true;
+                a.BroadcastConfirmSought = false;
+            }
         }
 
         // A request whose function code is meaningless without objects asked
@@ -1405,6 +1452,13 @@ public sealed partial class OutstationSession
     /// <summary>Answers a read request.</summary>
     private void OnRead(Association a, Received r, Fragment frag)
     {
+        // A poll during an unconfirmed unsolicited series ends that series at
+        // its next timeout; see UnsolicitedConfig.UnlimitedRetries.
+        if (a.Unsol.LastFrag is not null)
+        {
+            a.Unsol.ReadSinceSent = true;
+        }
+
         // A group 0 read is answered on its own. The attributes are not
         // measurements and share none of the machinery below: each carries its
         // own header, because for group 0 the variation is the attribute's
@@ -1936,16 +1990,20 @@ public sealed partial class OutstationSession
             return;
         }
 
-        if (a.PendingBodies is { } queued && a.PendingIndex < queued.Count)
+        // A response is still in flight while fragments remain to be sent, and
+        // also while its last fragment awaits confirmation — the case a master
+        // produces whenever its confirm is lost, or it simply moves on. Either
+        // way the new request supersedes it: the confirmation wait is abandoned
+        // and the events it held go back in the queue. Left waiting, the new
+        // response would sit behind a confirmation that is never coming, and
+        // the timeout would then discard it along with the old one.
+        if (a.AwaitingConfirm || (a.PendingBodies is { } queued && a.PendingIndex < queued.Count))
         {
-            // A well-behaved master confirms (or lets confirm time out) before
-            // asking anything else, so this should not happen; abandon the
-            // response still in flight rather than silently losing track of
-            // whatever events it was holding.
-            a.Log.Log(Dnp3LogLevel.Warn, "a new response is replacing one still in flight");
+            a.Log.Log(Dnp3LogLevel.Debug, "a new response is replacing one still in flight");
             if (a.AwaitingConfirm)
             {
                 a.AwaitingConfirm = false;
+                a.BroadcastConfirmSought = false;
                 a.Events.Unselect();
             }
         }
@@ -1960,6 +2018,7 @@ public sealed partial class OutstationSession
         // with this same response rather than by running the request again.
         a.LastRespBodies = bodies;
         a.LastRespEvents = hasEvents;
+        a.LastRespErrors = a.Iin & Iin.RequestErrorMask;
 
         AdvanceResponse(a);
     }
@@ -2002,8 +2061,13 @@ public sealed partial class OutstationSession
         var last = i == bodies.Count - 1;
 
         // Intermediate fragments must be confirmed or the master cannot pace
-        // the series; the final one only needs it when it carries events.
-        var needConfirm = !last || a.PendingHasEvents;
+        // the series; the final one only needs it when it carries events, or
+        // when a broadcast to the mandatory-confirm address is owed one.
+        var needConfirm = !last || a.PendingHasEvents || a.BroadcastConfirmOwed;
+        if (last && a.BroadcastConfirmOwed)
+        {
+            a.BroadcastConfirmSought = true;
+        }
 
         var ctrl = new AppControl(
             Fir: i == 0,
@@ -2069,15 +2133,26 @@ public sealed partial class OutstationSession
 
         // The broadcast indication reports only the request that arrived by
         // broadcast, so it is cleared once reported. So are the request-error
-        // indications: NO_FUNC_CODE_SUPPORT, OBJECT_UNKNOWN and PARAMETER_ERROR
-        // describe the request this response answers (or, for one that could
-        // not be answered, the first response after it). Left latched, one bad
-        // request would make every later response report an error the master
-        // never caused.
-        a.Iin = a.Iin.Clear(Iin.Broadcast)
-            .Clear(Iin.NoFuncCodeSupport)
-            .Clear(Iin.ObjectUnknown)
-            .Clear(Iin.ParameterError);
+        // indications (NO_FUNC_CODE_SUPPORT, OBJECT_UNKNOWN, PARAMETER_ERROR and
+        // ALREADY_EXECUTING): they describe the request this response answers
+        // (or, for one that could not be answered, the first response after
+        // it). Left latched, one bad request would make every later response
+        // report an error the master never caused.
+        a.Iin = a.Iin.Clear(Iin.RequestErrorMask);
+
+        // A response that asked for confirmation on behalf of a mandatory-
+        // confirm broadcast only finishes once the master has confirmed it,
+        // which discharges the obligation. Until then the indication stays.
+        if (a.BroadcastConfirmSought)
+        {
+            a.BroadcastConfirmOwed = false;
+            a.BroadcastConfirmSought = false;
+        }
+
+        if (!a.BroadcastConfirmOwed)
+        {
+            a.Iin = a.Iin.Clear(Iin.Broadcast);
+        }
     }
 
     /// <summary>
@@ -2106,6 +2181,15 @@ public sealed partial class OutstationSession
         // Copied rather than aliased: the fragment points into the stack's
         // reassembly buffer, which the next segment overwrites.
         a.LastReqFrag = r.Fragment.ToArray();
+
+        // Whatever the previous request produced is no answer to this one; it
+        // is replaced when this request produces its own response. Kept, a
+        // repeat of a request that is never answered (one sent with a
+        // no-response function code) would be answered with the previous
+        // request's response.
+        a.LastRespBodies = null;
+        a.LastRespEvents = false;
+        a.LastRespErrors = Iin.None;
     }
 
     /// <summary>Re-sends the response a repeated request already produced.</summary>
@@ -2125,6 +2209,12 @@ public sealed partial class OutstationSession
         a.AwaitingConfirm = false;
         a.PendingBodies = null;
         a.PendingIndex = 0;
+
+        // The request error indications the original response carried were
+        // cleared once it was sent, and the repeat is owed the same answer:
+        // without them, a master whose refused request's response was lost
+        // would read the replay as that request succeeding.
+        a.Iin = a.Iin.Set(a.LastRespErrors);
 
         SendFragments(a, r, req, bodies, a.LastRespEvents);
     }

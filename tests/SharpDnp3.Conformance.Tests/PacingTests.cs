@@ -48,6 +48,62 @@ public class PacingTests
     }
 
     /// <summary>
+    /// A repeat is owed the same answer as the original, refusal and all. The
+    /// request error indications are cleared once reported, so a replay that
+    /// did not put them back would tell a master whose refused request's
+    /// response was lost that the request succeeded.
+    /// </summary>
+    [Fact]
+    public async Task ARepeatOfARefusedRequestIsRefusedAgain()
+    {
+        await using var h = new Harness(new OutstationConfig { Database = Requests.SmallDatabase() });
+
+        var control = new AppControl(Fir: true, Fin: true, Con: false, Uns: false, Seq: 3);
+        var unknown = FragmentFactory.ReadRange(88, 1, 0, 1);
+
+        var before = h.Count;
+        await h.SendWithControlAsync(control, FuncCode.Read, unknown);
+        var first = await h.AwaitAsync(before);
+        Assert.True(first.Header.Iin.Has(Iin.ObjectUnknown), $"IIN = {first.Header.Iin}");
+
+        await h.SendWithControlAsync(control, FuncCode.Read, unknown);
+        var second = await h.AwaitAsync(before + 1);
+        Assert.True(
+            second.Header.Iin.Has(Iin.ObjectUnknown),
+            $"the replay reported IIN = {second.Header.Iin}, want OBJECT_UNKNOWN");
+
+        // And the indication is still cleared once reported: the next,
+        // unrelated request does not inherit it.
+        var next = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.False(next.Header.Iin.Has(Iin.ObjectUnknown), $"IIN = {next.Header.Iin}");
+    }
+
+    /// <summary>
+    /// A request that is never answered leaves nothing to replay. Its repeat
+    /// must not be answered with the response to the request before it, which
+    /// the master would take as the answer to something it did not ask.
+    /// </summary>
+    [Fact]
+    public async Task ARepeatOfAnUnansweredRequestGetsNoStaleResponse()
+    {
+        var commands = new RecordingCommandHandler();
+        await using var h = new Harness(
+            new OutstationConfig { Database = Requests.SmallDatabase() }, commands);
+
+        await h.RequestAsync(FuncCode.DelayMeasure);
+        var answered = h.Count;
+
+        var control = new AppControl(Fir: true, Fin: true, Con: false, Uns: false, Seq: 9);
+        var crob = Requests.CrobHeader(0, ControlCode.LatchOn);
+        await h.SendWithControlAsync(control, FuncCode.DirectOperateNR, crob);
+        await h.SendWithControlAsync(control, FuncCode.DirectOperateNR, crob);
+
+        await Task.Delay(150);
+        Assert.Equal(answered, h.Count);
+        Assert.Equal(1, commands.Operates);
+    }
+
+    /// <summary>
     /// A request whose sequence number repeats but whose octets differ is new
     /// work, and must be executed rather than answered from the store.
     /// </summary>
@@ -70,6 +126,64 @@ public class PacingTests
         await h.AwaitAsync(before + 1);
 
         Assert.Equal(2, commands.Operates);
+    }
+
+    /// <summary>
+    /// A request whose objects cannot be parsed still has a readable header
+    /// and a sequence number the master is waiting on. It is answered at once
+    /// with a null response carrying the error, rather than left to time out.
+    /// </summary>
+    [Fact]
+    public async Task AMalformedRequestIsAnsweredWithItsError()
+    {
+        await using var h = new Harness(new OutstationConfig { Database = Requests.SmallDatabase() });
+
+        // A write of an object the outstation cannot size: unknown.
+        var unknown = new ObjectHeader
+        {
+            Group = 88,
+            Variation = 1,
+            Qualifier = Qualifier.Make(IndexPrefix.None, RangeSpec.Count8),
+            Range = new ObjectRange { Spec = RangeSpec.Count8, Count = 1 },
+            Data = new byte[] { 0x00 },
+        };
+
+        var resp = await h.RequestAsync(FuncCode.Write, unknown);
+        Assert.Equal(h.Seq, resp.Header.Control.Seq);
+        Assert.Empty(resp.Objects);
+        Assert.True(resp.Header.Iin.Has(Iin.ObjectUnknown), $"IIN = {resp.Header.Iin}");
+
+        // A write whose object data is cut short: a parameter error.
+        var truncated = Requests.ClearRestart() with { Data = Array.Empty<byte>() };
+
+        resp = await h.RequestAsync(FuncCode.Write, truncated);
+        Assert.Equal(h.Seq, resp.Header.Control.Seq);
+        Assert.True(resp.Header.Iin.Has(Iin.ParameterError), $"IIN = {resp.Header.Iin}");
+        Assert.False(resp.Header.Iin.Has(Iin.ObjectUnknown), "the earlier error should not linger");
+    }
+
+    /// <summary>
+    /// A malformed request sent with a no-reply function code is still not
+    /// answered; its error rides on the next response.
+    /// </summary>
+    [Fact]
+    public async Task AMalformedNoReplyRequestIsReportedOnTheNextResponse()
+    {
+        var commands = new RecordingCommandHandler();
+        await using var h = new Harness(
+            new OutstationConfig { Database = Requests.SmallDatabase() }, commands);
+
+        var crob = Requests.CrobHeader(0, ControlCode.LatchOn);
+        var cut = crob with { Data = crob.Data[..4] };
+
+        var before = h.Count;
+        await h.SendAsync(FuncCode.DirectOperateNR, cut);
+        await Task.Delay(150);
+        Assert.Equal(before, h.Count);
+        Assert.Equal(0, commands.Operates);
+
+        var resp = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.True(resp.Header.Iin.Has(Iin.ParameterError), $"IIN = {resp.Header.Iin}");
     }
 
     /// <summary>
@@ -275,5 +389,36 @@ public class PacingTests
 
         await h.SendConfirmAsync(first.Header.Control.Seq);
         await h.AwaitAsync(before + 1);
+    }
+
+    /// <summary>
+    /// A master that moves on without confirming a response — because its
+    /// confirm was lost, or it chose not to — is still answered. The new
+    /// request supersedes the confirmation wait, and the unconfirmed events go
+    /// back in the queue for the next poll rather than being dropped.
+    /// </summary>
+    [Fact]
+    public async Task ARequestDuringAConfirmWaitIsAnswered()
+    {
+        await using var h = new Harness(new OutstationConfig
+        {
+            Database = new DatabaseConfig { Binary = 4, DefaultClass = Class.Class1 },
+            ConfirmTimeout = TimeSpan.FromSeconds(30),
+        });
+
+        await h.RequestAsync(FuncCode.Write, Requests.ClearRestart());
+        h.Outstation.Update(db => db.UpdateBinary(0, new Binary(true, Flags.Online, default)));
+        await Harness.WaitForAsync(() => h.Outstation.Events?.Total >= 1, "the event to be queued");
+
+        var events = await h.RequestAsync(FuncCode.Read, FragmentFactory.ReadAllObjects(60, 2));
+        Assert.True(events.Header.Control.Con, "an event response asks for confirmation");
+
+        // No confirm; the master asks something else.
+        var next = await h.RequestAsync(FuncCode.DelayMeasure);
+        Assert.Equal(h.Seq, next.Header.Control.Seq);
+
+        // The event was never confirmed, so it is still there to collect.
+        var again = await h.RequestAsync(FuncCode.Read, FragmentFactory.ReadAllObjects(60, 2));
+        Assert.NotEmpty(again.Objects);
     }
 }
