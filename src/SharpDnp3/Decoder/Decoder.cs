@@ -457,7 +457,7 @@ public sealed class Dnp3Decoder
         {
             if (h.Group == GroupCto && h.Data.Length >= CommandObjects.Time48Size)
             {
-                ctx = ctx.WithCto(CommandObjects.ParseTime48(h.Data.Span).Time);
+                ctx = ctx.WithGroup51(CommandObjects.ParseTime48(h.Data.Span).Time, h.Variation);
                 output.Add([]);
                 continue;
             }

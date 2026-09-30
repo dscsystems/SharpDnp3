@@ -43,7 +43,7 @@ internal sealed class MasterTask
     public int Priority { get; init; }
 
     /// <summary>Appends the task's object headers to the request.</summary>
-    public Action<FragmentBuilder>? Build { get; init; }
+    public Action<FragmentBuilder>? Build { get; set; }
 
     /// <summary>Runs for each response fragment, before the confirm.</summary>
     public Action<Fragment>? OnFragment { get; set; }
@@ -88,6 +88,24 @@ internal sealed class MasterTask
 
     /// <summary>The application sequence number the request went out with.</summary>
     public byte Seq { get; set; }
+
+    /// <summary>
+    /// An error the task's fragment handlers found, which fails the task once
+    /// its response is complete instead of letting it report success.
+    /// </summary>
+    public Exception? Failure { get; set; }
+
+    /// <summary>
+    /// For the key exchange that precedes a task, the task it was run for, so a
+    /// failed exchange does not lose a periodic one.
+    /// </summary>
+    public MasterTask? Origin { get; init; }
+
+    /// <summary>
+    /// The sequence number of the last fragment accepted, from which the next
+    /// in the series is expected to follow.
+    /// </summary>
+    public byte RespSeq { get; set; }
 
     /// <summary>
     /// Set once a fragment of this task's response series has been accepted,
@@ -246,18 +264,28 @@ internal static class MasterTasks
     };
 
     /// <summary>Sets the outstation's clock.</summary>
-    public static MasterTask WriteTime(DateTimeOffset t)
+    public static MasterTask WriteTime(DateTimeOffset t) => WriteTimeObject("write-time", 1, t);
+
+    /// <summary>
+    /// Writes what the master's clock read when it sent RECORD_CURRENT_TIME, as
+    /// group 50 variation 3: the second half of the LAN procedure. The
+    /// outstation adds the time it has held the request since.
+    /// </summary>
+    public static MasterTask WriteRecordedTime(DateTimeOffset t) =>
+        WriteTimeObject("write-recorded-time", 3, t);
+
+    private static MasterTask WriteTimeObject(string name, byte variation, DateTimeOffset t)
     {
         var ms = Dnp3Time.ToDnp3(t);
         return new MasterTask
         {
-            Name = "write-time",
+            Name = name,
             FuncCode = FuncCode.Write,
             Priority = TaskPriority.Startup,
             Build = b => Add(b, new ObjectHeader
             {
                 Group = 50,
-                Variation = 1,
+                Variation = variation,
                 Qualifier = Qualifier.Make(IndexPrefix.None, RangeSpec.Count8),
                 Range = new ObjectRange { Spec = RangeSpec.Count8, Count = 1 },
                 Data = new[]
@@ -307,11 +335,21 @@ internal static class MasterTasks
             Priority = TaskPriority.Command,
             Build = b =>
             {
-                // One index byte and four value bytes per deadband.
-                var data = new List<byte>(5 * indexes.Count);
+                // The index prefix is widened when any index passes 255; a
+                // one-octet prefix would set the deadband of the wrong point.
+                // The indexes are sorted, so the last one is the largest.
+                var wide = indexes.Count > 0 && indexes[^1] > 0xFF;
+                var prefix = wide ? IndexPrefix.Index2 : IndexPrefix.Index1;
+                var spec = wide ? RangeSpec.Count16 : RangeSpec.Count8;
+                var data = new List<byte>((prefix.Octets() + 4) * indexes.Count);
                 foreach (var i in indexes)
                 {
                     data.Add((byte)i);
+                    if (wide)
+                    {
+                        data.Add((byte)(i >> 8));
+                    }
+
                     ObjectConvert.AppendSingle(data, deadbands[i]);
                 }
 
@@ -319,8 +357,8 @@ internal static class MasterTasks
                 {
                     Group = 34,
                     Variation = 3, // single precision
-                    Qualifier = Qualifier.Make(IndexPrefix.Index1, RangeSpec.Count8),
-                    Range = new ObjectRange { Spec = RangeSpec.Count8, Count = (uint)indexes.Count },
+                    Qualifier = Qualifier.Make(prefix, spec),
+                    Range = new ObjectRange { Spec = spec, Count = (uint)indexes.Count },
                     Data = data.ToArray(),
                 });
             },
@@ -339,6 +377,33 @@ internal static class MasterTasks
             Build = b => CommandCodec.BuildCommands(b, cmds),
             OnFragment = frag => CommandCodec.ParseCommandStatuses(frag, result.Statuses),
         };
+
+    /// <summary>
+    /// Asks the outstation to freeze every counter at a time, and again every
+    /// interval when that is non-zero.
+    /// </summary>
+    public static MasterTask FreezeAtTime(DateTimeOffset at, TimeSpan interval) => new()
+    {
+        Name = "freeze-at-time",
+        FuncCode = FuncCode.FreezeAtTime,
+        Priority = TaskPriority.Command,
+        Build = b =>
+        {
+            var data = new List<byte>(10);
+            CommandObjects.AppendTime48(data, Timestamp.Now(at));
+            var ms = (uint)interval.TotalMilliseconds;
+            data.AddRange([(byte)ms, (byte)(ms >> 8), (byte)(ms >> 16), (byte)(ms >> 24)]);
+            Add(b, new ObjectHeader
+            {
+                Group = 50,
+                Variation = 2,
+                Qualifier = Qualifier.Make(IndexPrefix.None, RangeSpec.Count8),
+                Range = new ObjectRange { Spec = RangeSpec.Count8, Count = 1 },
+                Data = data.ToArray(),
+            });
+            Add(b, FragmentFactory.ReadAllObjects(20, 0));
+        },
+    };
 
     private static void Add(FragmentBuilder b, ObjectHeader h)
     {
@@ -411,7 +476,8 @@ internal sealed class Scheduler
     public int Count => _queue.Count;
 
     /// <summary>
-    /// Drops every pending task, failing anything a caller is waiting on.
+    /// Drops every pending one-shot task, failing anything a caller is waiting
+    /// on.
     /// </summary>
     /// <remarks>
     /// This runs when the outstation reports a restart: the queued work was
@@ -419,12 +485,27 @@ internal sealed class Scheduler
     /// </remarks>
     public void Clear()
     {
+        // Periodic tasks are kept, because a periodic task is only re-queued
+        // after it runs and would otherwise be lost for good; they poll the
+        // restarted device as they always did.
+        var kept = new List<MasterTask>();
         foreach (var t in _tracked)
         {
+            if (t.Period > TimeSpan.Zero)
+            {
+                kept.Add(t);
+                continue;
+            }
+
             t.Finish(new TaskFailedException());
         }
 
         _tracked.Clear();
         _queue.Clear();
+        foreach (var t in kept)
+        {
+            _tracked.Add(t);
+            _queue.Enqueue(t, new TaskKey(t.Due, t.Priority, t.Order));
+        }
     }
 }

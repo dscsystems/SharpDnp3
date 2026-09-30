@@ -30,6 +30,18 @@ public enum PointType : byte
     AnalogOutputStatus,
     /// <summary>Variable-length opaque value.</summary>
     OctetString,
+    /// <summary>A control operated on a binary output (group 13).</summary>
+    BinaryCommandEvent,
+    /// <summary>A control operated on an analog output (group 43).</summary>
+    AnalogCommandEvent,
+    /// <summary>Analog input captured at a freeze.</summary>
+    FrozenAnalog,
+    /// <summary>Virtual terminal port (groups 112 and 113).</summary>
+    VirtualTerminal,
+    /// <summary>Secure Authentication statistic (groups 121 and 122).</summary>
+    SecurityStatistic,
+    /// <summary>Dataset (groups 85 to 88).</summary>
+    Dataset,
 }
 
 /// <summary>
@@ -223,7 +235,7 @@ public readonly struct Flags : IEquatable<Flags>
             [(0x20, "CHATTER_FILTER"), (0x40, "BIT6"), (0x80, "STATE")],
         PointType.Counter or PointType.FrozenCounter =>
             [(0x20, "ROLLOVER"), (0x40, "DISCONTINUITY"), (0x80, "BIT7")],
-        PointType.Analog or PointType.AnalogOutputStatus =>
+        PointType.Analog or PointType.FrozenAnalog or PointType.AnalogOutputStatus =>
             [(0x20, "OVER_RANGE"), (0x40, "REFERENCE_ERR"), (0x80, "BIT7")],
         _ => [(0x20, "BIT5"), (0x40, "BIT6"), (0x80, "BIT7")],
     };

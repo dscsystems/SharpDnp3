@@ -42,6 +42,28 @@ public record struct Event
     /// <summary>Set when <see cref="Type"/> is <see cref="PointType.Analog"/>.</summary>
     public Analog Analog { get; set; }
 
+    /// <summary>Set when <see cref="Type"/> is <see cref="PointType.FrozenAnalog"/>.</summary>
+    public Analog FrozenAnalog { get; set; }
+
+    /// <summary>Set when <see cref="Type"/> is <see cref="PointType.Dataset"/>: the complete encoded object.</summary>
+    public byte[]? Dataset { get; set; }
+
+    /// <summary>Set when <see cref="Type"/> is <see cref="PointType.SecurityStatistic"/>.</summary>
+    public uint SecurityStatistic { get; set; }
+
+    /// <summary>
+    /// For a command event (<see cref="PointType.BinaryCommandEvent"/>,
+    /// <see cref="PointType.AnalogCommandEvent"/>): the outcome the outstation
+    /// reported.
+    /// </summary>
+    public CommandStatus CommandStatus { get; set; }
+
+    /// <summary>The state a binary output was commanded to, for a binary command event.</summary>
+    public bool CommandState { get; set; }
+
+    /// <summary>The value an analog output was commanded to, for an analog command event.</summary>
+    public double CommandValue { get; set; }
+
     /// <summary>Set when <see cref="Type"/> is <see cref="PointType.BinaryOutputStatus"/>.</summary>
     public BinaryOutputStatus BinaryOutput { get; set; }
 
@@ -56,6 +78,12 @@ public record struct Event
     /// by the master.
     /// </summary>
     internal bool Selected { get; set; }
+
+    /// <summary>
+    /// Identifies the event within its buffer, so a caller that selected more
+    /// than it could send can hand back exactly the surplus.
+    /// </summary>
+    internal ulong Seq { get; set; }
 }
 
 /// <summary>Sizes the event buffer.</summary>
@@ -103,6 +131,8 @@ public sealed class EventBuffer
     /// </remarks>
     private ulong _dropsAtSelect;
 
+    private ulong _nextSeq;
+
     /// <summary>Creates an event buffer.</summary>
     public EventBuffer(EventBufferConfig? config = null)
     {
@@ -131,6 +161,7 @@ public sealed class EventBuffer
                 _drops++;
             }
 
+            e.Seq = ++_nextSeq;
             _events.AddLast(e);
         }
     }
@@ -219,7 +250,17 @@ public sealed class EventBuffer
     /// The events stay in the buffer. They are removed only by
     /// <see cref="Confirm"/>.
     /// </remarks>
-    public List<Event> Select(Class mask, int limit)
+    public List<Event> Select(Class mask, int limit) =>
+        SelectWhere(limit, e => (e.Class & mask) != 0);
+
+    /// <summary>
+    /// <see cref="Select"/> for a read of one kind of event — every binary
+    /// input event, say — which takes them whatever class they are in.
+    /// </summary>
+    public List<Event> SelectType(PointType type, int limit) =>
+        SelectWhere(limit, e => e.Type == type);
+
+    private List<Event> SelectWhere(int limit, Func<Event, bool> match)
     {
         lock (_gate)
         {
@@ -239,7 +280,7 @@ public sealed class EventBuffer
                 }
 
                 var e = node.Value;
-                if (e.Selected || (e.Class & mask) == 0)
+                if (e.Selected || !match(e))
                 {
                     continue;
                 }
@@ -250,6 +291,47 @@ public sealed class EventBuffer
             }
 
             return output;
+        }
+    }
+
+    /// <summary>
+    /// Returns the given events, previously handed out by <see cref="Select"/>,
+    /// to the queue without touching any other selected event.
+    /// </summary>
+    /// <remarks>
+    /// It is for a caller that selected more than fitted in the fragment it
+    /// could send: confirming those would delete events the master was never
+    /// offered.
+    /// </remarks>
+    public int Release(IReadOnlyList<Event> events)
+    {
+        ArgumentNullException.ThrowIfNull(events);
+        if (events.Count == 0)
+        {
+            return 0;
+        }
+
+        lock (_gate)
+        {
+            var release = new HashSet<ulong>(events.Count);
+            foreach (var e in events)
+            {
+                release.Add(e.Seq);
+            }
+
+            var n = 0;
+            for (var node = _events.First; node is not null; node = node.Next)
+            {
+                if (node.Value.Selected && release.Contains(node.Value.Seq))
+                {
+                    var e = node.Value;
+                    e.Selected = false;
+                    node.Value = e;
+                    n++;
+                }
+            }
+
+            return n;
         }
     }
 
@@ -385,7 +467,9 @@ public sealed class EventBuffer
                     overflowed = true;
                 }
 
-                _events.AddLast(e);
+                var seeded = e;
+                seeded.Seq = ++_nextSeq;
+                _events.AddLast(seeded);
             }
 
             _overflow |= overflowed;

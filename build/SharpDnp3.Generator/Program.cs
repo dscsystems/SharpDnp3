@@ -194,9 +194,10 @@ namespace SharpDnp3.Generator
             b.Append("    /// explicit size, so a parser walks them instead of looking them up.\n");
             b.Append("    /// </summary>\n");
             b.Append("    private static readonly HashSet<byte> VariableGroups =\n    [\n");
+            var seenVariable = new HashSet<byte>();
             foreach (var o in s.Objects)
             {
-                if (o.Variable)
+                if (o.Variable && seenVariable.Add(o.Group))
                 {
                     b.Append(Inv("        {0}, // {1}\n", o.Group, o.Name));
                 }
@@ -258,9 +259,10 @@ namespace SharpDnp3.Generator
             b.Append("    /// Groups with no fixed size; their encoding carries one.\n");
             b.Append("    /// </summary>\n");
             b.Append("    private static readonly HashSet<byte> VariableGroups =\n    [\n");
+            var seenVariable = new HashSet<byte>();
             foreach (var o in s.Objects)
             {
-                if (o.Variable)
+                if (o.Variable && seenVariable.Add(o.Group))
                 {
                     b.Append(Inv("        {0}, // {1}\n", o.Group, o.Name));
                 }

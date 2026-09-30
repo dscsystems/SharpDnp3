@@ -188,6 +188,18 @@ internal sealed class Association
     /// </summary>
     public bool Connected;
 
+    /// <summary>This connection's Secure Authentication state.</summary>
+    internal SecurityState Security = new();
+
+    /// <summary>The file authentication key this master was issued, or zero.</summary>
+    public uint FileAuthKey;
+
+    /// <summary>The link source the file authentication key is bound to.</summary>
+    public ushort FileAuthSource;
+
+    /// <summary>When the file authentication key stops being valid.</summary>
+    public DateTimeOffset FileAuthUntil;
+
     /// <summary>
     /// Set from outside the association's loop when the device restarts, and
     /// acted on by that loop at its next tick.

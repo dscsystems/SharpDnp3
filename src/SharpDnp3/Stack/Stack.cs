@@ -90,6 +90,9 @@ internal sealed class StackConfig
 
     /// <summary>Caps a reassembled application fragment.</summary>
     public int MaxRxFragment { get; set; }
+
+    /// <summary>Accepts the discovery destination (0xFFFC), for outstations only.</summary>
+    public bool SelfAddress { get; set; }
 }
 
 /// <summary>What one completed fragment looks like.</summary>
@@ -344,6 +347,10 @@ internal sealed class ProtocolStack
                 return true;
 
             default:
+                // Nothing is in flight at the link layer, so there is nothing
+                // left to wait for. Leaving awaiting set would refuse every
+                // later send.
+                _awaiting = false;
                 return false;
         }
     }
@@ -381,6 +388,16 @@ internal sealed class ProtocolStack
         while (_parser.TryNext(out var f))
         {
             if (!AddressedToUs(f.Header.Dest))
+            {
+                continue;
+            }
+
+            // DIR is 1 on everything a master transmits and 0 on everything an
+            // outstation transmits, so a frame whose direction matches our own
+            // role did not come from the other end of this link. Acting on it
+            // would let a master process another master's primary frame, or an
+            // outstation an outstation's.
+            if (f.Header.Control.Dir == _cfg.IsMaster)
             {
                 continue;
             }
@@ -424,7 +441,19 @@ internal sealed class ProtocolStack
             // or merely misrouted from some other station on the line.
             if (f.Header.Src != _dest)
             {
-                continue;
+                // The one exception is discovery. A request sent to the self
+                // address is answered from the station's own, so the first
+                // valid reply names it: the exchange carries on with that
+                // address from here, and anyone else's frame is refused as
+                // before. Without this a link-confirmed exchange with an
+                // unknown outstation could never be acknowledged, since the ACK
+                // comes from an address the primary was not sent to.
+                if (_dest != LinkConstants.SelfAddress || !LinkConstants.IsValidSource(f.Header.Src))
+                {
+                    continue;
+                }
+
+                _dest = f.Header.Src;
             }
 
             var (next, action) = _pri.OnFrame(f);
@@ -472,7 +501,8 @@ internal sealed class ProtocolStack
 
     /// <summary>Reports whether a frame is ours to process.</summary>
     private bool AddressedToUs(ushort dest) =>
-        dest == _cfg.LocalAddr || LinkConstants.IsBroadcast(dest);
+        dest == _cfg.LocalAddr || LinkConstants.IsBroadcast(dest) ||
+        (_cfg.SelfAddress && !_cfg.IsMaster && dest == LinkConstants.SelfAddress);
 
     /// <summary>Encodes a frame into <paramref name="buf"/> and sends it.</summary>
     private static void WriteFrame(IByteSink sink, byte[] buf, LinkFrame f)

@@ -183,6 +183,27 @@ public readonly record struct Counter(uint Value, Flags Flags, Timestamp Time);
 /// <param name="Time">When the measurement was taken.</param>
 public readonly record struct FrozenCounter(uint Value, Flags Flags, Timestamp Time);
 
+/// <summary>
+/// A control operated on an output point, as carried by groups 13 (binary) and
+/// 43 (analog).
+/// </summary>
+/// <param name="Status">The outcome the outstation reported for the command.</param>
+/// <param name="Analog">Reports which of <paramref name="State"/> and <paramref name="Value"/> is meaningful.</param>
+/// <param name="State">The state a binary output was commanded to.</param>
+/// <param name="Value">The value an analog output was commanded to.</param>
+/// <param name="Time">When the command was operated, for the variations that carry one; invalid otherwise.</param>
+public readonly record struct CommandEvent(
+    CommandStatus Status, bool Analog, bool State, double Value, Timestamp Time);
+
+/// <summary>
+/// An indexed group 50 variation 4 value. <see cref="Units"/> is the DNP3
+/// interval-units code; it does not change the outstation clock.
+/// </summary>
+/// <param name="Time">The start time.</param>
+/// <param name="Interval">The interval count.</param>
+/// <param name="Units">The interval units code.</param>
+public readonly record struct TimeAndInterval(Timestamp Time, uint Interval, byte Units);
+
 /// <summary>An analog input.</summary>
 /// <remarks>
 /// The stack carries every analog variation — 16-bit, 32-bit, single and

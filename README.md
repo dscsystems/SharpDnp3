@@ -141,13 +141,22 @@ testing](#building-and-testing).
 | **Events** | Class 1/2/3 assignment, deadbands, confirmation-backed event buffer, unsolicited reporting |
 | **Controls** | CROB and analog output setpoints, direct operate, select-before-operate, no-reply operate |
 | **Time** | LAN and serial (delay-measured) synchronisation, `NEED_TIME` handling, relative-time (CTO) objects |
-| **Files** | Group 70 transfer: read, write, delete, directory listing, file info, with a rooted directory handler |
-| **Attributes** | Group 70's counterpart — group 0 device attributes, derived point counts included |
+| **Files** | Group 70 transfer: read, write, delete, directory listing, file info, with a rooted directory handler and optional `AUTHENTICATE_FILE` |
+| **Attributes** | Group 70's counterpart — group 0 device attributes, derived point counts included, and same-type writes to the ones you mark writable |
+| **Freezes** | `IMMED_FREEZE`, `FREEZE_CLEAR` and scheduled `FREEZE_AT_TIME` for counters and analogs, with independent frozen-analog storage |
+| **Command events** | Operated controls recorded as group 13/43 events in the class each output names |
+| **Extended services** | Indexed time-and-interval objects, virtual terminals, datasets (groups 85–88), application/configuration function codes 15–19 and `ACTIVATE_CONFIG`, self-address discovery |
+| **Secure Authentication** | A symmetric SAv5 subset (locally provisioned AES update keys, RFC 3394 session keys, SHA-256 HMAC, challenge/reply for every state-changing request) with security statistics |
 | **Multidrop** | Several sessions sharing one serial line, with half-duplex turn taking and a bus registry |
-| **Objects** | Groups 0, 1–4, 10–13, 20–23, 30–34, 40–43, 50–52, 60, 70, 80, 110–111, generated from a declarative spec |
+| **Objects** | Groups 0, 1–4, 10–13, 20–23, 30–34, 40–43, 50–52, 60, 70, 80, 85–91, 110–113, 120–122, generated from a declarative spec |
 | **Tooling** | Structured protocol decoder, four working command-line programs |
 
-Deliberately out of scope: Secure Authentication v5 (use TLS) and datasets.
+Not implemented: Secure Authentication aggressive mode, remote user and update-key
+management and any MAC but SHA-256/16 (see the
+[user guide](docs/user-guide.md#extended-services) for exactly what the subset
+covers), automatic dataset prototype expansion, and typed dataset element
+controls. The symmetric subset is independent of TLS and is **not** a certified
+SAv5 profile.
 
 ---
 
@@ -219,6 +228,20 @@ not reach its peer has proved nothing:
 $ GO_DNP3_BIN=/path/to/go-dnp3/bin OPENDNP3_BIN=/path/to/opendnp3/build/bin \
     dotnet test tests/SharpDnp3.Interop.Tests/SharpDnp3.Interop.Tests.csproj
 ```
+
+`GO_DNP3_BIN` holds go-dnp3's `dnp3-master` and `dnp3-outstation`, and `gopeer`,
+a small master/outstation built on go-dnp3's public packages that reaches the
+extended services the stock binaries do not (Secure Authentication, datasets,
+frozen analogs, command events, file authentication, time intervals, virtual
+terminals, the management function codes). One script builds all three:
+
+```console
+$ testdata/interop/gopeer/build.sh /path/to/go-dnp3 /tmp/go-dnp3-bin
+$ GO_DNP3_BIN=/tmp/go-dnp3-bin dotnet test tests/SharpDnp3.Interop.Tests
+```
+
+Each extended service is exercised in both directions: our master against the go
+outstation, and the go master against our outstation.
 
 ### The generated object table
 

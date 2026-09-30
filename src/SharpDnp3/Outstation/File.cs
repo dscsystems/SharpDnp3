@@ -53,6 +53,9 @@ internal sealed class Transfer : IDisposable
     /// </summary>
     public bool Done { get; set; }
 
+    /// <summary>The octets accepted into a file being written.</summary>
+    public ulong Received { get; set; }
+
     /// <summary>
     /// One octet read ahead of the block just served, held back so the next
     /// block can start with it.
@@ -204,6 +207,73 @@ public sealed partial class OutstationSession
         }
     }
 
+    /// <summary>
+    /// Validates credentials and issues a key bound to the requesting link
+    /// source, connection and the file timeout.
+    /// </summary>
+    private void OnAuthenticateFile(Association a, Received r, Fragment frag)
+    {
+        if (!FileEnabled || _cfg.Files.Authenticate is not { } authenticate)
+        {
+            UnsupportedFile(a, r, frag.Header);
+            return;
+        }
+
+        FileAuth auth;
+        try
+        {
+            if (!TryFileObject(frag, out var h) || frag.Objects.Count != 1 || h.Variation != 2 || h.Count != 1)
+            {
+                a.Iin = a.Iin.Set(Iin.ParameterError);
+                Respond(a, r, frag.Header, []);
+                return;
+            }
+
+            auth = FileObjects.ParseAuth(FreeFormat.FirstObject(h).Span);
+        }
+        catch (MalformedException)
+        {
+            a.Iin = a.Iin.Set(Iin.ParameterError);
+            Respond(a, r, frag.Header, []);
+            return;
+        }
+
+        if (auth.Key != 0)
+        {
+            a.Iin = a.Iin.Set(Iin.ParameterError);
+            Respond(a, r, frag.Header, []);
+            return;
+        }
+
+        a.FileAuthKey = 0;
+        if (authenticate(auth.User, auth.Password))
+        {
+            while (a.FileAuthKey == 0)
+            {
+                a.FileAuthKey = (uint)System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue);
+            }
+
+            a.FileAuthSource = r.Source;
+            a.FileAuthUntil = _appl.Now() + _cfg.Files.Timeout;
+        }
+
+        // A failed authentication returns key zero. Credentials never appear in
+        // the response or the session log.
+        var value = new List<byte>();
+        FileObjects.AppendAuth(value, new FileAuth { Key = a.FileAuthKey });
+        RespondFile(a, r, frag.Header, 2, value);
+    }
+
+    private bool FileAuthorized(Association a, ushort source, uint key)
+    {
+        if (_cfg.Files.Authenticate is null)
+        {
+            return key == 0;
+        }
+
+        return key != 0 && key == a.FileAuthKey && source == a.FileAuthSource && _appl.Now() < a.FileAuthUntil;
+    }
+
     /// <summary>Opens a file and hands back a handle.</summary>
     private void OnOpenFile(Association a, Received r, Fragment frag)
     {
@@ -222,6 +292,11 @@ public sealed partial class OutstationSession
         }
 
         var reply = new FileCommandStatus { RequestId = cmd.RequestId };
+        if (!FileAuthorized(a, r.Source, cmd.Key))
+        {
+            RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.PermissionDenied });
+            return;
+        }
 
         if (_file is not null)
         {
@@ -434,6 +509,23 @@ public sealed partial class OutstationSession
         }
 
         var name = _file.Name;
+
+        // Closing a write is the commit point, so it must not report success
+        // for a file that did not arrive whole: fewer octets than the master
+        // declared, or no block carrying the last-block flag, means it was cut
+        // short. The handle is released either way.
+        var incomplete = _file.Mode is FileOpenMode.Write or FileOpenMode.Append &&
+                         (!_file.Done || _file.Received != _file.Size);
+        if (incomplete)
+        {
+            a.Log.Log(
+                Dnp3LogLevel.Warn,
+                "file closed before the write was complete",
+                ("name", name), ("declared", _file.Size), ("received", _file.Received),
+                ("last_block_seen", _file.Done));
+        }
+
+        var closeFailed = false;
         try
         {
             CloseFile();
@@ -444,7 +536,11 @@ public sealed partial class OutstationSession
                 Dnp3LogLevel.Warn,
                 "closing a transferred file failed",
                 ("name", name), ("err", ex.Message));
+            closeFailed = true;
+        }
 
+        if (closeFailed || incomplete)
+        {
             // The master needs to know: a write whose close failed has not
             // landed, whatever the individual blocks reported.
             RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.Fatal });
@@ -473,6 +569,11 @@ public sealed partial class OutstationSession
         }
 
         var reply = new FileCommandStatus { RequestId = cmd.RequestId };
+        if (!FileAuthorized(a, r.Source, cmd.Key))
+        {
+            RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.PermissionDenied });
+            return;
+        }
 
         if (_file is not null && _file.Name == cmd.Name)
         {
@@ -832,6 +933,7 @@ public sealed partial class OutstationSession
             {
                 t.Writer!.Write(block.Data.Span);
                 t.Block++;
+                t.Received += (ulong)block.Data.Length;
                 t.Done = block.Last;
                 status = FileStatus.Success;
 

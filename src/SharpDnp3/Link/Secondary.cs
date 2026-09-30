@@ -84,6 +84,20 @@ internal sealed class Secondary
     };
 
     /// <summary>
+    /// Reports whether a primary frame's user data agrees with its function:
+    /// the two user-data functions must carry some, and every other function
+    /// carries none. A frame that disagrees is malformed, and answering it
+    /// would acknowledge data — or its absence — the peer did not mean to send.
+    /// </summary>
+    private static bool ValidLength(Control c, ReadOnlyMemory<byte> payload) => c.Func switch
+    {
+        LinkFunction.ConfirmedUserData or LinkFunction.UnconfirmedUserData => payload.Length > 0,
+        LinkFunction.ResetLinkStates or LinkFunction.TestLinkStates or LinkFunction.RequestLinkStatus =>
+            payload.Length == 0,
+        _ => true,
+    };
+
+    /// <summary>
     /// Returns the secondary to its unreset state. A session calls this when
     /// the underlying connection is re-established, because link state does not
     /// survive a socket.
@@ -117,7 +131,7 @@ internal sealed class Secondary
         // outright, without a reply: answering it would confirm a frame we are
         // refusing to act on, and the peer's own timeout is what should tell it
         // something is wrong.
-        if (!ValidControl(f.Header.Control))
+        if (!ValidControl(f.Header.Control) || !ValidLength(f.Header.Control, f.Payload))
         {
             return new SecResult { Discarded = true };
         }

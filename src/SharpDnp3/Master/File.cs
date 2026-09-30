@@ -31,6 +31,15 @@ internal sealed class FileTransferState
     /// <summary>Ties each response to the request that caused it.</summary>
     public required ushort RequestId { get; init; }
 
+    /// <summary>The file authentication key to present, or zero.</summary>
+    public uint Key { get; set; }
+
+    /// <summary>
+    /// Marks a transfer that sends a file, which is abandoned with an abort
+    /// rather than a close: closing is what commits a write.
+    /// </summary>
+    public bool Write { get; init; }
+
     /// <summary>
     /// The handle the open issued. Zero means nothing was opened, so nothing
     /// needs closing.
@@ -179,6 +188,7 @@ public sealed partial class MasterSession
                 FileObjects.AppendCommand(obj, new FileCommand
                 {
                     Name = t.Name,
+                    Key = t.Key,
                     Mode = mode,
                     Size = t.Size,
                     MaxBlockSize = blockSize,
@@ -426,6 +436,27 @@ public sealed partial class MasterSession
         OnDone = _ => t.Closed = true,
     };
 
+    /// <summary>Abandons a transfer without committing it.</summary>
+    private static MasterTask FileAbortTask(FileTransferState t) => new()
+    {
+        Name = "file-abort",
+        FuncCode = FuncCode.AbortFile,
+        Priority = TaskPriority.Command,
+        Build = b =>
+        {
+            var obj = new List<byte>(FileObjects.FileCommandStatusSize);
+            FileObjects.AppendCommandStatus(obj, new FileCommandStatus
+            {
+                Handle = t.Handle,
+                RequestId = t.RequestId,
+            });
+
+            b.TryAddObject(FreeFormat.Build(70, 4, System.Runtime.InteropServices
+                .CollectionsMarshal.AsSpan(obj)));
+        },
+        OnDone = _ => t.Closed = true,
+    };
+
     /// <summary>Removes a file.</summary>
     private static MasterTask FileDeleteTask(FileTransferState t) => new()
     {
@@ -438,6 +469,7 @@ public sealed partial class MasterSession
             FileObjects.AppendCommand(obj, new FileCommand
             {
                 Name = t.Name,
+                Key = t.Key,
                 Mode = FileOpenMode.Null,
                 RequestId = t.RequestId,
             });

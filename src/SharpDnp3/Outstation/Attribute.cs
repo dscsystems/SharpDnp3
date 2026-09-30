@@ -126,11 +126,14 @@ public sealed partial class OutstationSession
         if (variation == AttributeNumbers.All)
         {
             var all = new List<DeviceAttribute>();
-            foreach (var (key, a) in _attributes)
+            lock (_attributes)
             {
-                if (key.Set == set)
+                foreach (var (key, a) in _attributes)
                 {
-                    all.Add(a);
+                    if (key.Set == set)
+                    {
+                        all.Add(a);
+                    }
                 }
             }
 
@@ -138,9 +141,12 @@ public sealed partial class OutstationSession
             return all;
         }
 
-        return _attributes.TryGetValue(new AttributeKey(set, variation), out var one)
-            ? [one]
-            : [];
+        lock (_attributes)
+        {
+            return _attributes.TryGetValue(new AttributeKey(set, variation), out var one)
+                ? [one]
+                : [];
+        }
     }
 
     /// <summary>Answers a read of group 0.</summary>
@@ -162,8 +168,8 @@ public sealed partial class OutstationSession
         if (h.Variation == AttributeNumbers.List)
         {
             // Which attributes exist, rather than what they say: one list of
-            // the set's variations, none of them writable because nothing here
-            // accepts a write. A set with nothing in it has no list to give.
+            // the set's variations with their configured writable properties. A
+            // set with nothing in it has no list to give.
             var all = AttributesFor(set, AttributeNumbers.All);
             attrs = [];
             if (all.Count > 0)
@@ -171,7 +177,7 @@ public sealed partial class OutstationSession
                 var items = new List<AttributeListItem>(all.Count);
                 foreach (var one in all)
                 {
-                    items.Add(new AttributeListItem(one.Variation, Writable: false));
+                    items.Add(new AttributeListItem(one.Variation, Writable: AttributeWritable(one.Set, one.Variation)));
                 }
 
                 attrs = [AttributeObjects.ListAttribute(items) with { Set = set }];

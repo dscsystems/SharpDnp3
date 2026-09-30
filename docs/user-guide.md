@@ -581,7 +581,9 @@ anyone who can reach the port issue them. IEC 62351-3 requires both ends to
 present certificates, and these channels refuse to build a configuration that
 does not. `MinVersion` defaults to TLS 1.2, the floor IEC 62351 sets.
 
-Secure Authentication v5 is out of scope for this library. Use TLS.
+TLS is a transport feature. The library also has an independent symmetric
+Secure Authentication subset — see [Extended services](#extended-services) —
+which does not replace it.
 
 ---
 
@@ -941,6 +943,102 @@ Implement `IFileHandler` for anything else. Every method reports a `FileStatus`
 rather than throwing, because the status is what goes on the wire: a master
 distinguishes a missing file from a denied one, and flattening both into
 "failed" leaves it unable to tell whether retrying could ever work.
+
+---
+
+## Extended services
+
+Everything here is opt-in: a device that configures none of it answers exactly as
+it did before.
+
+### Frozen analogs, freezes and command events
+
+`DatabaseConfig.FrozenAnalog` sizes independent frozen-analog storage (g31
+static, g33 events), updated with `Database.UpdateFrozenAnalog` or by freezing
+running analogs. `IMMED_FREEZE` and `FREEZE_CLEAR` (which freezes and then zeroes
+the running values) apply to counters and analogs; `FREEZE_AT_TIME` schedules a
+one-shot or repeating freeze. A time already past with no interval is refused
+with `PARAMETER_ERROR`; asking for the same freeze twice answers
+`ALREADY_EXECUTING`.
+
+```csharp
+await master.FreezeCountersAsync(FreezeMode.FreezeAndClear);
+await master.FreezeAtTimeAsync(DateTimeOffset.UtcNow.AddSeconds(30), TimeSpan.FromMinutes(15));
+await master.SyncTimeRecordedAsync();   // RECORD_CURRENT_TIME then g50v3
+```
+
+`PointConfig.CommandEventClass` makes an output record each operated control as a
+g13/g43 event in that class (`CommandEventVariation` picks the encoding; zero
+mirrors the command). A handler receives them by implementing
+`ICommandEventHandler`; `IFrozenAnalogHandler` separates frozen from running
+analogs, and `IDatasetHandler` receives whole dataset objects.
+
+`OutstationSession.SetIndication` (and `OutstationConfig.Indications`) asserts the
+device-controlled indications — `LocalControl`, `DeviceTrouble`,
+`ConfigCorrupt`. A restart requested while one is under way answers
+`ALREADY_EXECUTING`.
+
+### Reading events by type
+
+A READ of an event group (g2, g4, g11, g13, g22, g23, g32, g33, g42, g43, g88,
+g111, g113, g122) returns the buffered events of that kind in the variation named,
+whatever class they are in. A count limits how many; the rest stay queued. A
+class read takes a count the same way. Relative-time events (g2v3, g4v3) are sent
+with a group 51 CTO in every fragment that needs one — variation 1 when the clock
+is synchronised, 2 when it is not — and the master gives the events the same
+quality.
+
+### Time intervals, terminals, datasets and management
+
+| You set | The outstation does |
+| --- | --- |
+| `DatabaseConfig.TimeAndInterval` | Stores indexed g50v4 values, readable and writable by a master; `READ g50v1` reports the clock and `READ g80v1` the internal indications as data |
+| `DatabaseConfig.VirtualTerminal`, `TerminalWrite` | Hands master output (g112) to you; `UpdateVirtualTerminal` queues input as g113 events |
+| `OutstationConfig.Datasets`, `DatasetWrite` | Stores encoded prototype/descriptor/present-value objects, serves reads and class events, and passes writes to you to validate |
+| `Management` | Receives `INITIALIZE_DATA`, `INITIALIZE_APPL`, `START_APPL`, `STOP_APPL`, `SAVE_CONFIG` with the raw object section |
+| `ActivateConfig` | Receives file names from g70v8 and answers with a g91v1 delay and status list |
+| `WritableAttributes`, `AttributeWrite` | Accepts same-type writes to the listed attributes; variation 255 reports them writable |
+
+An absent handler answers `NO_FUNC_CODE_SUPPORT`. Datasets are deliberately
+thin: prototype-dependent values are the application's to resolve.
+
+### File authentication
+
+Set `FileConfig.Authenticate` on the outstation and `MasterConfig.FileCredentials`
+on the master. The master runs `AUTHENTICATE_FILE` before each open and delete;
+the outstation returns a random key bound to the requesting link source,
+connection and the file timeout, and refuses opens and deletes without it. **The
+password crosses the wire unencrypted**; use it only over a channel that provides
+confidentiality. Closing a write that did not arrive whole is reported `FATAL`,
+and a master abandons a failed write with `ABORT_FILE` rather than committing it.
+
+### Secure Authentication (symmetric subset)
+
+```csharp
+// Outstation
+var sa = new SharpDnp3.Outstation.SecureAuthenticationConfig();
+sa.Users[1] = updateKey;                  // 16 or 32 octets, provisioned locally
+config.SecureAuthentication = sa;
+
+// Master
+masterConfig.SecureAuthentication = new SharpDnp3.Master.SecureAuthenticationConfig
+{
+    User = 1, UpdateKey = updateKey,
+};
+```
+
+Implemented: locally provisioned AES update keys, RFC 3394 session-key wrapping,
+SHA-256 HMAC with 16-octet MACs, challenge/reply for every request that changes
+state (writes, controls, freezes, class assignment, restarts, file operations,
+management and enable/disable unsolicited — only reads, confirms and the delay
+measurement stay open), source binding, reply and key timeouts, a per-key message
+budget, function authorisation (`Authorize`), and the security statistics (g121)
+and threshold events (g122). A g120 object under an ordinary function code is
+challenged like any critical request.
+
+Not implemented: aggressive mode, authenticated unsolicited traffic, remote user
+and update-key management, other MAC algorithms. This is **not** a certified SAv5
+profile and TLS does not stand in for it, or it for TLS.
 
 ---
 
@@ -1371,12 +1469,16 @@ started. Move it into `Session.Update`.
 - A `TcpServerChannel` outstation serves **one master at a time** unless you set
   `MaxMasters`. If two SCADA systems poll the device, set it, and size the event
   buffer knowing each master holds its own.
-- Self-address (0xFFFC) is not supported. Broadcast is received and executed but
-  never answered, as the standard requires. After a broadcast to 0xFFFE the next
-  response asks for confirmation, and the BROADCAST indication stays set until a
-  response that asked is confirmed.
+- Self-address (0xFFFC) is opt-in (`OutstationConfig.SelfAddress`): a master
+  that does not know the outstation's link address sends to it and adopts the
+  address the reply comes from. Leave it off unless you need discovery.
+  Broadcast is received and executed but never answered, as the standard
+  requires. After a broadcast to 0xFFFE the next response asks for
+  confirmation, and the BROADCAST indication stays set until a response that
+  asked is confirmed.
 - Use TLS with mutual authentication for anything that leaves a locked cabinet.
-  Secure Authentication v5 is out of scope.
+  The Secure Authentication subset is not a certified SAv5 profile and does not
+  replace it.
 - File transfer hands a master a path into the device's filesystem over a
   protocol with no authentication of its own. It is off until you set a handler;
   leave it off unless you need it, prefer `ReadOnly`, and serve the narrowest

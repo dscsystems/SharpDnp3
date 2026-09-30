@@ -102,6 +102,38 @@ public interface IMasterHandler
 }
 
 /// <summary>
+/// Implemented by an <see cref="IMasterHandler"/> that also wants command
+/// events: the group 13 and 43 objects an outstation reports when a control
+/// was operated. It is a separate interface so that adding it did not break
+/// existing handlers; a handler that does not implement it never sees them.
+/// </summary>
+public interface ICommandEventHandler
+{
+    /// <summary>Receives command events.</summary>
+    void HandleCommandEvent(HeaderInfo info, IReadOnlyList<Indexed<CommandEvent>> values);
+}
+
+/// <summary>
+/// Receives complete dataset objects, including their encoded identifier. The
+/// application interprets values using the associated prototype.
+/// </summary>
+public interface IDatasetHandler
+{
+    /// <summary>Receives one dataset object.</summary>
+    void HandleDataset(HeaderInfo info, byte[] data);
+}
+
+/// <summary>
+/// Distinguishes frozen analog inputs from running analogs. Handlers without
+/// this interface receive both through <see cref="IMasterHandler.HandleAnalog"/>.
+/// </summary>
+public interface IFrozenAnalogHandler
+{
+    /// <summary>Receives frozen analog inputs and their events.</summary>
+    void HandleFrozenAnalog(HeaderInfo info, IReadOnlyList<Indexed<Analog>> values);
+}
+
+/// <summary>
 /// Discards everything. Derive from it to implement only the methods you care
 /// about.
 /// </summary>
@@ -176,6 +208,12 @@ public readonly record struct Update
     /// <summary>Set when <see cref="Type"/> is <see cref="PointType.Analog"/>.</summary>
     public Analog Analog { get; init; }
 
+    /// <summary>Set when <see cref="Type"/> is <see cref="PointType.FrozenAnalog"/>.</summary>
+    public Analog FrozenAnalog { get; init; }
+
+    /// <summary>Set for the two command event types.</summary>
+    public CommandEvent CommandEvent { get; init; }
+
     /// <summary>Set when <see cref="Type"/> is <see cref="PointType.BinaryOutputStatus"/>.</summary>
     public BinaryOutputStatus BinaryOutput { get; init; }
 
@@ -194,10 +232,10 @@ public readonly record struct Update
 /// when the consumer falls behind, and the drop is counted — a stalled UI must
 /// not stall the protocol.
 /// </remarks>
-public sealed class ChannelHandler : NopHandler
+public sealed class ChannelHandler : NopHandler, ICommandEventHandler, IFrozenAnalogHandler
 {
     private readonly Channel<Update> _channel;
-    private ulong _dropped;
+    private long _dropped;
     private ResponseInfo _info;
 
     /// <summary>
@@ -224,7 +262,7 @@ public sealed class ChannelHandler : NopHandler
     /// <summary>
     /// How many updates were discarded because the consumer was not keeping up.
     /// </summary>
-    public ulong Dropped => _dropped;
+    public ulong Dropped => (ulong)Interlocked.Read(ref _dropped);
 
     /// <inheritdoc/>
     public override void BeginFragment(ResponseInfo info) => _info = info;
@@ -233,7 +271,7 @@ public sealed class ChannelHandler : NopHandler
     {
         if (!_channel.Writer.TryWrite(u with { Fragment = _info }))
         {
-            _dropped++;
+            Interlocked.Increment(ref _dropped);
         }
     }
 
@@ -320,6 +358,38 @@ public sealed class ChannelHandler : NopHandler
     }
 
     /// <inheritdoc/>
+    public void HandleFrozenAnalog(HeaderInfo info, IReadOnlyList<Indexed<Analog>> values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        foreach (var v in values)
+        {
+            Send(new Update
+            {
+                Info = info,
+                Type = PointType.FrozenAnalog,
+                Index = v.Index,
+                FrozenAnalog = v.Value,
+            });
+        }
+    }
+
+    /// <inheritdoc/>
+    public void HandleCommandEvent(HeaderInfo info, IReadOnlyList<Indexed<CommandEvent>> values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        foreach (var v in values)
+        {
+            Send(new Update
+            {
+                Info = info,
+                Type = v.Value.Analog ? PointType.AnalogCommandEvent : PointType.BinaryCommandEvent,
+                Index = v.Index,
+                CommandEvent = v.Value,
+            });
+        }
+    }
+
+    /// <inheritdoc/>
     public override void HandleBinaryOutputStatus(
         HeaderInfo info, IReadOnlyList<Indexed<BinaryOutputStatus>> values)
     {
@@ -362,7 +432,7 @@ public sealed class ChannelHandler : NopHandler
             Send(new Update
             {
                 Info = info,
-                Type = PointType.OctetString,
+                Type = info.GV.Group is 112 or 113 ? PointType.VirtualTerminal : PointType.OctetString,
                 Index = v.Index,
                 OctetString = v.Value,
             });

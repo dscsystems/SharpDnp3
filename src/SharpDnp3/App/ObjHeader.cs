@@ -193,6 +193,15 @@ internal static class ObjectHeaderCodec
             return WalkAttributes(range.Count, buf, out length);
         }
 
+        // An activation result (group 91 variation 1) is a status, a delay and a
+        // list of length-prefixed names, so it walks itself.
+        if (group == 91 && variation == 1)
+        {
+            return prefix != IndexPrefix.None
+                ? AppParseStatus.BadQualifier
+                : WalkActivationResults(range.Count, buf, out length);
+        }
+
         if (!sizer.TrySizeBits(group, variation, out var bits))
         {
             return AppParseStatus.UnknownObject;
@@ -225,6 +234,42 @@ internal static class ObjectHeaderCodec
 
         var total = (ulong)range.Count * ((ulong)prefixOctets + ((ulong)bits / 8));
         return CheckFits(total, buf, out length);
+    }
+
+    /// <summary>
+    /// Advances over <paramref name="count"/> activation results: a four-octet
+    /// delay and a one-octet count of statuses, each a non-empty
+    /// length-prefixed record.
+    /// </summary>
+    private static AppParseStatus WalkActivationResults(
+        uint count,
+        ReadOnlySpan<byte> buf,
+        out int length)
+    {
+        length = 0;
+        var off = 0;
+        for (uint i = 0; i < count; i++)
+        {
+            if (buf.Length - off < 5)
+            {
+                return AppParseStatus.Truncated;
+            }
+
+            int names = buf[off + 4];
+            off += 5;
+            for (var k = 0; k < names; k++)
+            {
+                if (off >= buf.Length || buf[off] == 0 || buf[off] + 1 > buf.Length - off)
+                {
+                    return AppParseStatus.Truncated;
+                }
+
+                off += 1 + buf[off];
+            }
+        }
+
+        length = off;
+        return AppParseStatus.Ok;
     }
 
     /// <summary>

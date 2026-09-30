@@ -37,6 +37,9 @@ internal sealed class ResponseBuilder
     /// </summary>
     public int Room => _max - AppConstants.ResponseHeaderSize - _cur.Count;
 
+    /// <summary>The fragment size cap, response header included.</summary>
+    public int Max => _max;
+
     /// <summary>Ends the current fragment.</summary>
     public void Flush()
     {
@@ -91,6 +94,7 @@ internal sealed class ResponseWriter
         PointType.Counter,
         PointType.FrozenCounter,
         PointType.Analog,
+        PointType.FrozenAnalog,
         PointType.AnalogOutputStatus,
         PointType.OctetString,
     ];
@@ -313,6 +317,15 @@ internal sealed class ResponseWriter
 
                 break;
 
+            case PointType.FrozenAnalog:
+                _db.TryGetFrozenAnalog(index, out var fav, out _);
+                if (ObjectRegistry.TryAnalogCodec(gv, out var fac))
+                {
+                    fac.Write(dst, fav, ctx);
+                }
+
+                break;
+
             case PointType.BinaryOutputStatus:
                 _db.TryGetBinaryOutputStatus(index, out var bov, out _);
                 if (ObjectRegistry.TryBinaryOutputCodec(gv, out var boc))
@@ -344,6 +357,7 @@ internal sealed class ResponseWriter
         PointType.Counter => _db.TryGetCounter(index, out _, out config),
         PointType.FrozenCounter => _db.TryGetFrozenCounter(index, out _, out config),
         PointType.Analog => _db.TryGetAnalog(index, out _, out config),
+        PointType.FrozenAnalog => _db.TryGetFrozenAnalog(index, out _, out config),
         PointType.BinaryOutputStatus => _db.TryGetBinaryOutputStatus(index, out _, out config),
         PointType.AnalogOutputStatus => _db.TryGetAnalogOutputStatus(index, out _, out config),
         PointType.OctetString => _db.TryGetOctetString(index, out _, out config),
@@ -363,6 +377,8 @@ internal sealed class ResponseWriter
         PointType.Counter => c.Counter,
         PointType.FrozenCounter => c.FrozenCounter,
         PointType.Analog => c.Analog,
+        PointType.FrozenAnalog => c.FrozenAnalog,
+        PointType.VirtualTerminal => c.VirtualTerminal,
         PointType.BinaryOutputStatus => c.BinaryOutputStatus,
         PointType.AnalogOutputStatus => c.AnalogOutputStatus,
         PointType.OctetString => c.OctetString,
@@ -373,7 +389,7 @@ internal sealed class ResponseWriter
     /// Builds a header addressing an inclusive index range, choosing the
     /// narrowest range encoding that fits.
     /// </summary>
-    private static ObjectHeader RangeObjectHeader(
+    internal static ObjectHeader RangeObjectHeader(
         GroupVar gv, ushort start, ushort stop, byte[] data)
     {
         var spec = stop <= 0xFF ? RangeSpec.StartStop8 : RangeSpec.StartStop16;
@@ -497,11 +513,41 @@ internal sealed class ResponseWriter
         PointType.BinaryOutputStatus => 11,
         PointType.Counter => 22,
         PointType.FrozenCounter => 23,
+        PointType.FrozenAnalog => 33,
+        PointType.Dataset => 88,
+        PointType.SecurityStatistic => 122,
+        PointType.VirtualTerminal => 113,
         PointType.Analog => 32,
         PointType.AnalogOutputStatus => 42,
         PointType.OctetString => 111,
+        PointType.BinaryCommandEvent => 13,
+        PointType.AnalogCommandEvent => 43,
         _ => 0,
     };
+
+    /// <summary>Maps an event group to the kind of event it reports, and says whether it is one.</summary>
+    internal static bool TryEventTypeForGroup(byte group, out PointType pt)
+    {
+        pt = group switch
+        {
+            2 => PointType.Binary,
+            4 => PointType.DoubleBitBinary,
+            11 => PointType.BinaryOutputStatus,
+            13 => PointType.BinaryCommandEvent,
+            22 => PointType.Counter,
+            23 => PointType.FrozenCounter,
+            33 => PointType.FrozenAnalog,
+            88 => PointType.Dataset,
+            122 => PointType.SecurityStatistic,
+            113 => PointType.VirtualTerminal,
+            32 => PointType.Analog,
+            42 => PointType.AnalogOutputStatus,
+            43 => PointType.AnalogCommandEvent,
+            111 => PointType.OctetString,
+            _ => PointType.Unknown,
+        };
+        return pt != PointType.Unknown;
+    }
 
     /// <summary>Appends event objects for the selected events.</summary>
     /// <remarks>
@@ -510,21 +556,53 @@ internal sealed class ResponseWriter
     /// variation so a burst of analog changes becomes one header rather than
     /// fifty.
     /// </remarks>
-    public void BuildEvents(ResponseBuilder b, IReadOnlyList<Event> events)
+    public void BuildEvents(
+        ResponseBuilder b,
+        IReadOnlyList<Event> events,
+        Func<DateTimeOffset>? now = null,
+        Action<Event>? release = null)
     {
-
-
         for (var i = 0; i < events.Count;)
         {
+            if (events[i].Type == PointType.Dataset)
+            {
+                var obj = events[i].Dataset ?? [];
+                var h = FreeFormat.Build(88, 1, obj);
+                if (h.Size + AppConstants.ResponseHeaderSize <= b.Max)
+                {
+                    b.Add(h);
+                }
+                else
+                {
+                    release?.Invoke(events[i]);
+                }
+
+                i++;
+                continue;
+            }
+
             var gv = GroupVar.GV(EventGroup(events[i].Type), events[i].Variation);
 
             // An octet string's size is its variation, not a table lookup:
             // group 111 has no descriptor row for a length to find. Consulting
             // the registry first would silently drop every string event.
             int size;
-            if (events[i].Type == PointType.OctetString)
+            var relative = false;
+            if (events[i].Type is PointType.OctetString or PointType.VirtualTerminal)
             {
                 size = gv.Variation;
+            }
+            else if (events[i].Type == PointType.SecurityStatistic)
+            {
+                size = gv.Variation == 2 ? 13 : 7;
+            }
+            else if (events[i].Type is PointType.BinaryCommandEvent or PointType.AnalogCommandEvent)
+            {
+                if (!CommandEventCodec.TrySize(gv.Group, gv.Variation, out size))
+                {
+                    i++;
+                    continue;
+                }
             }
             else
             {
@@ -539,6 +617,8 @@ internal sealed class ResponseWriter
                     i++;
                     continue;
                 }
+
+                relative = d.RelativeTime;
             }
 
             if (size == 0)
@@ -550,6 +630,7 @@ internal sealed class ResponseWriter
             // Collect the run of consecutive events sharing this encoding.
             var j = i;
             while (j < events.Count &&
+                   events[j].Type != PointType.Dataset &&
                    EventGroup(events[j].Type) == gv.Group &&
                    events[j].Variation == gv.Variation)
             {
@@ -581,13 +662,22 @@ internal sealed class ResponseWriter
             var perObject = prefixLen + size;
             var headerOverhead = ObjectHeader.ObjectHeaderSize + spec.Octets();
 
+            // A relative-time event is an offset from a common time of
+            // occurrence, and the offset means nothing without the group 51
+            // object it is measured from — in the same fragment, since a master
+            // resolves each fragment on its own. So the base travels with every
+            // header of relative events, and the room for it is reserved with
+            // the header's so the two can never be split across a fragment
+            // boundary.
+            var ctoSize = relative ? CtoHeader(b.Ctx, default).Size : 0;
+
             while (i < j)
             {
-                var avail = b.Room - headerOverhead;
+                var avail = b.Room - ctoSize - headerOverhead;
                 if (avail < perObject)
                 {
                     b.Flush();
-                    avail = b.Room - headerOverhead;
+                    avail = b.Room - ctoSize - headerOverhead;
                     if (avail < perObject)
                     {
                         return;
@@ -595,6 +685,19 @@ internal sealed class ResponseWriter
                 }
 
                 var runLen = Math.Min(Math.Min(avail / perObject, j - i), maxCount);
+                var ctx = b.Ctx;
+                if (relative)
+                {
+                    // The base is the first event's time, so its own offset is
+                    // zero, and the run stops at the first event too far past it
+                    // for sixteen bits of milliseconds (or before it, which an
+                    // unsigned offset cannot say). That event starts a new base.
+                    var baseTime = EventBase(events[i], now);
+                    runLen = Math.Min(runLen, EventsWithinWindow(events, i, runLen, baseTime));
+                    ctx = ctx.WithCto(baseTime);
+                    b.Add(CtoHeader(b.Ctx, baseTime));
+                }
+
                 var data = new List<byte>(runLen * perObject);
                 for (var k = 0; k < runLen; k++)
                 {
@@ -609,7 +712,7 @@ internal sealed class ResponseWriter
                         data.Add((byte)(e.Index >> 8));
                     }
 
-                    EncodeEvent(data, gv, e, b.Ctx);
+                    EncodeEvent(data, gv, e, ctx);
                 }
 
                 b.Add(new ObjectHeader
@@ -624,6 +727,65 @@ internal sealed class ResponseWriter
                 i += runLen;
             }
         }
+    }
+
+    /// <summary>
+    /// Builds the group 51 object that carries a common time of occurrence:
+    /// variation 1 when the outstation's clock is synchronised and 2 when it is
+    /// not, which is how a master learns how far to trust the relative times
+    /// that follow.
+    /// </summary>
+    private static ObjectHeader CtoHeader(Context ctx, DateTimeOffset baseTime)
+    {
+        var data = new List<byte>(CommandObjects.Time48Size);
+        CommandObjects.AppendTime48(data, Timestamp.Now(baseTime));
+        return new ObjectHeader
+        {
+            Group = 51,
+            Variation = (byte)(ctx.Synchronized ? 1 : 2),
+            Qualifier = Qualifier.Make(IndexPrefix.None, RangeSpec.Count8),
+            Range = new ObjectRange { Spec = RangeSpec.Count8, Count = 1 },
+            Data = data.ToArray(),
+        };
+    }
+
+    /// <summary>
+    /// Picks the common time of occurrence for a run of relative-time events
+    /// starting at <paramref name="e"/>: the event's own time, to the
+    /// millisecond the encoding can carry. An event that carries no time has
+    /// nothing to anchor to, so the current time is used rather than the epoch.
+    /// </summary>
+    private static DateTimeOffset EventBase(Event e, Func<DateTimeOffset>? now)
+    {
+        var t = e.Time.IsValid ? e.Time.Time : (now?.Invoke() ?? DateTimeOffset.UtcNow);
+        return new DateTimeOffset(t.UtcTicks / TimeSpan.TicksPerMillisecond * TimeSpan.TicksPerMillisecond, TimeSpan.Zero);
+    }
+
+    /// <summary>
+    /// Returns how many of the events from <paramref name="from"/>, at most
+    /// <paramref name="max"/>, can be expressed as a sixteen-bit millisecond
+    /// offset from <paramref name="baseTime"/>. An event with no time is
+    /// expressed as the base itself. It is always at least one: the run's first
+    /// event is its own base.
+    /// </summary>
+    private static int EventsWithinWindow(IReadOnlyList<Event> events, int from, int max, DateTimeOffset baseTime)
+    {
+        for (var n = 0; n < max; n++)
+        {
+            var e = events[from + n];
+            if (!e.Time.IsValid)
+            {
+                continue;
+            }
+
+            var d = (long)(e.Time.Time - baseTime).TotalMilliseconds;
+            if (d is < 0 or > 0xFFFF)
+            {
+                return Math.Max(n, 1);
+            }
+        }
+
+        return max;
     }
 
     /// <summary>Appends one event's object encoding.</summary>
@@ -671,6 +833,14 @@ internal sealed class ResponseWriter
 
                 break;
 
+            case PointType.FrozenAnalog:
+                if (ObjectRegistry.TryAnalogCodec(gv, out var fac))
+                {
+                    fac.Write(dst, e.FrozenAnalog, ctx);
+                }
+
+                break;
+
             case PointType.BinaryOutputStatus:
                 if (ObjectRegistry.TryBinaryOutputCodec(gv, out var boc))
                 {
@@ -687,8 +857,25 @@ internal sealed class ResponseWriter
 
                 break;
 
-            case PointType.OctetString:
+            case PointType.SecurityStatistic:
+                dst.Add(Flags.Online.Value);
+                dst.Add(0);
+                dst.Add(0);
+                ObjectConvert.AppendUInt32(dst, e.SecurityStatistic);
+                if (gv.Variation == 2)
+                {
+                    CommandObjects.AppendTime48(dst, e.Time);
+                }
+
+                break;
+
+            case PointType.OctetString or PointType.VirtualTerminal:
                 AppendOctetString(dst, e.OctetString, gv.Variation);
+                break;
+
+            case PointType.BinaryCommandEvent or PointType.AnalogCommandEvent:
+                CommandEventCodec.Append(dst, gv.Group, gv.Variation, new CommandEvent(
+                    e.CommandStatus, e.Type == PointType.AnalogCommandEvent, e.CommandState, e.CommandValue, e.Time));
                 break;
 
             default:

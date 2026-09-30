@@ -68,7 +68,9 @@ public sealed partial class MasterSession
             NoResponse = noAck,
         };
 
-        return RunTaskAsync(t, cancellationToken);
+        // A refusal by the outstation is an error, not a success that froze
+        // nothing.
+        return noAck ? RunTaskAsync(t, cancellationToken) : RunCheckedAsync("freeze", t, cancellationToken);
     }
 
     /// <summary>Assigns points of one static group to an event class (FC 22).</summary>

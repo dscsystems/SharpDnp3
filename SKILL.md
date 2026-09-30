@@ -382,6 +382,42 @@ and produces nonsense. `Reset()` when the connection comes back.
 Decoded values are formatted *text*, because every consumer of this namespace
 wants text. If you need typed measurements, run a `MasterSession`.
 
+### 2.7 Extended services
+
+All opt-in; a device that configures none of it behaves as before.
+
+```csharp
+// Freezes, LAN time sync, scheduled freeze (master)
+await master.FreezeCountersAsync(FreezeMode.FreezeAndClear);   // throws RejectedException if refused
+await master.FreezeAtTimeAsync(DateTimeOffset.UtcNow.AddSeconds(30), TimeSpan.FromMinutes(15));
+await master.SyncTimeRecordedAsync();
+
+// Outstation: frozen analogs, command events, terminals, datasets, indications
+config.Database.FrozenAnalog = 4;
+db.Configure(PointType.BinaryOutputStatus, 0, new PointConfig { CommandEventClass = Class.Class2 });
+outstation.SetIndication(Indication.DeviceTrouble, true);
+config.WritableAttributes.Add(new AttributeId(0, 247));         // master may write g0v247
+
+// File authentication
+config.Files.Authenticate = (user, password) => user == "admin" && password == secret;
+masterConfig.FileCredentials = new FileCredentials("admin", secret);  // password is sent in the clear
+
+// Symmetric Secure Authentication subset (not certified SAv5)
+var sa = new SharpDnp3.Outstation.SecureAuthenticationConfig();
+sa.Users[1] = updateKey;                                         // 16 or 32 octets
+config.SecureAuthentication = sa;
+masterConfig.SecureAuthentication = new SharpDnp3.Master.SecureAuthenticationConfig { User = 1, UpdateKey = updateKey };
+```
+
+- Every state-changing request is challenged under Secure Authentication; only
+  reads, confirms and delay measurement stay open. Both sides must opt in.
+- Handlers opt in to the new objects with `ICommandEventHandler`,
+  `IFrozenAnalogHandler` and `IDatasetHandler`; one that does not never sees them.
+- `SelfAddress = true` on an outstation accepts destination 0xFFFC, and a master
+  with `RemoteAddr = 0xFFFC` adopts the address the first reply comes from.
+- Not implemented: SA aggressive mode, remote key management, other MACs,
+  automatic dataset prototype expansion. See the user guide's *Extended services*.
+
 ---
 
 ## 3. Transports

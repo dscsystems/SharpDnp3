@@ -124,6 +124,12 @@ internal static partial class ObjectSizing
         [Gv(60, 3)] = 0, // Class2Data
         [Gv(60, 4)] = 0, // Class3Data
         [Gv(80, 1)] = 1, // InternalIndications
+        [Gv(86, 2)] = 8, // DatasetCharacteristics
+        [Gv(120, 3)] = 48, // AuthenticationAggressiveRequest
+        [Gv(120, 4)] = 16, // AuthenticationKeyStatusRequest
+        [Gv(121, 1)] = 56, // SecurityStatistic
+        [Gv(122, 1)] = 56, // SecurityStatisticEvent
+        [Gv(122, 2)] = 104, // SecurityStatisticEventTime
     };
 
     /// <summary>
@@ -144,5 +150,12 @@ internal static partial class ObjectSizing
     [
         0, // DeviceAttribute
         70, // FileTransfer
+        85, // DatasetPrototype
+        86, // DatasetDescriptor
+        87, // DatasetPresentValue
+        88, // DatasetSnapshot
+        90, // ApplicationIdentifier
+        91, // ActivationResult
+        120, // AuthenticationChallenge
     ];
 }

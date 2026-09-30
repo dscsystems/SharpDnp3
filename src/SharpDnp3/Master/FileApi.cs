@@ -146,6 +146,7 @@ public sealed partial class MasterSession
             RequestId = NextRequestId(),
             Source = source,
             Size = size,
+            Write = true,
         };
 
         // Each block is read from the source as its task is built, so a large
@@ -232,7 +233,13 @@ public sealed partial class MasterSession
         ArgumentException.ThrowIfNullOrEmpty(name);
 
         var t = new FileTransferState { Name = name, RequestId = NextRequestId() };
-        await RunTaskAsync(FileDeleteTask(t), cancellationToken).ConfigureAwait(false);
+        var first = FileDeleteTask(t);
+        if (_cfg.FileCredentials is { } credentials)
+        {
+            first = FileAuthTask(t, credentials, first);
+        }
+
+        await RunTaskAsync(first, cancellationToken).ConfigureAwait(false);
 
         if (t.Error is not null)
         {
@@ -271,6 +278,11 @@ public sealed partial class MasterSession
         CancellationToken cancellationToken)
     {
         Exception? failure = null;
+        if (_cfg.FileCredentials is { } credentials)
+        {
+            first = FileAuthTask(t, credentials, first);
+        }
+
         try
         {
             await RunTaskAsync(first, cancellationToken).ConfigureAwait(false);
@@ -296,7 +308,9 @@ public sealed partial class MasterSession
             using var closeCts = new CancellationTokenSource(_cfg.ResponseTimeout);
             try
             {
-                await RunTaskAsync(FileCloseTask(t), closeCts.Token).ConfigureAwait(false);
+                // Closing would commit whatever part of a written file arrived.
+                await RunTaskAsync(t.Write ? FileAbortTask(t) : FileCloseTask(t), closeCts.Token)
+                    .ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is Dnp3Exception or OperationCanceledException)
             {

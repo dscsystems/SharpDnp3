@@ -75,8 +75,14 @@ internal static class FragmentParser
 
         for (var off = n; off < buf.Length;)
         {
+            // FREEZE_AT_TIME is mixed: its leading group 50 object carries the
+            // time and the interval, and the counter headers after it only name
+            // what to freeze. So it is decided per object, not per fragment.
+            var objectCarriesData = header.Func is FuncCode.FreezeAtTime or FuncCode.FreezeAtTimeNR
+                ? buf.Span[off] == 50
+                : carriesData;
             var objStatus = ObjectHeaderCodec.ParseObjectHeader(
-                sizer, buf[off..], off, carriesData, out var oh, out var used);
+                sizer, buf[off..], off, objectCarriesData, out var oh, out var used);
 
             if (objStatus != AppParseStatus.Ok)
             {

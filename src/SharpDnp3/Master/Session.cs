@@ -86,6 +86,19 @@ public sealed class MasterConfig
     /// </remarks>
     public TimeSpan KeepAlive { get; set; }
 
+    /// <summary>
+    /// Enables AUTHENTICATE_FILE before each file open or delete. DNP3 file
+    /// authentication sends the password on the wire; protect the channel when
+    /// credentials require confidentiality.
+    /// </summary>
+    public FileCredentials? FileCredentials { get; set; }
+
+    /// <summary>
+    /// Enables the symmetric Secure Authentication master exchange. The update
+    /// key must match the outstation's locally provisioned user key.
+    /// </summary>
+    public SecureAuthenticationConfig? SecureAuthentication { get; set; }
+
     /// <summary>Receives protocol and session events.</summary>
     public IDnp3Logger? Log { get; set; }
 
@@ -291,6 +304,12 @@ public sealed partial class MasterSession
         }
     }
 
+    /// <summary>
+    /// Set when the link layer gave up on a keep-alive probe with no
+    /// application request in flight, and ends the connection.
+    /// </summary>
+    private bool _peerSilent;
+
     private void SetConnected(bool v)
     {
         lock (_gate)
@@ -350,6 +369,7 @@ public sealed partial class MasterSession
             _log.Log(Dnp3LogLevel.Info, "connected", ("channel", channel.ToString()));
 
             _stack.Reset();
+            _security.Clear();
             SetConnected(true);
             _lastRx = _time.GetUtcNow();
             StartupSequence();
@@ -449,6 +469,7 @@ public sealed partial class MasterSession
 
         var readTask = ReadIntoAsync(conn, rx.Writer, ct);
 
+        _peerSilent = false;
         Task<bool>? rxWait = null;
         Task<bool>? submitWait = null;
 
@@ -518,6 +539,12 @@ public sealed partial class MasterSession
                 if (CheckLinkTimeout())
                 {
                     continue;
+                }
+
+                if (_peerSilent)
+                {
+                    _peerSilent = false;
+                    return;
                 }
 
                 CheckTimeout();
@@ -613,6 +640,14 @@ public sealed partial class MasterSession
         if (failed)
         {
             _log.Log(Dnp3LogLevel.Warn, "link layer gave up on a frame");
+            if (_inflight is null)
+            {
+                // A keep-alive probe went unanswered. Nothing is waiting on the
+                // link, so nothing else will notice the peer is gone: end the
+                // connection and let RunAsync reconnect.
+                _peerSilent = true;
+            }
+
             FailInflight(new Dnp3TimeoutException());
             return false;
         }
@@ -709,7 +744,20 @@ public sealed partial class MasterSession
     /// </remarks>
     private void SendTask(MasterTask t)
     {
-        _seq = (byte)((_seq + 1) % AppConstants.SeqModulus);
+        t.Failure = null;
+        if (_cfg.SecureAuthentication is not null && t.FuncCode != FuncCode.AuthRequest && !SecurityReady())
+        {
+            SendTask(NewSessionKeysTask(t));
+            return;
+        }
+
+        // Authentication exchanges do not consume the application's sequence
+        // space. A key refresh between SELECT and OPERATE must preserve the
+        // consecutive sequence numbers the control reservation requires.
+        if (t.FuncCode != FuncCode.AuthRequest)
+        {
+            _seq = (byte)((_seq + 1) % AppConstants.SeqModulus);
+        }
 
         byte[] fragment;
         try
@@ -722,6 +770,10 @@ public sealed partial class MasterSession
 
             t.Build?.Invoke(b);
             fragment = b.ToArray();
+            if (_cfg.SecureAuthentication is not null && t.FuncCode != FuncCode.AuthRequest)
+            {
+                _security.LastRequest = fragment;
+            }
         }
         catch (Dnp3Exception ex)
         {
@@ -754,7 +806,7 @@ public sealed partial class MasterSession
 
         _log.Log(Dnp3LogLevel.Debug, "task sent", ("task", t.Name), ("seq", _seq));
 
-        if (t.NoResponse)
+        if (t.NoResponse && _cfg.SecureAuthentication is null)
         {
             // Nothing will come back, so there is nothing to wait for.
             _inflight = null;
@@ -810,6 +862,13 @@ public sealed partial class MasterSession
             }
         }
 
+        if (error is not null && t.Origin is { } origin && origin.Period > TimeSpan.Zero)
+        {
+            // A failed key exchange must not lose the periodic task it was run
+            // for.
+            _sched.Push(origin.CloneForPeriod(_time.GetUtcNow() + origin.Period));
+        }
+
         if (t.Period > TimeSpan.Zero)
         {
             // A periodic task keeps its slot in the schedule whether or not
@@ -847,6 +906,23 @@ public sealed partial class MasterSession
         if (status != AppParseStatus.Ok)
         {
             _log.Log(Dnp3LogLevel.Warn, "malformed response", ("err", error));
+            lock (_gate)
+            {
+                _stats.FragmentsDiscarded++;
+            }
+
+            // A response to the request in flight that cannot be parsed is not a
+            // timeout, and counting it as one would hide the outstation's fault
+            // behind the counter that says it did not answer.
+            if (_inflight is { } pending &&
+                HeaderCodec.ParseHeader(r.Fragment.Span, out var header, out _) == AppParseStatus.Ok &&
+                header.IsResponse && header.Control.Seq == pending.Seq)
+            {
+                _inflight = null;
+                CompleteTask(pending, new MalformedException(
+                    $"master: {pending.Name} response: dnp3: malformed data: {error}"));
+            }
+
             return;
         }
 
@@ -856,6 +932,35 @@ public sealed partial class MasterSession
                 Dnp3LogLevel.Debug,
                 "ignoring a non-response fragment",
                 ("func", frag.Header.Func.ToDisplayString()));
+            return;
+        }
+
+        if (frag.Header.Func == FuncCode.AuthResponse && _cfg.SecureAuthentication is not null)
+        {
+            OnAuthenticationResponse(frag);
+            return;
+        }
+
+        // Only two response codes mean anything to this master, and the UNS bit
+        // has to agree with which one it is. AUTH_RESPONSE is handled above when
+        // authentication is enabled; a solicited response claiming to be
+        // unsolicited, or the reverse, would otherwise complete an in-flight task
+        // or deliver data through the wrong path. None of it is allowed to touch
+        // session state, indications included.
+        var uns = frag.Header.Control.Uns;
+        if (!((frag.Header.Func == FuncCode.Response && !uns) ||
+              (frag.Header.Func == FuncCode.UnsolicitedResponse && uns)))
+        {
+            lock (_gate)
+            {
+                _stats.FragmentsDiscarded++;
+            }
+
+            _log.Log(
+                Dnp3LogLevel.Debug,
+                "discarding an invalid response",
+                ("func", frag.Header.Func.ToDisplayString()),
+                ("uns", uns), ("seq", frag.Header.Control.Seq));
             return;
         }
 
@@ -935,26 +1040,50 @@ public sealed partial class MasterSession
             return;
         }
 
-        if (frag.Header.Control.Seq != t.Seq)
+        var seq = frag.Header.Control.Seq;
+
+        // The first fragment of a response carries the request's sequence number
+        // and each later one increments it, so a continuation is recognised by
+        // position in the series rather than by matching the request alone. A
+        // fragment carrying the number of the one before it is the outstation
+        // repeating that fragment because it never saw the confirm.
+        bool stale;
+        bool repeat;
+        if (!t.Started)
+        {
+            // Nothing has been accepted yet: only a FIR fragment answering this
+            // request can begin the series. One without FIR continues a series
+            // that never began, and delivering it would report part of a
+            // response as the whole of one.
+            stale = seq != t.Seq;
+            repeat = !frag.Header.Control.Fir;
+        }
+        else if (frag.Header.Control.Fir)
+        {
+            // A FIR arriving once the series has started is the first fragment
+            // repeated; delivering it would report the same measurements twice.
+            stale = seq != t.Seq;
+            repeat = true;
+        }
+        else
+        {
+            var next = (byte)((t.RespSeq + 1) % AppConstants.SeqModulus);
+            stale = seq != next && seq != t.RespSeq;
+            repeat = seq == t.RespSeq;
+        }
+
+        if (stale)
         {
             // A response for a request we have already given up on. Acting on
             // it would attribute stale data to the current poll.
             _log.Log(
                 Dnp3LogLevel.Debug,
                 "response sequence mismatch",
-                ("got", frag.Header.Control.Seq), ("want", t.Seq));
+                ("got", seq), ("want", t.Seq), ("started", t.Started));
             return;
         }
 
-        // A fragment is only delivered if it belongs where the series actually
-        // is: the first one must carry FIR and every later one must not. A FIR
-        // fragment arriving once the series has started is the outstation
-        // repeating a fragment whose confirm it never saw, and a fragment
-        // without FIR arriving before any has started continues a series that
-        // never began. Delivering the first would report the same measurements
-        // twice; delivering the second would report part of a response as the
-        // whole of one.
-        if (frag.Header.Control.Fir == t.Started)
+        if (repeat)
         {
             lock (_gate)
             {
@@ -966,7 +1095,7 @@ public sealed partial class MasterSession
                 "discarding a response fragment that does not continue the series",
                 ("fir", frag.Header.Control.Fir),
                 ("started", t.Started),
-                ("seq", frag.Header.Control.Seq));
+                ("seq", seq));
 
             // The confirm still goes out. A repeat is sent precisely because
             // the outstation did not see the confirm the first time, and
@@ -974,7 +1103,7 @@ public sealed partial class MasterSession
             // again.
             if (frag.Header.Control.Con)
             {
-                SendConfirm(frag.Header.Control.Seq, unsolicited: false);
+                SendConfirm(seq, unsolicited: false);
             }
 
             // The task is deliberately not completed, whatever this fragment's
@@ -986,6 +1115,7 @@ public sealed partial class MasterSession
         }
 
         t.Started = true;
+        t.RespSeq = seq;
 
         Deliver(frag, unsolicited: false);
         t.OnFragment?.Invoke(frag);
@@ -1005,6 +1135,12 @@ public sealed partial class MasterSession
 
         _inflight = null;
         t.OnDone?.Invoke(frag.Header.Iin);
+
+        if (t.Failure is { } failure)
+        {
+            CompleteTask(t, failure);
+            return;
+        }
 
         // A chained task runs immediately rather than going back to the
         // scheduler, so nothing can be interleaved between the two.
@@ -1096,7 +1232,7 @@ public sealed partial class MasterSession
                 // that follow it in this fragment.
                 if (h.Group == 51 && h.Data.Length >= CommandObjects.Time48Size)
                 {
-                    ctx = ctx.WithCto(CommandObjects.ParseTime48(h.Data.Span).Time);
+                    ctx = ctx.WithGroup51(CommandObjects.ParseTime48(h.Data.Span).Time, h.Variation);
                     continue;
                 }
 

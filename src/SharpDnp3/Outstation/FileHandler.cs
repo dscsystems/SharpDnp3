@@ -46,6 +46,13 @@ public sealed class FileConfig
     public IFileHandler? Handler { get; set; }
 
     /// <summary>
+    /// Requires a credential exchange before OPEN_FILE or DELETE_FILE. It
+    /// validates a user and password; the session generates and tracks the wire
+    /// key it returns. A handler must never log the password.
+    /// </summary>
+    public Func<string, string, bool>? Authenticate { get; set; }
+
+    /// <summary>
     /// Caps the block size, whatever the master asks for. Zero uses
     /// <see cref="DefaultBlockSize"/>.
     /// </summary>

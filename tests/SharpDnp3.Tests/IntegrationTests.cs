@@ -13,7 +13,7 @@ using SharpDnp3.Outstation;
 namespace SharpDnp3.Tests;
 
 /// <summary>Collects everything a master reports, for assertions.</summary>
-internal sealed class RecordingHandler : NopHandler
+internal class RecordingHandler : NopHandler
 {
     private readonly Lock _gate = new();
 
