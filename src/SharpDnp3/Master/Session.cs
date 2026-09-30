@@ -86,6 +86,19 @@ public sealed class MasterConfig
     /// </remarks>
     public TimeSpan KeepAlive { get; set; }
 
+    /// <summary>
+    /// Enables AUTHENTICATE_FILE before each file open or delete. DNP3 file
+    /// authentication sends the password on the wire; protect the channel when
+    /// credentials require confidentiality.
+    /// </summary>
+    public FileCredentials? FileCredentials { get; set; }
+
+    /// <summary>
+    /// Enables the symmetric Secure Authentication master exchange. The update
+    /// key must match the outstation's locally provisioned user key.
+    /// </summary>
+    public SecureAuthenticationConfig? SecureAuthentication { get; set; }
+
     /// <summary>Receives protocol and session events.</summary>
     public IDnp3Logger? Log { get; set; }
 
@@ -356,6 +369,7 @@ public sealed partial class MasterSession
             _log.Log(Dnp3LogLevel.Info, "connected", ("channel", channel.ToString()));
 
             _stack.Reset();
+            _security.Clear();
             SetConnected(true);
             _lastRx = _time.GetUtcNow();
             StartupSequence();
@@ -731,7 +745,19 @@ public sealed partial class MasterSession
     private void SendTask(MasterTask t)
     {
         t.Failure = null;
-        _seq = (byte)((_seq + 1) % AppConstants.SeqModulus);
+        if (_cfg.SecureAuthentication is not null && t.FuncCode != FuncCode.AuthRequest && !SecurityReady())
+        {
+            SendTask(NewSessionKeysTask(t));
+            return;
+        }
+
+        // Authentication exchanges do not consume the application's sequence
+        // space. A key refresh between SELECT and OPERATE must preserve the
+        // consecutive sequence numbers the control reservation requires.
+        if (t.FuncCode != FuncCode.AuthRequest)
+        {
+            _seq = (byte)((_seq + 1) % AppConstants.SeqModulus);
+        }
 
         byte[] fragment;
         try
@@ -744,6 +770,10 @@ public sealed partial class MasterSession
 
             t.Build?.Invoke(b);
             fragment = b.ToArray();
+            if (_cfg.SecureAuthentication is not null && t.FuncCode != FuncCode.AuthRequest)
+            {
+                _security.LastRequest = fragment;
+            }
         }
         catch (Dnp3Exception ex)
         {
@@ -776,7 +806,7 @@ public sealed partial class MasterSession
 
         _log.Log(Dnp3LogLevel.Debug, "task sent", ("task", t.Name), ("seq", _seq));
 
-        if (t.NoResponse)
+        if (t.NoResponse && _cfg.SecureAuthentication is null)
         {
             // Nothing will come back, so there is nothing to wait for.
             _inflight = null;
@@ -830,6 +860,13 @@ public sealed partial class MasterSession
             {
                 _stats.TasksSucceeded++;
             }
+        }
+
+        if (error is not null && t.Origin is { } origin && origin.Period > TimeSpan.Zero)
+        {
+            // A failed key exchange must not lose the periodic task it was run
+            // for.
+            _sched.Push(origin.CloneForPeriod(_time.GetUtcNow() + origin.Period));
         }
 
         if (t.Period > TimeSpan.Zero)
@@ -895,6 +932,12 @@ public sealed partial class MasterSession
                 Dnp3LogLevel.Debug,
                 "ignoring a non-response fragment",
                 ("func", frag.Header.Func.ToDisplayString()));
+            return;
+        }
+
+        if (frag.Header.Func == FuncCode.AuthResponse && _cfg.SecureAuthentication is not null)
+        {
+            OnAuthenticationResponse(frag);
             return;
         }
 

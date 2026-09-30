@@ -157,6 +157,11 @@ public sealed class OutstationConfig
     public IList<DatasetObject> Datasets { get; } = [];
 
     /// <summary>
+    /// Enables symmetric DNP3 Secure Authentication independently of TLS.
+    /// </summary>
+    public SecureAuthenticationConfig? SecureAuthentication { get; set; }
+
+    /// <summary>
     /// Validates and applies prototype-dependent dataset writes. The arguments
     /// are the group, the variation and the object's octets.
     /// </summary>
@@ -512,6 +517,17 @@ public sealed partial class OutstationSession
 
         var events = new EventBuffer(config.Events);
         _db = new Database(config.Database, events);
+        foreach (var v in config.Datasets)
+        {
+            try
+            {
+                _db.UpdateDataset(v, Class.None);
+            }
+            catch (Dnp3Exception)
+            {
+                _indications |= (int)Indication.ConfigCorrupt;
+            }
+        }
         _writer = new ResponseWriter(_db);
         _log = new ScopedLogger(config.Log!, ("role", "outstation"), ("addr", config.LocalAddr));
 
@@ -856,6 +872,7 @@ public sealed partial class OutstationSession
             Id = id,
             Connection = conn,
             Peer = peer,
+            Security = NewSecurityState(),
             Events = new EventBuffer(_cfg.Events),
             Log = new ScopedLogger(_log, ("conn", id), ("peer", peer)),
             Stack = new ProtocolStack(new StackConfig
@@ -1050,6 +1067,7 @@ public sealed partial class OutstationSession
                         CheckSelectTimeout(a, now);
                         CheckFileTimeout(now);
                         RunFreezes(now);
+                        ExpireSecurity(a);
                         PollUnsolicited(a, now);
                     }
                 }
@@ -1259,7 +1277,7 @@ public sealed partial class OutstationSession
     }
 
     /// <summary>Dispatches one request fragment.</summary>
-    private void Handle(Association a, Received r)
+    private void Handle(Association a, Received r, bool authenticated = false)
     {
         // Before anything is answered: a restart raised a moment ago has to be
         // reported in this response rather than waiting for the next tick, or a
@@ -1269,6 +1287,12 @@ public sealed partial class OutstationSession
         lock (_gate)
         {
             _stats.RequestsReceived++;
+        }
+
+        if (Sa is not null)
+        {
+            CountSecurity(6);
+            ExpireSecurity(a);
         }
 
         // Whatever address this master uses is where its unsolicited responses
@@ -1366,6 +1390,19 @@ public sealed partial class OutstationSession
                 RejectMalformed(a, r, frag, AppParseStatus.BadQualifier);
                 return;
             }
+        }
+
+        if (frag.Header.Func is FuncCode.AuthRequest or FuncCode.AuthRequestNoAck)
+        {
+            OnAuthentication(a, r, frag);
+            return;
+        }
+
+        if (!authenticated && Sa is not null &&
+            (CriticalFunction(frag.Header.Func) || HasAuthenticationObject(frag)))
+        {
+            ChallengeRequest(a, r, frag);
+            return;
         }
 
         // A confirm is an acknowledgement of our own response, not a request:
@@ -1472,6 +1509,10 @@ public sealed partial class OutstationSession
 
             case FuncCode.RecordCurrentTime:
                 OnRecordCurrentTime(a, r, frag);
+                return;
+
+            case FuncCode.AuthenticateFile:
+                OnAuthenticateFile(a, r, frag);
                 return;
 
             case FuncCode.OpenFile:
@@ -1631,7 +1672,7 @@ public sealed partial class OutstationSession
     /// </summary>
     private static bool HandlesFunc(FuncCode f) => f is
         FuncCode.Confirm or FuncCode.Read or FuncCode.Write or FuncCode.DelayMeasure or
-        FuncCode.RecordCurrentTime or FuncCode.OpenFile or FuncCode.CloseFile or
+        FuncCode.RecordCurrentTime or FuncCode.AuthenticateFile or FuncCode.OpenFile or FuncCode.CloseFile or
         FuncCode.InitializeData or FuncCode.InitializeAppl or FuncCode.StartAppl or
         FuncCode.StopAppl or FuncCode.SaveConfig or FuncCode.ActivateConfig or
         FuncCode.DeleteFile or FuncCode.GetFileInfo or FuncCode.AbortFile or
@@ -1641,7 +1682,8 @@ public sealed partial class OutstationSession
         FuncCode.DirectOperate or FuncCode.DirectOperateNR or
         FuncCode.ImmedFreeze or FuncCode.ImmedFreezeNR or
         FuncCode.FreezeClear or FuncCode.FreezeClearNR or
-        FuncCode.FreezeAtTime or FuncCode.FreezeAtTimeNR;
+        FuncCode.FreezeAtTime or FuncCode.FreezeAtTimeNR or
+        FuncCode.AuthRequest or FuncCode.AuthRequestNoAck;
 
     /// <summary>Clears the wait on the fragment just confirmed.</summary>
     /// <remarks>
@@ -1816,6 +1858,12 @@ public sealed partial class OutstationSession
             if (h.Group == 112)
             {
                 ReadTerminals(a, b, h);
+                continue;
+            }
+
+            if (h.Group == 121)
+            {
+                ReadSecurityStatistics(a, b, h);
                 continue;
             }
 

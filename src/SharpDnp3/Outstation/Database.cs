@@ -847,6 +847,22 @@ public sealed partial class Database
         }
     }
 
+    /// <summary>Queues a security statistic threshold event (group 122).</summary>
+    internal void RaiseSecurityStatistic(ushort index, Class cls, uint value, Timestamp time)
+    {
+        lock (_gate)
+        {
+            RaiseWithClass(cls, new Event
+            {
+                Type = PointType.SecurityStatistic,
+                Index = index,
+                Variation = 2,
+                SecurityStatistic = value,
+                Time = time,
+            });
+        }
+    }
+
     /// <summary>Sets an analog output's reported value.</summary>
     public void UpdateAnalogOutputStatus(ushort index, AnalogOutputStatus v)
     {

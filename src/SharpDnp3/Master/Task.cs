@@ -43,7 +43,7 @@ internal sealed class MasterTask
     public int Priority { get; init; }
 
     /// <summary>Appends the task's object headers to the request.</summary>
-    public Action<FragmentBuilder>? Build { get; init; }
+    public Action<FragmentBuilder>? Build { get; set; }
 
     /// <summary>Runs for each response fragment, before the confirm.</summary>
     public Action<Fragment>? OnFragment { get; set; }
@@ -94,6 +94,12 @@ internal sealed class MasterTask
     /// its response is complete instead of letting it report success.
     /// </summary>
     public Exception? Failure { get; set; }
+
+    /// <summary>
+    /// For the key exchange that precedes a task, the task it was run for, so a
+    /// failed exchange does not lose a periodic one.
+    /// </summary>
+    public MasterTask? Origin { get; init; }
 
     /// <summary>
     /// The sequence number of the last fragment accepted, from which the next
