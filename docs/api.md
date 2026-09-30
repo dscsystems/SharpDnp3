@@ -108,6 +108,12 @@ public enum PointType : byte
     BinaryOutputStatus,
     AnalogOutputStatus,
     OctetString,
+    BinaryCommandEvent,   // a control operated on a binary output (g13)
+    AnalogCommandEvent,   // a control operated on an analog output (g43)
+    FrozenAnalog,         // g31 / g33
+    VirtualTerminal,      // g112 / g113
+    SecurityStatistic,    // g121 / g122
+    Dataset,              // g85-g88
 }
 ```
 
@@ -417,6 +423,7 @@ public class NotSupportedByPeerException : Dnp3Exception;   // the peer refused 
 public class BadConfigException : Dnp3Exception;           // bad arguments: empty class mask, start > stop, no commands
 public class TaskFailedException : Dnp3Exception;          // retries exhausted
 public class NoConnectionException : Dnp3Exception;        // nothing is connected
+public class RejectedException : Dnp3Exception;            // answered, but with PARAMETER_ERROR or OBJECT_UNKNOWN
 
 public sealed class ChannelClosedException : Dnp3Exception; // in SharpDnp3.Channels
 ```
@@ -686,7 +693,10 @@ public sealed class MasterConfig
     public int LinkRetries { get; set; }      // retransmissions of a confirmed frame
     public TimeSpan LinkTimeout { get; set; } // default 1s; matters only with UseLinkConfirms
 
-    public TimeSpan KeepAlive { get; set; }   // probe an idle link this often; zero disables
+    public TimeSpan KeepAlive { get; set; }   // probe an idle link this often; zero disables. An unanswered probe ends the connection.
+
+    public FileCredentials? FileCredentials { get; set; }                    // AUTHENTICATE_FILE before each file open/delete
+    public SecureAuthenticationConfig? SecureAuthentication { get; set; }     // symmetric SAv5 subset; see the user guide
 
     public IDnp3Logger? Log { get; set; }         // null discards
     public TimeProvider? TimeProvider { get; set; } // null uses TimeProvider.System
@@ -835,6 +845,25 @@ past.
 — and rejects an empty dictionary. A deadband is how a master tells an outstation
 how much a point must move before it is worth an event.
 
+```csharp
+public Task SyncTimeRecordedAsync(CancellationToken cancellationToken = default);
+public Task FreezeAtTimeAsync(DateTimeOffset at, TimeSpan interval = default,
+                              CancellationToken cancellationToken = default);
+public Task FreezeCountersAsync(FreezeMode mode, bool noAck = false, ushort? start = null,
+                                ushort? stop = null, CancellationToken cancellationToken = default);
+public Task WriteAttributeAsync(DeviceAttribute attribute, CancellationToken cancellationToken = default);
+public Task<uint> AuthenticateFileAsync(string user, string password, CancellationToken cancellationToken = default);
+```
+
+`SyncTimeRecordedAsync` is the LAN procedure proper: RECORD_CURRENT_TIME, then the
+master's own clock reading as group 50 variation 3. The outstation adds however
+long it held the request, so the transit delay is measured rather than assumed.
+`FreezeCountersAsync` (without `noAck`) and `FreezeAtTimeAsync` throw
+`RejectedException` or `NotSupportedByPeerException` when the outstation refuses,
+instead of reporting success for a freeze that froze nothing. `WriteAttributeAsync`
+needs the outstation to advertise the attribute writable and the value to keep its
+configured type.
+
 `RestartAsync` returns when the request was *accepted*, not when the device is
 back: the outstation answers with how long it expects to be unavailable and then
 restarts.
@@ -894,6 +923,21 @@ public readonly record struct HeaderInfo
 Consumers need `HeaderInfo` more often than it looks: the same analog point read
 as a static value and received as an event mean different things to a historian,
 and only the group tells them apart.
+
+### Optional handler interfaces
+
+A handler opts in to the newer object types by implementing these in addition to
+`IMasterHandler`; one that does not never sees them (frozen analogs then arrive
+through `HandleAnalog`).
+
+```csharp
+public interface ICommandEventHandler { void HandleCommandEvent(HeaderInfo info, IReadOnlyList<Indexed<CommandEvent>> values); }
+public interface IFrozenAnalogHandler { void HandleFrozenAnalog(HeaderInfo info, IReadOnlyList<Indexed<Analog>> values); }
+public interface IDatasetHandler      { void HandleDataset(HeaderInfo info, byte[] data); } // whole encoded object, groups 85-88
+```
+
+`ChannelHandler` implements the first two; its `Update` carries `FrozenAnalog` and
+`CommandEvent`, and group 112/113 octets arrive as `PointType.VirtualTerminal`.
 
 ## ChannelHandler
 
@@ -1079,6 +1123,18 @@ public sealed class OutstationConfig
     public TimeSpan LinkTimeout { get; set; } // default 1s
 
     public IDnp3Logger? Log { get; set; }     // null discards
+
+    public Indication Indications { get; set; }              // LocalControl | DeviceTrouble | ConfigCorrupt asserted from the start
+    public bool SelfAddress { get; set; }                     // accept destination 0xFFFC for discovery
+    public FileConfig Files { get; set; }                     // Handler, Authenticate, MaxBlockSize, Timeout
+    public IList<AttributeId> WritableAttributes { get; }
+    public Func<DeviceAttribute, bool>? AttributeWrite { get; set; }
+    public IManagementHandler? Management { get; set; }       // function codes 15-19
+    public Func<IReadOnlyList<string>, ActivationResult>? ActivateConfig { get; set; } // function code 31, answered with g91v1
+    public Func<ushort, byte[], bool>? TerminalWrite { get; set; }
+    public IList<DatasetObject> Datasets { get; }
+    public Func<byte, byte, byte[], bool>? DatasetWrite { get; set; }
+    public SecureAuthenticationConfig? SecureAuthentication { get; set; }
 }
 
 public sealed class UnsolicitedConfig
@@ -1116,6 +1172,9 @@ public sealed class DatabaseConfig
     public int Counter { get; set; }
     public int FrozenCounter { get; set; }
     public int Analog { get; set; }
+    public int FrozenAnalog { get; set; }     // independent storage: g31 static, g33 events
+    public int TimeAndInterval { get; set; }  // indexed g50v4 values
+    public int VirtualTerminal { get; set; }
     public int BinaryOutputStatus { get; set; }
     public int AnalogOutputStatus { get; set; }
     public int OctetString { get; set; }
@@ -1135,6 +1194,11 @@ public void UpdateAnalog(ushort index, Analog v);
 public void UpdateBinaryOutputStatus(ushort index, BinaryOutputStatus v);
 public void UpdateAnalogOutputStatus(ushort index, AnalogOutputStatus v);
 public void UpdateOctetString(ushort index, ReadOnlySpan<byte> v);
+public void UpdateFrozenAnalog(ushort index, Analog v);            // applies its own event deadband
+public void FreezeAnalogs();                                        // snapshot every analog that has a frozen counterpart
+public bool UpdateTimeAndInterval(ushort index, TimeAndInterval v); // generates no events
+public void UpdateVirtualTerminal(ushort index, ReadOnlySpan<byte> v); // queues a g113 event
+public void UpdateDataset(DatasetObject v, Class cls = Class.None);  // a g87 present value queues a g88 snapshot event in cls
 ```
 
 An update generates an event when the value or its quality changed and the point
@@ -1158,6 +1222,8 @@ public bool TryGetAnalog(ushort index, out Analog value, out PointConfig config)
 public bool TryGetBinaryOutputStatus(ushort index, out BinaryOutputStatus value, out PointConfig config);
 public bool TryGetAnalogOutputStatus(ushort index, out AnalogOutputStatus value, out PointConfig config);
 public bool TryGetOctetString(ushort index, out byte[] value, out PointConfig config);
+public bool TryGetFrozenAnalog(ushort index, out Analog value, out PointConfig config);
+public bool TryGetTimeAndInterval(ushort index, out TimeAndInterval value);
 ```
 
 The return value reports whether the index exists.
@@ -1184,6 +1250,8 @@ public record struct PointConfig
     public byte StaticVariation { get; set; } // used when reported in a class 0 or range read
     public byte EventVariation { get; set; }  // used when the point's events are reported
     public double Deadband { get; set; }      // ignored for binaries, which event on any change
+    public Class CommandEventClass { get; set; }    // class of the g13/g43 command events an operated control on this output records; None records none
+    public byte CommandEventVariation { get; set; } // zero mirrors the command: the variation with a time at the command's own width
 }
 ```
 
@@ -1210,6 +1278,7 @@ Defaults, chosen as the widest lossless encoding for each type:
 | DoubleBitBinary | g3v2 | g4v2 |
 | Counter | g20v1 (32-bit, flags) | g22v5 (with time) |
 | FrozenCounter | g21v1 | g23v5 |
+| FrozenAnalog | g31v1 | g33v3 |
 | Analog | g30v1 (32-bit, flags) | g32v3 (32-bit, time) |
 | BinaryOutputStatus | g10v2 | g11v2 |
 | AnalogOutputStatus | g40v1 | g42v3 |

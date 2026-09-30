@@ -231,6 +231,13 @@ static async Task SimulateAsync(
     var period = TimeSpan.FromSeconds(Simulator.TickSeconds);
     var lastRestart = DateTimeOffset.UtcNow;
 
+    // An injected fault the library cannot assert for itself: it depends on the
+    // device, not on the protocol.
+    if (simulator.DeviceTroubleInjected)
+    {
+        session.SetIndication(Indication.DeviceTrouble, true);
+    }
+
     using var timer = new PeriodicTimer(period);
     try
     {
