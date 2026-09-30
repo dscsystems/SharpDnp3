@@ -123,6 +123,53 @@ public sealed class OutstationConfig
     /// </summary>
     public TimeSpan LinkTimeout { get; set; }
 
+    /// <summary>Attributes that accept same-type writes from a master.</summary>
+    public IList<AttributeId> WritableAttributes { get; } = [];
+
+    /// <summary>
+    /// May reject or persist an attribute before it is stored. Returning
+    /// <see langword="false"/> refuses the write with PARAMETER_ERROR.
+    /// </summary>
+    public Func<DeviceAttribute, bool>? AttributeWrite { get; set; }
+
+    /// <summary>
+    /// Enables the self address (0xFFFC), so a master that does not know this
+    /// outstation's link address can discover it. Replies identify the
+    /// configured address.
+    /// </summary>
+    public bool SelfAddress { get; set; }
+
+    /// <summary>Implements the application and configuration function codes 15 to 19.</summary>
+    public IManagementHandler? Management { get; set; }
+
+    /// <summary>
+    /// Applies the named configuration files and reports the group 91 result
+    /// for ACTIVATE_CONFIG.
+    /// </summary>
+    public Func<IReadOnlyList<string>, ActivationResult>? ActivateConfig { get; set; }
+
+    /// <summary>
+    /// Consumes master virtual-terminal output. Null refuses writes.
+    /// </summary>
+    public Func<ushort, byte[], bool>? TerminalWrite { get; set; }
+
+    /// <summary>Supplies dataset prototype, descriptor and present-value objects.</summary>
+    public IList<DatasetObject> Datasets { get; } = [];
+
+    /// <summary>
+    /// Validates and applies prototype-dependent dataset writes. The arguments
+    /// are the group, the variation and the object's octets.
+    /// </summary>
+    public Func<byte, byte, byte[], bool>? DatasetWrite { get; set; }
+
+    /// <summary>
+    /// The device-controlled indications asserted from the start, for a device
+    /// that already knows its configuration is bad or a point is in local
+    /// control when it comes up. Change them while running with
+    /// <see cref="OutstationSession.SetIndication"/>.
+    /// </summary>
+    public Indication Indications { get; set; }
+
     /// <summary>Receives protocol and session events.</summary>
     public IDnp3Logger? Log { get; set; }
 
@@ -198,6 +245,26 @@ public interface IOutstationApplication
 
     /// <summary>Reports whether the outstation accepts clock writes.</summary>
     bool SupportsWriteTime();
+}
+
+/// <summary>
+/// A device-controlled internal indication: one the library cannot know for
+/// itself, because it depends on the device rather than on the protocol.
+/// </summary>
+[Flags]
+public enum Indication : ushort
+{
+    /// <summary>No indication.</summary>
+    None = 0,
+
+    /// <summary>One or more points are in local control and refuse commands.</summary>
+    LocalControl = 0x0020,
+
+    /// <summary>A device-specific fault, whose meaning is the device's to define.</summary>
+    DeviceTrouble = 0x0040,
+
+    /// <summary>The device's configuration is not valid and its answers cannot be relied on.</summary>
+    ConfigCorrupt = 0x2000,
 }
 
 /// <summary>An application with sensible defaults.</summary>
@@ -280,6 +347,9 @@ public record struct OutstationStats
     /// <summary>Transfers the master abandoned.</summary>
     public ulong FilesAborted;
 
+    /// <summary>FREEZE_AT_TIME freezes that have been performed.</summary>
+    public ulong ScheduledFreezes;
+
     /// <summary>Connections established.</summary>
     public ulong Connections;
 
@@ -349,6 +419,19 @@ public sealed partial class OutstationSession
     /// </remarks>
     private volatile bool _deviceRestart;
 
+    /// <summary>
+    /// The device-controlled indications, set from application threads and read
+    /// while answering.
+    /// </summary>
+    private int _indications;
+
+    /// <summary>
+    /// When the last restart the application announced is expected to finish,
+    /// as ticks. A second request while it is under way is answered
+    /// ALREADY_EXECUTING instead of being carried out twice.
+    /// </summary>
+    private long _restartUntilTicks;
+
     /// <summary>Executes the controls themselves.</summary>
     private readonly ICommandHandler _cmds;
 
@@ -379,6 +462,32 @@ public sealed partial class OutstationSession
 
     private int _nextAssocId;
 
+    /// <summary>
+    /// Asserts or clears device-controlled indications in every response from
+    /// now on. Safe to call from any thread.
+    /// </summary>
+    /// <remarks>
+    /// Only <see cref="Indication.LocalControl"/>, <see cref="Indication.DeviceTrouble"/>
+    /// and <see cref="Indication.ConfigCorrupt"/> can be set; any other bit is
+    /// ignored, since the rest describe the protocol and are the library's to
+    /// assert.
+    /// </remarks>
+    public void SetIndication(Indication indication, bool on)
+    {
+        var bits = (int)(indication & SettableIndications);
+        if (on)
+        {
+            Interlocked.Or(ref _indications, bits);
+        }
+        else
+        {
+            Interlocked.And(ref _indications, ~bits);
+        }
+    }
+
+    private const Indication SettableIndications =
+        Indication.LocalControl | Indication.DeviceTrouble | Indication.ConfigCorrupt;
+
     /// <summary>Creates an outstation session.</summary>
     /// <remarks>
     /// A null application uses <see cref="NopApplication"/>. A null command
@@ -397,6 +506,7 @@ public sealed partial class OutstationSession
         _cfg = config;
         _appl = application ?? new NopApplication();
         _cmds = commandHandler ?? new RejectingCommandHandler();
+        _indications = (int)(config.Indications & SettableIndications);
 
         _attributes = BuildAttributes(config);
 
@@ -938,6 +1048,7 @@ public sealed partial class OutstationSession
                         CheckConfirmTimeout(a);
                         CheckSelectTimeout(a, now);
                         CheckFileTimeout(now);
+                        RunFreezes(now);
                         PollUnsolicited(a, now);
                     }
                 }
@@ -1173,43 +1284,7 @@ public sealed partial class OutstationSession
             }
 
             a.Log.Log(Dnp3LogLevel.Warn, "malformed request", ("err", error));
-
-            // An object the outstation cannot size is one it does not know;
-            // anything else wrong with the objects is a parameter error.
-            a.Iin = a.Iin.Set(status == AppParseStatus.UnknownObject ? Iin.ObjectUnknown : Iin.ParameterError);
-
-            // When the application header itself was readable, the master is
-            // waiting on a sequence number we know, so it is answered at once
-            // with a null response carrying the error: left to time out, it
-            // learns nothing about why. Anything that would not have been
-            // answered had it parsed — a confirm, a response, a no-reply
-            // function, a broadcast, one fragment of a series — is not
-            // answered now either, and the indication rides on the next
-            // response instead.
-            if (status != AppParseStatus.ShortFragment &&
-                frag.Header.Control is { Fir: true, Fin: true } &&
-                frag.Header.Func != FuncCode.Confirm &&
-                !frag.Header.Func.IsResponse() &&
-                !frag.Header.Func.NoReply() &&
-                !r.Broadcast)
-            {
-                // Remembered like any other request, so a retransmission of it
-                // is answered from the same null response, error and all.
-                if (IsRepeatRequest(a, r, frag))
-                {
-                    lock (_gate)
-                    {
-                        _stats.RepeatedRequests++;
-                    }
-
-                    ReplayResponse(a, r, frag.Header);
-                    return;
-                }
-
-                RememberRequest(a, r, frag);
-                Respond(a, r, frag.Header, []);
-            }
-
+            RejectMalformed(a, r, frag, status);
             return;
         }
 
@@ -1237,6 +1312,59 @@ public sealed partial class OutstationSession
             // to answer, so the indication rides on the next response instead.
             a.Iin = a.Iin.Set(Iin.ParameterError);
             return;
+        }
+
+        // Two things a well-formed message never does, whatever it is asking
+        // for. A CONFIRM is a bare header: objects after it are not an
+        // acknowledgement of anything. And CON and UNS belong to responses — a
+        // request asks the outstation for nothing by setting them, so one that
+        // does is discarded unanswered rather than acted on as though it meant
+        // something else.
+        if (frag.Header.Func == FuncCode.Confirm && frag.Objects.Count > 0)
+        {
+            lock (_gate)
+            {
+                _stats.MalformedRequests++;
+            }
+
+            a.Log.Log(Dnp3LogLevel.Warn, "discarding a confirm that carries objects", ("seq", frag.Header.Control.Seq));
+            return;
+        }
+
+        if (frag.Header.Func != FuncCode.Confirm && (frag.Header.Control.Con || frag.Header.Control.Uns))
+        {
+            lock (_gate)
+            {
+                _stats.MalformedRequests++;
+            }
+
+            a.Log.Log(
+                Dnp3LogLevel.Warn,
+                "discarding a request with CON or UNS set",
+                ("func", frag.Header.Func.ToDisplayString()),
+                ("con", frag.Header.Control.Con), ("uns", frag.Header.Control.Uns));
+            return;
+        }
+
+        // A prefix and a range that do not go together — an index prefix on a
+        // start-stop range, say — are not a qualifier the standard defines, and
+        // which points they name is anyone's guess.
+        foreach (var h in frag.Objects)
+        {
+            if (!h.Qualifier.Consistent())
+            {
+                lock (_gate)
+                {
+                    _stats.MalformedRequests++;
+                }
+
+                a.Log.Log(
+                    Dnp3LogLevel.Warn,
+                    "request carries an inconsistent qualifier",
+                    ("group", h.Group), ("variation", h.Variation), ("qualifier", h.Qualifier.ToString()));
+                RejectMalformed(a, r, frag, AppParseStatus.BadQualifier);
+                return;
+            }
         }
 
         // A confirm is an acknowledgement of our own response, not a request:
@@ -1386,9 +1514,31 @@ public sealed partial class OutstationSession
                 OnCommand(a, r, frag);
                 return;
 
+            case FuncCode.InitializeData:
+            case FuncCode.InitializeAppl:
+            case FuncCode.StartAppl:
+            case FuncCode.StopAppl:
+            case FuncCode.SaveConfig:
+            case FuncCode.ActivateConfig:
+                OnManagement(a, r, frag);
+                return;
+
             case FuncCode.ImmedFreeze:
             case FuncCode.ImmedFreezeNR:
-                OnFreeze(a, frag);
+            case FuncCode.FreezeClear:
+            case FuncCode.FreezeClearNR:
+                OnFreeze(a, frag, frag.Header.Func is FuncCode.FreezeClear or FuncCode.FreezeClearNR);
+                if (frag.Header.Func.NoReply() || r.Broadcast)
+                {
+                    return;
+                }
+
+                Respond(a, r, frag.Header, []);
+                return;
+
+            case FuncCode.FreezeAtTime:
+            case FuncCode.FreezeAtTimeNR:
+                OnFreezeAtTime(a, frag);
                 if (frag.Header.Func.NoReply() || r.Broadcast)
                 {
                     return;
@@ -1413,6 +1563,84 @@ public sealed partial class OutstationSession
                 return;
         }
     }
+
+    /// <summary>
+    /// Answers a request whose object section could not be parsed or whose
+    /// qualifiers are inconsistent.
+    /// </summary>
+    /// <remarks>
+    /// An object the outstation cannot size is one it does not know; anything
+    /// else wrong with the objects is a parameter error. When the application
+    /// header itself was readable, the master is waiting on a sequence number
+    /// we know, so it is answered at once with a null response carrying the
+    /// error: left to time out, it learns nothing about why. Anything that would
+    /// not have been answered had it parsed — a confirm, a response, a no-reply
+    /// function, a broadcast, one fragment of a series — is not answered now
+    /// either, and the indication rides on the next response instead.
+    /// </remarks>
+    private void RejectMalformed(Association a, Received r, Fragment frag, AppParseStatus status)
+    {
+        if (status == AppParseStatus.ShortFragment || frag.Header.Func.IsResponse())
+        {
+            a.Iin = a.Iin.Set(Iin.ParameterError);
+            return;
+        }
+
+        if (!HandlesFunc(frag.Header.Func))
+        {
+            lock (_gate)
+            {
+                _stats.UnknownFunction++;
+            }
+
+            a.Iin = a.Iin.Set(Iin.NoFuncCodeSupport);
+        }
+        else
+        {
+            a.Iin = a.Iin.Set(status == AppParseStatus.UnknownObject ? Iin.ObjectUnknown : Iin.ParameterError);
+        }
+
+        if (frag.Header.Control is { Fir: true, Fin: true } &&
+            frag.Header.Func != FuncCode.Confirm &&
+            !frag.Header.Func.NoReply() &&
+            !r.Broadcast)
+        {
+            // Remembered like any other request, so a retransmission of it
+            // is answered from the same null response, error and all.
+            if (IsRepeatRequest(a, r, frag))
+            {
+                lock (_gate)
+                {
+                    _stats.RepeatedRequests++;
+                }
+
+                ReplayResponse(a, r, frag.Header);
+                return;
+            }
+
+            RememberRequest(a, r, frag);
+            Respond(a, r, frag.Header, []);
+        }
+    }
+
+    /// <summary>
+    /// Reports whether <see cref="Handle"/> dispatches a function code to
+    /// something other than its "not supported" default. It mirrors the switch
+    /// there.
+    /// </summary>
+    private static bool HandlesFunc(FuncCode f) => f is
+        FuncCode.Confirm or FuncCode.Read or FuncCode.Write or FuncCode.DelayMeasure or
+        FuncCode.RecordCurrentTime or FuncCode.OpenFile or FuncCode.CloseFile or
+        FuncCode.InitializeData or FuncCode.InitializeAppl or FuncCode.StartAppl or
+        FuncCode.StopAppl or FuncCode.SaveConfig or FuncCode.ActivateConfig or
+        FuncCode.DeleteFile or FuncCode.GetFileInfo or FuncCode.AbortFile or
+        FuncCode.ColdRestart or FuncCode.WarmRestart or
+        FuncCode.EnableUnsolicited or FuncCode.DisableUnsolicited or
+        FuncCode.AssignClass or FuncCode.Select or FuncCode.Operate or
+        FuncCode.DirectOperate or FuncCode.DirectOperateNR or
+        FuncCode.ImmedFreeze or FuncCode.ImmedFreezeNR or
+        FuncCode.FreezeClear or FuncCode.FreezeClearNR or
+        FuncCode.FreezeAtTime or FuncCode.FreezeAtTimeNR;
 
     /// <summary>Clears the wait on the fragment just confirmed.</summary>
     /// <remarks>
@@ -1495,6 +1723,7 @@ public sealed partial class OutstationSession
                             _writer.BuildStaticRange(b, staticType, 0, 0, 0xFFFF);
                         }
 
+                        ReadDatasets(a, b, FragmentFactory.ReadAllObjects(87, 1));
                         break;
 
                     case 2:
@@ -1505,9 +1734,18 @@ public sealed partial class OutstationSession
                         // so in the usual Class 1,2,3,0 poll the events must
                         // precede the static data, or an old buffered event
                         // overwrites the current value it was read alongside.
+                        // A class read names how many events it wants when its
+                        // range is a count; without one it wants every event in
+                        // the class.
+                        if (!TryEventReadLimit(h, out var classLimit))
+                        {
+                            a.Iin = a.Iin.Set(Iin.ParameterError);
+                            break;
+                        }
+
                         var mask = (Class)((byte)Class.Class1 << (h.Variation - 2));
-                        var events = a.Events.Select(mask, 512);
-                        _writer.BuildEvents(b, events);
+                        var events = a.Events.Select(mask, classLimit);
+                        _writer.BuildEvents(b, events, _appl.Now, e => a.Events.Release([e]));
                         selected.AddRange(events);
                         break;
 
@@ -1515,6 +1753,68 @@ public sealed partial class OutstationSession
                         break;
                 }
 
+                continue;
+            }
+
+            if (ResponseWriter.TryEventTypeForGroup(h.Group, out var eventType))
+            {
+                // A read of an event group asks for the buffered events of that
+                // kind, in the variation named — not the static values of the
+                // group's namesake, which is what falling into the static path
+                // below would have answered.
+                if (h.Variation != 0 && !EventVariationKnown(eventType, h.Variation))
+                {
+                    a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                    continue;
+                }
+
+                if (!TryEventReadLimit(h, out var limit))
+                {
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
+                    continue;
+                }
+
+                var evs = a.Events.SelectType(eventType, limit);
+                if (h.Variation != 0 && eventType != PointType.OctetString)
+                {
+                    for (var k = 0; k < evs.Count; k++)
+                    {
+                        evs[k] = evs[k] with { Variation = h.Variation };
+                    }
+                }
+
+                _writer.BuildEvents(b, evs, _appl.Now, e => a.Events.Release([e]));
+                selected.AddRange(evs);
+                continue;
+            }
+
+            if (h.Group == 50 && h.Variation == 1)
+            {
+                ReadCurrentTime(a, b, h);
+                continue;
+            }
+
+            if (h.Group == 80 && h.Variation == 1)
+            {
+                ReadIin(a, b, h);
+                continue;
+            }
+
+            if (h.Group == 50 && h.Variation == 4)
+            {
+                ReadTimeIntervals(a, b, h);
+                continue;
+            }
+
+            if (h.Group is >= 85 and <= 87)
+            {
+                ReadDatasets(a, b, h);
+                continue;
+            }
+
+            if (h.Group == 112)
+            {
+                ReadTerminals(a, b, h);
                 continue;
             }
 
@@ -1543,6 +1843,16 @@ public sealed partial class OutstationSession
             }
 
             if (!TryPointTypeForGroup(h.Group, out var pt))
+            {
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                continue;
+            }
+
+            // A variation the group does not have would otherwise read as an
+            // empty database, and a master could not tell the two apart. An
+            // octet string's variation is its length, so it has no table row.
+            if (h.Variation != 0 && pt != PointType.OctetString &&
+                !ObjectRegistry.TryLookup(Database.StaticGroupVar(pt, h.Variation), out _))
             {
                 a.Iin = a.Iin.Set(Iin.ObjectUnknown);
                 continue;
@@ -1577,6 +1887,81 @@ public sealed partial class OutstationSession
         SendFragments(a, r, frag.Header, b.Done(), selected.Count > 0);
     }
 
+    /// <summary>
+    /// Returns the octets of the first time object in a write, skipping the
+    /// object's index prefix when the qualifier carries one.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ObjectHeader.Data"/> includes per-object index prefixes, and
+    /// both qualifiers 0x17 and 0x28 are legal for a write: reading Data from
+    /// its first octet would take the index for the top of the timestamp and
+    /// set a garbage clock.
+    /// </remarks>
+    private static bool TryTimeWriteData(ObjectHeader h, out ReadOnlySpan<byte> stamp)
+    {
+        var skip = h.Qualifier.IndexPrefix.Octets();
+        if (h.Data.Length < skip + CommandObjects.Time48Size)
+        {
+            stamp = default;
+            return false;
+        }
+
+        stamp = h.Data.Span.Slice(skip, CommandObjects.Time48Size);
+        return true;
+    }
+
+    /// <summary>
+    /// Reports whether a variation of an event group exists. An octet string
+    /// event's variation is its length, so it has no table row and only the
+    /// "any" variation is a request that means anything.
+    /// </summary>
+    private static bool EventVariationKnown(PointType pt, byte variation)
+    {
+        if (pt == PointType.Dataset)
+        {
+            return variation == 1;
+        }
+
+        if (pt is PointType.OctetString or PointType.VirtualTerminal)
+        {
+            return false;
+        }
+
+        if (pt is PointType.BinaryCommandEvent or PointType.AnalogCommandEvent)
+        {
+            return CommandEventCodec.TrySize(ResponseWriter.EventGroup(pt), variation, out _);
+        }
+
+        return ObjectRegistry.TryLookup(GroupVar.GV(ResponseWriter.EventGroup(pt), variation), out _);
+    }
+
+    /// <summary>
+    /// Says how many events an event read asks for: the count when the range is
+    /// one, every event when it is "all objects". Any other range — a
+    /// start-stop, or an index prefix — means nothing for events, which have no
+    /// stable index to range over, and is not a limit at all.
+    /// </summary>
+    private static bool TryEventReadLimit(ObjectHeader h, out int limit)
+    {
+        limit = 0;
+        if (h.Qualifier.IndexPrefix != IndexPrefix.None)
+        {
+            return false;
+        }
+
+        switch (h.Range.Spec)
+        {
+            case RangeSpec.AllObjects:
+                limit = int.MaxValue;
+                return true;
+            case RangeSpec.Count8 or RangeSpec.Count16 or RangeSpec.Count32:
+                limit = (int)Math.Min(h.Range.Count, int.MaxValue);
+                return true;
+            default:
+                return false;
+        }
+    }
+
     /// <summary>Handles the write function code.</summary>
     private void OnWrite(Association a, Received r, Fragment frag)
     {
@@ -1590,6 +1975,30 @@ public sealed partial class OutstationSession
 
         foreach (var h in frag.Objects)
         {
+            if (h.Group is >= 85 and <= 87)
+            {
+                WriteDatasets(a, h);
+                continue;
+            }
+
+            if (h.Group == 0)
+            {
+                WriteAttribute(a, h);
+                continue;
+            }
+
+            if (h.Group == 50 && h.Variation == 4)
+            {
+                WriteTimeIntervals(a, h);
+                continue;
+            }
+
+            if (h.Group == 112)
+            {
+                WriteTerminals(a, h);
+                continue;
+            }
+
             if (h.Group == 80 && h.Variation == 1)
             {
                 // A master clears DEVICE_RESTART by writing zero to index 7.
@@ -1626,13 +2035,13 @@ public sealed partial class OutstationSession
                     continue;
                 }
 
-                if (h.Data.Length < CommandObjects.Time48Size)
+                if (!TryTimeWriteData(h, out var recordedStamp))
                 {
                     a.Iin = a.Iin.Set(Iin.ParameterError);
                     continue;
                 }
 
-                var recorded = CommandObjects.ParseTime48(h.Data.Span);
+                var recorded = CommandObjects.ParseTime48(recordedStamp);
                 var elapsed = _appl.Now() - reference;
                 if (_appl.WriteAbsoluteTime(recorded.Time + elapsed))
                 {
@@ -1660,13 +2069,13 @@ public sealed partial class OutstationSession
                     continue;
                 }
 
-                if (h.Data.Length < CommandObjects.Time48Size)
+                if (!TryTimeWriteData(h, out var stamp))
                 {
                     a.Iin = a.Iin.Set(Iin.ParameterError);
                     continue;
                 }
 
-                var ts = CommandObjects.ParseTime48(h.Data.Span);
+                var ts = CommandObjects.ParseTime48(stamp);
                 if (_appl.WriteAbsoluteTime(ts.Time))
                 {
                     _synchronized = true;
@@ -1831,25 +2240,46 @@ public sealed partial class OutstationSession
     private void OnRestart(Association a, Received r, Fragment frag)
     {
         TimeSpan d;
-        if (frag.Header.Func == FuncCode.ColdRestart)
+        var now = _appl.Now();
+        var until = new DateTimeOffset(Interlocked.Read(ref _restartUntilTicks), TimeSpan.Zero);
+        if (now < until)
         {
-            d = _appl.ColdRestart();
-            _db.ResetEvents();
+            // A restart already under way. Doing it again would restart what has
+            // not finished restarting, so the request is understood but not
+            // repeated, and the delay reported is what is left of the first.
+            d = until - now;
+            a.Iin = a.Iin.Set(Iin.AlreadyExecuting);
         }
         else
         {
-            d = _appl.WarmRestart();
+            if (frag.Header.Func == FuncCode.ColdRestart)
+            {
+                d = _appl.ColdRestart();
+                _db.ResetEvents();
+            }
+            else
+            {
+                d = _appl.WarmRestart();
+            }
+
+            if (d > TimeSpan.Zero)
+            {
+                Interlocked.Exchange(ref _restartUntilTicks, (_appl.Now() + d).UtcTicks);
+            }
+
+            _deviceRestart = true;
+            _synchronized = false;
+            a.Iin = a.Iin.Set(Iin.DeviceRestart);
         }
 
-        _deviceRestart = true;
-        _synchronized = false;
-        a.Iin = a.Iin.Set(Iin.DeviceRestart);
-
-        foreach (var other in Attached())
+        if (!a.Iin.Has(Iin.AlreadyExecuting))
         {
-            if (!ReferenceEquals(other, a))
+            foreach (var other in Attached())
             {
-                other.RestartPending = true;
+                if (!ReferenceEquals(other, a))
+                {
+                    other.RestartPending = true;
+                }
             }
         }
 
@@ -2074,7 +2504,10 @@ public sealed partial class OutstationSession
             Fin: last,
             Con: needConfirm,
             Uns: false,
-            Seq: a.PendingSeq);
+            // The first fragment answers the request under its sequence number
+            // and each later one increments it, so a confirm names exactly the
+            // fragment it acknowledges.
+            Seq: (byte)((a.PendingSeq + i) % AppConstants.SeqModulus));
 
         var frag = new List<byte>(AppConstants.ResponseHeaderSize + bodies[i].Length);
         HeaderCodec.AppendHeader(frag, new AppHeader(ctrl, FuncCode.Response, CurrentIin(a)));
@@ -2225,7 +2658,7 @@ public sealed partial class OutstationSession
     /// </summary>
     private Iin CurrentIin(Association a)
     {
-        var iin = a.Iin;
+        var iin = a.Iin | new Iin((ushort)Volatile.Read(ref _indications));
 
         var classes = a.Events.Classes();
         if ((classes & Class.Class1) != 0)
@@ -2345,7 +2778,7 @@ public sealed partial class OutstationSession
     /// a group 20 header freezes only those: freezing the lot regardless
     /// overwrites frozen values the master never asked to change.
     /// </remarks>
-    private void OnFreeze(Association a, Fragment frag)
+    private void OnFreeze(Association a, Fragment frag, bool clear)
     {
         // Every counter frozen by one request shares the one moment of the
         // freeze, taken from the application's clock and only as trustworthy as
@@ -2354,16 +2787,28 @@ public sealed partial class OutstationSession
         var now = _appl.Now();
         var at = _synchronized ? Timestamp.Now(now) : Timestamp.Unsynchronized(now);
 
-        void Freeze(ushort start, ushort stop) => _db.FreezeCounters(start, stop, at);
+        void Freeze(ushort start, ushort stop) => _db.FreezeCounters(start, stop, at, clear);
+        void FreezeAnalog(ushort start, ushort stop) => _db.FreezeAnalogs(start, stop, at, clear);
 
         if (frag.Objects.Count == 0)
         {
             Freeze(0, 0xFFFF);
+            FreezeAnalog(0, 0xFFFF);
             return;
         }
 
         foreach (var h in frag.Objects)
         {
+            if (h.Group == 30)
+            {
+                if (!TryForEachPointRun(h, FreezeAnalog))
+                {
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
+                }
+
+                continue;
+            }
+
             if (h.Group != 20)
             {
                 a.Iin = a.Iin.Set(Iin.ObjectUnknown);
@@ -2388,6 +2833,9 @@ public sealed partial class OutstationSession
             case 20 or 22: pt = PointType.Counter; return true;
             case 21 or 23: pt = PointType.FrozenCounter; return true;
             case 30 or 32: pt = PointType.Analog; return true;
+            case 31 or 33: pt = PointType.FrozenAnalog; return true;
+            case 87 or 88: pt = PointType.Dataset; return true;
+            case 112 or 113: pt = PointType.VirtualTerminal; return true;
             case 40 or 42: pt = PointType.AnalogOutputStatus; return true;
             default: pt = PointType.Unknown; return false;
         }

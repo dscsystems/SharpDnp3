@@ -104,7 +104,10 @@ internal sealed class Harness : IAsyncDisposable
     /// <summary>The sequence number the last request went out with.</summary>
     public byte Seq { get; private set; }
 
-    public Harness(OutstationConfig config, ICommandHandler? commands = null)
+    public Harness(
+        OutstationConfig config,
+        ICommandHandler? commands = null,
+        IOutstationApplication? application = null)
     {
         if (config.LocalAddr == 0)
         {
@@ -125,7 +128,7 @@ internal sealed class Harness : IAsyncDisposable
         _masterChannel = masterChannel;
         _outstationChannel = outstationChannel;
 
-        Outstation = new OutstationSession(config, null, commands);
+        Outstation = new OutstationSession(config, application, commands);
         _outstationTask = Outstation.RunAsync(_outstationChannel, _cts.Token);
 
         _conn = _masterChannel.ConnectAsync(_cts.Token).GetAwaiter().GetResult();
@@ -220,6 +223,25 @@ internal sealed class Harness : IAsyncDisposable
         var frag = FragmentFactory.BuildRequest(control, fc, objects);
         _txStack.Send(_sink, frag);
         await FlushAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Transmits an application fragment exactly as given.</summary>
+    public async Task SendRawAsync(byte[] fragment)
+    {
+        _txStack.Send(_sink, fragment);
+        await FlushAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Fails if the outstation says anything after <paramref name="before"/>
+    /// fragments.
+    /// </summary>
+    public async Task ExpectSilenceAsync(int before)
+    {
+        await Task.Delay(150).ConfigureAwait(false);
+        Assert.True(
+            Count == before,
+            $"the outstation answered a message it should have discarded ({Count - before} new fragment(s))");
     }
 
     /// <summary>

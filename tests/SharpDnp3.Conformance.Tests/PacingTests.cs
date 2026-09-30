@@ -59,7 +59,7 @@ public class PacingTests
         await using var h = new Harness(new OutstationConfig { Database = Requests.SmallDatabase() });
 
         var control = new AppControl(Fir: true, Fin: true, Con: false, Uns: false, Seq: 3);
-        var unknown = FragmentFactory.ReadRange(88, 1, 0, 1);
+        var unknown = FragmentFactory.ReadRange(84, 1, 0, 1);
 
         var before = h.Count;
         await h.SendWithControlAsync(control, FuncCode.Read, unknown);

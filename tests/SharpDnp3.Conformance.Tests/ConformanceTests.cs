@@ -99,7 +99,7 @@ public class ConformanceTests
     {
         await using var h = new Harness(Config());
 
-        var resp = await h.RequestAsync(FuncCode.Read, FragmentFactory.ReadRange(88, 1, 0, 1));
+        var resp = await h.RequestAsync(FuncCode.Read, FragmentFactory.ReadRange(84, 1, 0, 1));
         Assert.True(
             resp.Header.Iin.Has(Iin.ObjectUnknown),
             $"IIN = {resp.Header.Iin}, want OBJECT_UNKNOWN");

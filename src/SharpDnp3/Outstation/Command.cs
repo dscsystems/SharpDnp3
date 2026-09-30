@@ -299,6 +299,18 @@ public sealed partial class OutstationSession
 
         foreach (var h in frag.Objects)
         {
+            // Pattern control (g12v2, with its g12v3 mask) operates a set of
+            // points named by a bit mask, which is not what a CROB does.
+            // Handing a pattern control block to the handler as though it were
+            // a CROB would operate the one point it names and call the rest
+            // done, so both are refused as objects this outstation does not
+            // have. Only g12v1 is a CROB.
+            if (h.Group == 12 && h.Variation != 1)
+            {
+                a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                continue;
+            }
+
             if (!ObjectRegistry.TryLookup(GroupVar.GV(h.Group, h.Variation), out var d) ||
                 d.Kind != Kind.Command)
             {
@@ -349,6 +361,10 @@ public sealed partial class OutstationSession
                 else if (status.OK())
                 {
                     status = RunCommand(h.Group, h.Variation, index, raw, selecting, opType);
+                    if (!selecting)
+                    {
+                        RecordCommandEvent(h.Group, h.Variation, index, raw, status);
+                    }
                 }
 
                 outcomes.Add(new CommandOutcome(wide, status));
@@ -376,6 +392,48 @@ public sealed partial class OutstationSession
         return ([.. body], outcomes);
     }
 
+    /// <summary>Records an operated control as a group 13 or 43 event.</summary>
+    /// <remarks>
+    /// Only a control that reached the handler is recorded: a SELECT reserves
+    /// nothing and moves nothing, and one refused before the handler saw it — a
+    /// missing selection, an index no point has — never happened as far as the
+    /// device is concerned. What the handler answered is recorded whatever it
+    /// was, since a refused operate is as much part of the record as an
+    /// accepted one.
+    /// </remarks>
+    private void RecordCommandEvent(
+        byte group, byte variation, ushort index, ReadOnlySpan<byte> raw, CommandStatus status)
+    {
+        var now = _appl.Now();
+        switch (group)
+        {
+            case 12:
+            {
+                if (variation != 1)
+                {
+                    return;
+                }
+
+                var c = CommandObjects.ParseCrob(raw);
+                var state = c.Code.IsClose();
+                if (!c.Code.IsClose() && !c.Code.IsTrip())
+                {
+                    state = c.Code.OpType() == ControlCode.LatchOn || c.Code.OpType() == ControlCode.PulseOn;
+                }
+
+                _db.RaiseBinaryCommandEvent(index, state, status, now);
+                break;
+            }
+
+            case 41:
+            {
+                var v = ParseAnalogOutput(variation, raw);
+                _db.RaiseAnalogCommandEvent(index, v.Value, variation, status, now);
+                break;
+            }
+        }
+    }
+
     /// <summary>Decodes one command object and hands it to the handler.</summary>
     private CommandStatus RunCommand(
         byte group,
@@ -389,6 +447,11 @@ public sealed partial class OutstationSession
         {
             case 12:
             {
+                if (variation != 1)
+                {
+                    return CommandStatus.NotSupported;
+                }
+
                 var c = CommandObjects.ParseCrob(raw);
                 return selecting
                     ? _cmds.SelectCrob(index, c)

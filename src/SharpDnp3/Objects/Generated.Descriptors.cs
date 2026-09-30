@@ -1185,6 +1185,67 @@ public static partial class ObjectRegistry
             SizeBits = 1,
             Packed = true,
         },
+        [GroupVar.GV(86, 2)] = new Descriptor
+        {
+            GV = GroupVar.GV(86, 2),
+            Name = "DatasetCharacteristics",
+            Level = 4,
+            Kind = Kind.Attribute,
+            Measurement = PointType.Unknown,
+            SizeBits = 8,
+        },
+        [GroupVar.GV(120, 3)] = new Descriptor
+        {
+            GV = GroupVar.GV(120, 3),
+            Name = "AuthenticationAggressiveRequest",
+            Level = 4,
+            Kind = Kind.Time,
+            Measurement = PointType.Unknown,
+            SizeBits = 48,
+        },
+        [GroupVar.GV(120, 4)] = new Descriptor
+        {
+            GV = GroupVar.GV(120, 4),
+            Name = "AuthenticationKeyStatusRequest",
+            Level = 4,
+            Kind = Kind.Time,
+            Measurement = PointType.Unknown,
+            SizeBits = 16,
+        },
+        [GroupVar.GV(121, 1)] = new Descriptor
+        {
+            GV = GroupVar.GV(121, 1),
+            Name = "SecurityStatistic",
+            Level = 4,
+            Kind = Kind.Static,
+            Measurement = PointType.Unknown,
+            SizeBits = 56,
+            HasFlags = true,
+            ValueBits = 32,
+        },
+        [GroupVar.GV(122, 1)] = new Descriptor
+        {
+            GV = GroupVar.GV(122, 1),
+            Name = "SecurityStatisticEvent",
+            Level = 4,
+            Kind = Kind.Event,
+            Measurement = PointType.Unknown,
+            SizeBits = 56,
+            HasFlags = true,
+            ValueBits = 32,
+        },
+        [GroupVar.GV(122, 2)] = new Descriptor
+        {
+            GV = GroupVar.GV(122, 2),
+            Name = "SecurityStatisticEventTime",
+            Level = 4,
+            Kind = Kind.Event,
+            Measurement = PointType.Unknown,
+            SizeBits = 104,
+            HasFlags = true,
+            HasTime = true,
+            ValueBits = 32,
+        },
     };
 
     /// <summary>
@@ -1207,5 +1268,12 @@ public static partial class ObjectRegistry
     [
         0, // DeviceAttribute
         70, // FileTransfer
+        85, // DatasetPrototype
+        86, // DatasetDescriptor
+        87, // DatasetPresentValue
+        88, // DatasetSnapshot
+        90, // ApplicationIdentifier
+        91, // ActivationResult
+        120, // AuthenticationChallenge
     ];
 }

@@ -344,6 +344,40 @@ public sealed partial class OutstationSession
             ("seq", a.Unsol.Seq), ("attempt", a.Unsol.Retries));
     }
 
+    /// <summary>
+    /// Returns how many of <paramref name="events"/>, taken in order, fit in one
+    /// unsolicited fragment. A single event too large for the limit is still
+    /// reported alone.
+    /// </summary>
+    private int EventsThatFit(Association a, IReadOnlyList<Event> events)
+    {
+        var ctx = new Context { Synchronized = _synchronized };
+
+        bool Fits(int n)
+        {
+            var b = new ResponseBuilder(_cfg.MaxTxFragment, ctx);
+            _writer.BuildEvents(b, [.. events.Take(n)], _appl.Now);
+            return b.Done().Count == 1;
+        }
+
+        // The answer is in [lo, hi]; one is always allowed.
+        int lo = 1, hi = events.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi + 1) / 2;
+            if (Fits(mid))
+            {
+                lo = mid;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+
+        return lo;
+    }
+
     /// <summary>Transmits one unsolicited response.</summary>
     private void SendUnsolicited(
         Association a,
@@ -351,20 +385,27 @@ public sealed partial class OutstationSession
         DateTimeOffset now,
         bool isNull)
     {
+        // An unsolicited response is a single fragment. If the events do not
+        // fit, the rest stay queued for the next one rather than being split
+        // across a series the master would have to reassemble without having
+        // asked for it. They have to be handed back as well as left out:
+        // confirming the response removes every event that is still selected,
+        // including the ones that were never sent.
+        if (!isNull)
+        {
+            var fit = EventsThatFit(a, events);
+            a.Events.Release([.. events.Skip(fit)]);
+            events = [.. events.Take(fit)];
+        }
+
         var ctx = new Context { Synchronized = _synchronized };
         var b = new ResponseBuilder(_cfg.MaxTxFragment, ctx);
         if (!isNull)
         {
-            _writer.BuildEvents(b, events);
+            _writer.BuildEvents(b, events, _appl.Now, e => a.Events.Release([e]));
         }
 
-        var bodies = b.Done();
-
-        // An unsolicited response is a single fragment. If the events do not
-        // fit, the rest stay queued for the next one rather than being split
-        // across a series the master would have to reassemble without having
-        // asked for it.
-        var body = bodies[0];
+        var body = b.Done()[0];
 
         // Every transmission through here is a new one, carrying data the
         // master has not been offered before, so it takes the next sequence

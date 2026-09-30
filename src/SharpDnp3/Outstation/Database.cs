@@ -34,6 +34,21 @@ public record struct PointConfig
     /// is ignored for binary types, which event on any change.
     /// </summary>
     public double Deadband { get; set; }
+
+    /// <summary>
+    /// The class of the command events (groups 13 and 43) recorded when a
+    /// control is operated on this output point. It applies to binary and
+    /// analog output status points only, and <see cref="Class.None"/>, the
+    /// default, records none.
+    /// </summary>
+    public Class CommandEventClass { get; set; }
+
+    /// <summary>
+    /// The group 13 or 43 variation those events are reported in. Zero mirrors
+    /// the command: the variation with a time whose value has the width of the
+    /// command's own.
+    /// </summary>
+    public byte CommandEventVariation { get; set; }
 }
 
 /// <summary>
@@ -55,6 +70,15 @@ public sealed class DatabaseConfig
 
     /// <summary>How many analog inputs.</summary>
     public int Analog { get; set; }
+
+    /// <summary>How many frozen analog inputs, which have storage of their own.</summary>
+    public int FrozenAnalog { get; set; }
+
+    /// <summary>How many indexed time-and-interval values (group 50 variation 4).</summary>
+    public int TimeAndInterval { get; set; }
+
+    /// <summary>How many virtual terminal ports.</summary>
+    public int VirtualTerminal { get; set; }
 
     /// <summary>How many binary output status points.</summary>
     public int BinaryOutputStatus { get; set; }
@@ -144,13 +168,16 @@ internal sealed class Point<T>
 /// Access goes through <c>OutstationSession.Update</c> and the session's own
 /// loop, which serialises it.
 /// </remarks>
-public sealed class Database
+public sealed partial class Database
 {
     private readonly Point<Binary>[] _binary;
     private readonly Point<DoubleBitBinary>[] _doubleBit;
     private readonly Point<Counter>[] _counter;
     private readonly Point<FrozenCounter>[] _frozen;
     private readonly Point<Analog>[] _analog;
+    private readonly Point<Analog>[] _frozenAnalog;
+    private readonly TimeAndInterval[] _timeAndInterval;
+    private readonly Point<byte[]>[] _terminal;
     private readonly Point<BinaryOutputStatus>[] _binaryOut;
     private readonly Point<AnalogOutputStatus>[] _analogOut;
     private readonly Point<byte[]>[] _octet;
@@ -275,6 +302,7 @@ public sealed class Database
         PointType.DoubleBitBinary => 2,    // g3v2
         PointType.Counter => 1,            // g20v1, 32-bit with flags
         PointType.FrozenCounter => 1,      // g21v1
+        PointType.FrozenAnalog => 1,       // g31v1
         PointType.Analog => 1,             // g30v1, 32-bit with flags
         PointType.BinaryOutputStatus => 2, // g10v2
         PointType.AnalogOutputStatus => 1, // g40v1
@@ -287,6 +315,7 @@ public sealed class Database
         PointType.DoubleBitBinary => 2,    // g4v2
         PointType.Counter => 5,            // g22v5, with time
         PointType.FrozenCounter => 5,      // g23v5
+        PointType.FrozenAnalog => 3,       // g33v3
         PointType.Analog => 3,             // g32v3, 32-bit with time
         PointType.BinaryOutputStatus => 2, // g11v2
         PointType.AnalogOutputStatus => 3, // g42v3
@@ -306,6 +335,11 @@ public sealed class Database
         _frozen = MakePoints<FrozenCounter>(
             config.FrozenCounter, PointType.FrozenCounter, config.DefaultClass);
         _analog = MakePoints<Analog>(config.Analog, PointType.Analog, config.DefaultClass);
+        _frozenAnalog = MakePoints<Analog>(
+            config.FrozenAnalog, PointType.FrozenAnalog, config.DefaultClass);
+        _timeAndInterval = new TimeAndInterval[Math.Max(config.TimeAndInterval, 0)];
+        _terminal = MakePoints<byte[]>(
+            config.VirtualTerminal, PointType.VirtualTerminal, config.DefaultClass);
         _binaryOut = MakePoints<BinaryOutputStatus>(
             config.BinaryOutputStatus, PointType.BinaryOutputStatus, config.DefaultClass);
         _analogOut = MakePoints<AnalogOutputStatus>(
@@ -340,6 +374,9 @@ public sealed class Database
         Counter = _counter.Length,
         FrozenCounter = _frozen.Length,
         Analog = _analog.Length,
+        FrozenAnalog = _frozenAnalog.Length,
+        TimeAndInterval = _timeAndInterval.Length,
+        VirtualTerminal = _terminal.Length,
         BinaryOutputStatus = _binaryOut.Length,
         AnalogOutputStatus = _analogOut.Length,
         OctetString = _octet.Length,
@@ -362,6 +399,8 @@ public sealed class Database
                 PointType.Counter => SetConfig(_counter, index, config),
                 PointType.FrozenCounter => SetConfig(_frozen, index, config),
                 PointType.Analog => SetConfig(_analog, index, config),
+                PointType.FrozenAnalog => SetConfig(_frozenAnalog, index, config),
+                PointType.VirtualTerminal => SetConfig(_terminal, index, config),
                 PointType.BinaryOutputStatus => SetConfig(_binaryOut, index, config),
                 PointType.AnalogOutputStatus => SetConfig(_analogOut, index, config),
                 PointType.OctetString => SetConfig(_octet, index, config),
@@ -416,11 +455,14 @@ public sealed class Database
                 case PointType.Counter: AssignClass(_counter, cls, start, stop); break;
                 case PointType.FrozenCounter: AssignClass(_frozen, cls, start, stop); break;
                 case PointType.Analog: AssignClass(_analog, cls, start, stop); break;
+                case PointType.FrozenAnalog: AssignClass(_frozenAnalog, cls, start, stop); break;
+                case PointType.VirtualTerminal: AssignClass(_terminal, cls, start, stop); break;
                 case PointType.BinaryOutputStatus:
                     AssignClass(_binaryOut, cls, start, stop); break;
                 case PointType.AnalogOutputStatus:
                     AssignClass(_analogOut, cls, start, stop); break;
                 case PointType.OctetString: AssignClass(_octet, cls, start, stop); break;
+                case PointType.Dataset: AssignDatasetClass(cls, start, stop); break;
                 default: break;
             }
         }
@@ -531,22 +573,28 @@ public sealed class Database
                 return;
             }
 
-            var p = _counter[index];
-            var flagsChanged = p.Value.Flags != v.Flags;
-            var valueChanged = p.Value.Value != v.Value;
-            p.Value = v;
+            SetCounter(index, v);
+        }
+    }
 
-            if ((flagsChanged || valueChanged) && p.ShouldReport(v.Value, flagsChanged))
+    /// <summary>Stores a counter and raises an event if it moved enough. The caller holds the lock.</summary>
+    private void SetCounter(int index, Counter v)
+    {
+        var p = _counter[index];
+        var flagsChanged = p.Value.Flags != v.Flags;
+        var valueChanged = p.Value.Value != v.Value;
+        p.Value = v;
+
+        if ((flagsChanged || valueChanged) && p.ShouldReport(v.Value, flagsChanged))
+        {
+            Raise(p.Config, new Event
             {
-                Raise(p.Config, new Event
-                {
-                    Type = PointType.Counter,
-                    Index = index,
-                    Variation = p.Config.EventVariation,
-                    Counter = v,
-                    Time = v.Time,
-                });
-            }
+                Type = PointType.Counter,
+                Index = (ushort)index,
+                Variation = p.Config.EventVariation,
+                Counter = v,
+                Time = v.Time,
+            });
         }
     }
 
@@ -596,6 +644,206 @@ public sealed class Database
                     Time = v.Time,
                 });
             }
+        }
+    }
+
+    /// <summary>Stores a frozen analog snapshot and applies its own event deadband.</summary>
+    public void UpdateFrozenAnalog(ushort index, Analog v)
+    {
+        lock (_gate)
+        {
+            if (index < _frozenAnalog.Length)
+            {
+                SetFrozenAnalog(index, v);
+            }
+        }
+    }
+
+    private void SetFrozenAnalog(int index, Analog v)
+    {
+        var p = _frozenAnalog[index];
+        var flagsChanged = p.Value.Flags != v.Flags;
+        p.Value = v;
+        if (p.ShouldReport(v.Value, flagsChanged))
+        {
+            Raise(p.Config, new Event
+            {
+                Type = PointType.FrozenAnalog,
+                Index = (ushort)index,
+                Variation = p.Config.EventVariation,
+                FrozenAnalog = v,
+                Time = v.Time,
+            });
+        }
+    }
+
+    /// <summary>Snapshots every analog that has a frozen counterpart.</summary>
+    public void FreezeAnalogs() =>
+        FreezeAnalogs(0, 0xFFFF, Timestamp.Unsynchronized(DateTimeOffset.UtcNow), false);
+
+    /// <summary>
+    /// Freezes the analogs from <paramref name="start"/> through
+    /// <paramref name="stop"/>; with <paramref name="clear"/> each running
+    /// analog is zeroed afterwards, as FREEZE_CLEAR does.
+    /// </summary>
+    public void FreezeAnalogs(ushort start, ushort stop, Timestamp at, bool clear)
+    {
+        lock (_gate)
+        {
+            var n = Math.Min(_analog.Length, _frozenAnalog.Length);
+            for (var i = (int)start; i <= stop && i < n; i++)
+            {
+                var v = _analog[i].Value with { Time = at };
+                SetFrozenAnalog(i, v);
+                if (!clear)
+                {
+                    continue;
+                }
+
+                var p = _analog[i];
+                v = v with { Value = 0 };
+                p.Value = v;
+                if (p.ShouldReport(0, false))
+                {
+                    Raise(p.Config, new Event
+                    {
+                        Type = PointType.Analog,
+                        Index = (ushort)i,
+                        Variation = p.Config.EventVariation,
+                        Analog = v,
+                        Time = at,
+                    });
+                }
+            }
+        }
+    }
+
+    /// <summary>Stores an indexed time-and-interval value; these generate no events.</summary>
+    /// <returns><see langword="false"/> when the index does not exist.</returns>
+    public bool UpdateTimeAndInterval(ushort index, TimeAndInterval v)
+    {
+        lock (_gate)
+        {
+            if (index >= _timeAndInterval.Length)
+            {
+                return false;
+            }
+
+            _timeAndInterval[index] = v;
+            return true;
+        }
+    }
+
+    /// <summary>Queues new terminal input as a group 113 event.</summary>
+    public void UpdateVirtualTerminal(ushort index, ReadOnlySpan<byte> v)
+    {
+        lock (_gate)
+        {
+            if (index >= _terminal.Length || v.Length is 0 or > 255)
+            {
+                return;
+            }
+
+            var p = _terminal[index];
+            p.Value = v.ToArray();
+            Raise(p.Config, new Event
+            {
+                Type = PointType.VirtualTerminal,
+                Index = index,
+                Variation = (byte)v.Length,
+                OctetString = p.Value,
+            });
+        }
+    }
+
+    /// <summary>
+    /// Records that a control was operated on a binary output, as a group 13
+    /// event, if the point has a command event class.
+    /// </summary>
+    /// <param name="index">The output point.</param>
+    /// <param name="state">The state the output was commanded to.</param>
+    /// <param name="status">The outcome the outstation reported for the command.</param>
+    /// <param name="at">When it was operated.</param>
+    public void RaiseBinaryCommandEvent(ushort index, bool state, CommandStatus status, DateTimeOffset at)
+    {
+        lock (_gate)
+        {
+            if (index >= _binaryOut.Length)
+            {
+                return;
+            }
+
+            var cfg = _binaryOut[index].Config;
+            if (cfg.CommandEventClass == Class.None)
+            {
+                return;
+            }
+
+            var variation = cfg.CommandEventVariation is 1 or 2 ? cfg.CommandEventVariation : (byte)2;
+            RaiseWithClass(cfg.CommandEventClass, new Event
+            {
+                Type = PointType.BinaryCommandEvent,
+                Index = index,
+                Variation = variation,
+                Time = Timestamp.Now(at),
+                CommandStatus = status,
+                CommandState = state,
+            });
+        }
+    }
+
+    /// <summary>
+    /// Records that a control was operated on an analog output, as a group 43
+    /// event, if the point has a command event class.
+    /// </summary>
+    /// <param name="index">The output point.</param>
+    /// <param name="value">The value the output was commanded to.</param>
+    /// <param name="commandVariation">
+    /// The group 41 variation the command arrived in, which decides the event's
+    /// width when the point does not name one.
+    /// </param>
+    /// <param name="status">The outcome the outstation reported for the command.</param>
+    /// <param name="at">When it was operated.</param>
+    public void RaiseAnalogCommandEvent(
+        ushort index, double value, byte commandVariation, CommandStatus status, DateTimeOffset at)
+    {
+        lock (_gate)
+        {
+            if (index >= _analogOut.Length)
+            {
+                return;
+            }
+
+            var cfg = _analogOut[index].Config;
+            if (cfg.CommandEventClass == Class.None)
+            {
+                return;
+            }
+
+            var variation = cfg.CommandEventVariation;
+            if (variation is < 1 or > 8)
+            {
+                // Mirror the command, with a time: g41v1 (int32) -> g43v3, g41v2
+                // (int16) -> g43v4, g41v3 (float) -> g43v7, g41v4 (double) ->
+                // g43v8.
+                variation = commandVariation switch
+                {
+                    2 => 4,
+                    3 => 7,
+                    4 => 8,
+                    _ => 3,
+                };
+            }
+
+            RaiseWithClass(cfg.CommandEventClass, new Event
+            {
+                Type = PointType.AnalogCommandEvent,
+                Index = index,
+                Variation = variation,
+                Time = Timestamp.Now(at),
+                CommandStatus = status,
+                CommandValue = value,
+            });
         }
     }
 
@@ -675,14 +923,16 @@ public sealed class Database
     /// so the first master to poll would take the events and the second would
     /// never learn they happened.
     /// </remarks>
-    private void Raise(PointConfig config, Event e)
+    private void Raise(PointConfig config, Event e) => RaiseWithClass(config.Class, e);
+
+    private void RaiseWithClass(Class cls, Event e)
     {
-        if (config.Class == Class.None)
+        if (cls == Class.None)
         {
             return;
         }
 
-        e.Class = config.Class;
+        e.Class = cls;
 
         var subscribers = _subscribers;
         if (subscribers.Length == 0)
@@ -741,6 +991,46 @@ public sealed class Database
         lock (_gate)
         {
             return Get(_analog, index, out value, out config);
+        }
+    }
+
+    /// <summary>Returns a frozen analog input, which is independent of the running input.</summary>
+    public bool TryGetFrozenAnalog(ushort index, out Analog value, out PointConfig config)
+    {
+        lock (_gate)
+        {
+            return Get(_frozenAnalog, index, out value, out config);
+        }
+    }
+
+    /// <summary>Returns an indexed time-and-interval value.</summary>
+    public bool TryGetTimeAndInterval(ushort index, out TimeAndInterval value)
+    {
+        lock (_gate)
+        {
+            if (index >= _timeAndInterval.Length)
+            {
+                value = default;
+                return false;
+            }
+
+            value = _timeAndInterval[index];
+            return true;
+        }
+    }
+
+    internal bool TryGetVirtualTerminal(ushort index, out byte[] value)
+    {
+        lock (_gate)
+        {
+            if (index >= _terminal.Length)
+            {
+                value = [];
+                return false;
+            }
+
+            value = _terminal[index].Value ?? [];
+            return true;
         }
     }
 
@@ -840,7 +1130,17 @@ public sealed class Database
     /// left event-driven masters to discover it only by reading the frozen
     /// counters outright.
     /// </remarks>
-    public void FreezeCounters(ushort start, ushort stop, Timestamp at)
+    public void FreezeCounters(ushort start, ushort stop, Timestamp at) =>
+        FreezeCounters(start, stop, at, false);
+
+    /// <summary>
+    /// Freezes the counters from <paramref name="start"/> through
+    /// <paramref name="stop"/>; with <paramref name="clear"/> each counter is
+    /// reset to zero once its value has been frozen, as FREEZE_CLEAR does, so
+    /// the frozen value holds what accumulated up to the freeze and the running
+    /// counter starts over.
+    /// </summary>
+    public void FreezeCounters(ushort start, ushort stop, Timestamp at, bool clear)
     {
         lock (_gate)
         {
@@ -851,6 +1151,10 @@ public sealed class Database
             {
                 var c = _counter[i].Value;
                 SetFrozen(i, new FrozenCounter(c.Value, c.Flags, at));
+                if (clear)
+                {
+                    SetCounter(i, new Counter(0, c.Flags, at));
+                }
             }
         }
     }
@@ -867,6 +1171,8 @@ public sealed class Database
             PointType.DoubleBitBinary => 3,
             PointType.Counter => 20,
             PointType.FrozenCounter => 21,
+            PointType.FrozenAnalog => 31,
+            PointType.VirtualTerminal => 112,
             PointType.Analog => 30,
             PointType.BinaryOutputStatus => 10,
             PointType.AnalogOutputStatus => 40,

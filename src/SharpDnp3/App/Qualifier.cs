@@ -200,6 +200,40 @@ public readonly struct Qualifier : IEquatable<Qualifier>
     /// </summary>
     public bool Reserved => (Value & 0x80) != 0;
 
+    /// <summary>
+    /// Reports whether the prefix and range specifier are a combination the
+    /// standard uses.
+    /// </summary>
+    /// <remarks>
+    /// Each is valid alone, but they compose only in some ways: an index prefix
+    /// goes with a count, since a range already says which indexes and a
+    /// per-object index would contradict it; a size prefix goes with the
+    /// variable-format range and the variable-format range with nothing else.
+    /// Qualifiers like 0x10, 0x26 or 0x0B are the result of composing them
+    /// freely.
+    /// </remarks>
+    public bool Consistent()
+    {
+        var p = IndexPrefix;
+        var r = RangeSpec;
+        if (Reserved || !p.Valid() || !r.Valid())
+        {
+            return false;
+        }
+
+        if (p.IsIndex())
+        {
+            return r is RangeSpec.Count8 or RangeSpec.Count16 or RangeSpec.Count32;
+        }
+
+        if (p.IsSize())
+        {
+            return r == RangeSpec.Variable;
+        }
+
+        return r != RangeSpec.Variable;
+    }
+
     /// <summary>Wraps a raw octet.</summary>
     public static implicit operator Qualifier(byte value) => new(value);
 

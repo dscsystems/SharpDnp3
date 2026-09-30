@@ -39,6 +39,11 @@ internal static partial class ObjectSizing
                 return true;
             }
 
+            if (GeneratedSizes.TryGetValue(Gv(group, variation), out bits))
+            {
+                return true;
+            }
+
             if (VariableGroups.Contains(group))
             {
                 // Genuinely variable-length. Reporting unknown makes the parser
