@@ -305,3 +305,43 @@ public class ExtendedIntegrationTests
         }
     }
 }
+
+public class SelfAddressTests
+{
+    /// <summary>
+    /// A master that does not know its outstation's address sends to the self
+    /// address and is answered from the real one. That has to work with link
+    /// confirmations too, where the acknowledgement of each frame also comes
+    /// from an address the master was not sent to.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DiscoveryWorksWithAndWithoutLinkConfirms(bool confirms)
+    {
+        await using var pair = new TestPair(
+            m =>
+            {
+                m.RemoteAddr = 0xFFFC;
+                m.UseLinkConfirms = confirms;
+                m.LinkTimeout = TimeSpan.FromMilliseconds(200);
+                m.LinkRetries = 1;
+                m.ResponseTimeout = TimeSpan.FromSeconds(1);
+            },
+            o =>
+            {
+                o.SelfAddress = true;
+                o.UseLinkConfirms = confirms;
+                o.LinkTimeout = TimeSpan.FromMilliseconds(200);
+                o.LinkRetries = 1;
+            });
+        await pair.WaitConnectedAsync();
+
+        // More than one exchange, so the state after discovery is used too.
+        for (var i = 0; i < 3; i++)
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+            await pair.Master.ScanClassesAsync(Class.Class0, cts.Token);
+        }
+    }
+}
