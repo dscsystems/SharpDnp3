@@ -427,7 +427,7 @@ internal sealed class Reassembler
             // unrecoverable, but the new one is perfectly good, so drop the
             // old, report it, and carry on rather than dropping both.
             var reported = DiscardReason.None;
-            if (_assembly && _len > 0)
+            if (_assembly)
             {
                 reported = DiscardReason.UnexpectedFir;
                 _stats.SegmentsDiscarded++;

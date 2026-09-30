@@ -265,7 +265,21 @@ internal sealed class Primary
             return (default, LinkAction.None);
         }
 
-        _dfc = f.Header.Control.Dfc;
+        // A secondary function carries no user data. A frame that does is
+        // malformed, and acting on it would take a reply for something it is
+        // not.
+        if (f.Payload.Length > 0)
+        {
+            return (default, LinkAction.None);
+        }
+
+        // DFC is the peer's answer to something we sent. Taken from a frame we
+        // were not waiting on it would latch flow control on an idle link,
+        // where nothing ever clears it and every later send is refused.
+        if (_state != PrimaryState.Idle)
+        {
+            _dfc = f.Header.Control.Dfc;
+        }
 
         switch (_state)
         {

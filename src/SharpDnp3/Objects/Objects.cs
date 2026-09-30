@@ -182,6 +182,14 @@ public readonly record struct Context
     /// <summary>Whether a common time of occurrence was seen.</summary>
     public bool HasCto { get; init; }
 
+    /// <summary>
+    /// Whether the clock that took the common time of occurrence was
+    /// synchronised, which group 51 carries in its variation: 1 synchronised,
+    /// 2 not. Relative times inherit it, and absolute times in the same
+    /// fragment do not.
+    /// </summary>
+    public bool CtoSynchronized { get; init; }
+
     /// <summary>Returns the quality to stamp on an absolute timestamp.</summary>
     public TimestampQuality TimeQuality() => Synchronized
         ? TimestampQuality.Synchronized
@@ -202,7 +210,7 @@ public readonly record struct Context
         : new Timestamp
         {
             Time = Cto.AddMilliseconds(offsetMillis),
-            Quality = TimeQuality(),
+            Quality = CtoSynchronized ? TimestampQuality.Synchronized : TimestampQuality.Unsynchronized,
         };
 
     /// <summary>
@@ -236,7 +244,21 @@ public readonly record struct Context
     /// Returns a copy of the context with its common time of occurrence set, as
     /// a parser does on encountering a group 51 object.
     /// </summary>
-    public Context WithCto(DateTimeOffset t) => this with { Cto = t, HasCto = true };
+    /// <remarks>
+    /// The base is taken to be as synchronised as the context is. A parser that
+    /// has read the group 51 object knows better, and uses
+    /// <see cref="WithGroup51"/>.
+    /// </remarks>
+    public Context WithCto(DateTimeOffset t) =>
+        this with { Cto = t, HasCto = true, CtoSynchronized = Synchronized };
+
+    /// <summary>
+    /// Returns a copy of the context with its common time of occurrence taken
+    /// from a group 51 object of the given variation: 1 is a base taken from a
+    /// synchronised clock, 2 from one that was not.
+    /// </summary>
+    public Context WithGroup51(DateTimeOffset t, byte variation) =>
+        WithCto(t) with { CtoSynchronized = variation == 1 };
 }
 
 /// <summary>Decodes one object of a measurement type.</summary>

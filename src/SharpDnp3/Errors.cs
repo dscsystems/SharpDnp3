@@ -43,6 +43,16 @@ public class Dnp3TimeoutException : Dnp3Exception
     public Dnp3TimeoutException(string message = "dnp3: timeout") : base(message) { }
 }
 
+/// <summary>
+/// The outstation answered a request but set an indication saying it refused
+/// it: PARAMETER_ERROR or OBJECT_UNKNOWN.
+/// </summary>
+public class RejectedException : Dnp3Exception
+{
+    /// <summary>Creates the exception with a message.</summary>
+    public RejectedException(string message = "dnp3: request rejected by peer") : base(message) { }
+}
+
 /// <summary>The session or channel has been shut down.</summary>
 public class ClosedException : Dnp3Exception
 {

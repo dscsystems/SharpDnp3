@@ -36,17 +36,52 @@ internal static class Dispatcher
             return;
         }
 
+        if (h.Group is >= 85 and <= 88)
+        {
+            if (handler is IDatasetHandler datasetHandler)
+            {
+                var kind = h.Group == 88 ? Kind.Event : Kind.Static;
+                var dinfo = new HeaderInfo { GV = gv, Kind = kind };
+                if (h.Group == 86 && h.Variation == 2)
+                {
+                    datasetHandler.HandleDataset(dinfo, h.Data.ToArray());
+                }
+                else
+                {
+                    try
+                    {
+                        foreach (var value in FreeFormat.Objects(h))
+                        {
+                            datasetHandler.HandleDataset(dinfo, value.ToArray());
+                        }
+                    }
+                    catch (MalformedException)
+                    {
+                        // A header whose objects cannot be walked delivers nothing.
+                    }
+                }
+            }
+
+            return;
+        }
+
         // Octet strings are checked before the registry lookup, not after:
         // their length lives in the variation number, so there is no descriptor
         // row for g110v5 to find. Looking them up first would silently drop
         // every string a device reports.
-        if (h.Group is GroupOctetString or GroupOctetStringEvent)
+        if (h.Group is GroupOctetString or GroupOctetStringEvent or 112 or 113)
         {
             DispatchOctetStrings(
                 handler,
                 h,
                 new HeaderInfo { GV = gv, Kind = Kind.String },
-                h.Group == GroupOctetStringEvent);
+                h.Group is GroupOctetStringEvent or 113);
+            return;
+        }
+
+        if (h.Group is 13 or 43)
+        {
+            DispatchCommandEvents(handler, h, new HeaderInfo { GV = gv, Kind = Kind.CommandEvent });
             return;
         }
 
@@ -99,7 +134,15 @@ internal static class Dispatcher
 
             case PointType.Analog:
                 ObjectRegistry.TryAnalogCodec(gv, out var ac);
-                handler.HandleAnalog(info, DecodeRun(h, size, prefixLen, ctx, ac.Parse));
+                if (handler is IFrozenAnalogHandler frozenAnalog && h.Group is 31 or 33)
+                {
+                    frozenAnalog.HandleFrozenAnalog(info, DecodeRun(h, size, prefixLen, ctx, ac.Parse));
+                }
+                else
+                {
+                    handler.HandleAnalog(info, DecodeRun(h, size, prefixLen, ctx, ac.Parse));
+                }
+
                 break;
 
             case PointType.BinaryOutputStatus:
@@ -160,6 +203,30 @@ internal static class Dispatcher
         }
 
         return output;
+    }
+
+    /// <summary>
+    /// Delivers group 13 and 43 objects to a handler that asks for them. They
+    /// record controls that were operated, so a handler that does not implement
+    /// <see cref="ICommandEventHandler"/> simply never sees them.
+    /// </summary>
+    private static void DispatchCommandEvents(IMasterHandler handler, ObjectHeader h, HeaderInfo info)
+    {
+        if (handler is not ICommandEventHandler ch || !CommandEventCodec.TrySize(h.Group, h.Variation, out var size))
+        {
+            return;
+        }
+
+        var prefixLen = h.Qualifier.IndexPrefix.IsIndex() ? h.Qualifier.IndexPrefix.Octets() : 0;
+        var vals = DecodeRun<CommandEvent>(h, size, prefixLen, default, (b, _) =>
+        {
+            CommandEventCodec.TryParse(h.Group, h.Variation, b, out var e);
+            return e;
+        });
+        if (vals.Count > 0)
+        {
+            ch.HandleCommandEvent(info, vals);
+        }
     }
 
     /// <summary>

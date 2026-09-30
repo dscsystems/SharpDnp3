@@ -866,6 +866,7 @@ public sealed partial class OutstationSession
                 UseConfirms = _cfg.UseLinkConfirms,
                 MaxRetries = _cfg.LinkRetries,
                 MaxRxFragment = _cfg.MaxRxFragment,
+                SelfAddress = _cfg.SelfAddress,
             }),
             RemoteAddr = _cfg.RemoteAddr,
 
