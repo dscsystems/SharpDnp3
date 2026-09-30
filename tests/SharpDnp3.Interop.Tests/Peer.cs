@@ -87,6 +87,10 @@ public sealed class PeerProcess : IAsyncDisposable
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+
+            // Held open so a peer that takes commands on stdin, and treats
+            // its end as a request to stop, is not told to stop at once.
+            RedirectStandardInput = true,
             UseShellExecute = false,
         };
 
@@ -146,6 +150,30 @@ public sealed class PeerProcess : IAsyncDisposable
         }
 
         return peer.StandardOutput + peer.StandardError;
+    }
+
+    /// <summary>Sends one line to the peer's standard input.</summary>
+    public async Task WriteLineAsync(string line)
+    {
+        await _process.StandardInput.WriteLineAsync(line).ConfigureAwait(false);
+        await _process.StandardInput.FlushAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Waits until the peer has printed a line containing <paramref name="text"/>.</summary>
+    public async Task WaitForOutputAsync(string text, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (StandardOutput.Contains(text, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            await Task.Delay(25).ConfigureAwait(false);
+        }
+
+        throw new TimeoutException($"the peer never printed '{text}'; output:\n{StandardOutput}\n{StandardError}");
     }
 
     /// <summary>Everything the peer has written to standard output.</summary>
