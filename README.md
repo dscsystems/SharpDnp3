@@ -164,7 +164,7 @@ SAv5 profile.
 
 | Path | What it is |
 | --- | --- |
-| `SharpDnp3.sln` | All nine projects, grouped into `src`, `tests` and `build` folders |
+| `SharpDnp3.sln` | All ten projects, grouped into `src`, `tests`, `conformance` and `build` folders |
 | `src/SharpDnp3/` | The library — the only thing that ships as a package |
 | `src/SharpDnp3.Tools.Explorer/` | `dnp3-explorer`, a terminal browser for one outstation |
 | `src/SharpDnp3.Tools.Master/` | `dnp3-master`, a poller, recorder and control tool |
@@ -173,6 +173,7 @@ SAv5 profile.
 | `tests/SharpDnp3.Tests/` | Unit and in-memory integration tests |
 | `tests/SharpDnp3.Conformance.Tests/` | Hand-built fragments checked against what the standard requires |
 | `tests/SharpDnp3.Interop.Tests/` | Runs against go-dnp3 and opendnp3; skips when they are absent |
+| `conformance/dnp3c/` | Runs Step Function I/O's dnp3c certification procedures against the outstation |
 | `build/SharpDnp3.Generator/` | Generates the object codec table from the YAML spec |
 | `docs/` | The reference documentation |
 
@@ -201,8 +202,8 @@ surprise people arriving from Modbus.
 
 ## Building and testing
 
-`SharpDnp3.sln` covers all nine projects — the library, the four tools, the
-three test suites and the generator:
+`SharpDnp3.sln` covers all ten projects — the library, the four tools, the
+three test suites, the dnp3c device under test and the generator:
 
 ```console
 $ dotnet build SharpDnp3.sln
@@ -242,6 +243,22 @@ $ GO_DNP3_BIN=/tmp/go-dnp3-bin dotnet test tests/SharpDnp3.Interop.Tests
 
 Each extended service is exercised in both directions: our master against the go
 outstation, and the go master against our outstation.
+
+### dnp3c conformance
+
+[dnp3c](https://github.com/stepfunc/dnp3c) is an independent implementation of
+the DNP Users Group's IED certification procedures, 3.1 rev 1 and 2.7.
+`conformance/dnp3c/` runs it against the outstation; it needs Java 17 and Maven,
+or Docker:
+
+```console
+$ KEEP_GOING=1 conformance/dnp3c/run.sh 3.1r1    # about an hour
+$ KEEP_GOING=1 conformance/dnp3c/run.sh 2.7
+```
+
+The `Conformance` workflow runs both weekly and on demand. See
+[its README](conformance/dnp3c/README.md) for how the harness fits together and
+what the last run found.
 
 ### The generated object table
 

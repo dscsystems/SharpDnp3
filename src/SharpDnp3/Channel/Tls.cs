@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Ricardo Olsen / DSC Systems
 // Licensed under the GNU General Public License v3.0 or later.
 
+using System.ComponentModel;
 using System.Globalization;
 using System.Net;
 using System.Net.Security;
@@ -200,6 +201,16 @@ public sealed class TlsClientChannel : IChannel
                     timeout.Token).ConfigureAwait(false);
 
                 _attempt = 0;
+
+                // A dial can take seconds, and a connection made for a channel
+                // that was closed meanwhile has nobody to close it.
+                if (_closed)
+                {
+                    await ssl.DisposeAsync().ConfigureAwait(false);
+                    client.Dispose();
+                    throw new ChannelClosedException();
+                }
+
                 return new TlsConnectionStream(client, ssl);
             }
             catch (Exception ex) when (
@@ -307,41 +318,59 @@ public sealed class TlsServerChannel : IChannel
     public bool SupportsConcurrentConnections => true;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// The handshake completes before the connection is handed over, bounded by
+    /// <see cref="HandshakeTimeout"/>: a peer that connected and then said
+    /// nothing would otherwise park the session for good. A failed handshake is
+    /// the peer's problem, not the listener's, so that peer is dropped and the
+    /// next one waited for.
+    /// </remarks>
     public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
     {
-        var listener = Listen();
-
-        var client = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
-        client.NoDelay = true;
-
-        var ssl = new SslStream(
-            client.GetStream(),
-            leaveInnerStreamOpen: false,
-            (_, cert, chain, errors) =>
-                Dnp3TlsConfig.VerifyAgainst(_authority, cert, chain, errors));
-
-        try
+        while (true)
         {
-            await ssl.AuthenticateAsServerAsync(
-                new SslServerAuthenticationOptions
-                {
-                    ServerCertificate = _certificate,
-                    ClientCertificateRequired = true,
-                    EnabledSslProtocols = _tls.EffectiveProtocols,
-                    RemoteCertificateValidationCallback = (_, cert, chain, errors) =>
-                        Dnp3TlsConfig.VerifyAgainst(_authority, cert, chain, errors),
-                },
-                cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            await ssl.DisposeAsync().ConfigureAwait(false);
-            client.Dispose();
-            throw;
-        }
+            var client = await TcpAccept.AcceptAsync(Listen, cancellationToken).ConfigureAwait(false);
+            client.NoDelay = true;
 
-        return new TlsConnectionStream(client, ssl);
+            var ssl = new SslStream(
+                client.GetStream(),
+                leaveInnerStreamOpen: false,
+                (_, cert, chain, errors) =>
+                    Dnp3TlsConfig.VerifyAgainst(_authority, cert, chain, errors));
+
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(HandshakeTimeout);
+                await ssl.AuthenticateAsServerAsync(
+                    new SslServerAuthenticationOptions
+                    {
+                        ServerCertificate = _certificate,
+                        ClientCertificateRequired = true,
+                        EnabledSslProtocols = _tls.EffectiveProtocols,
+
+                        // The client is verified by the callback given to the
+                        // stream above. Setting it here as well is refused, and
+                        // every handshake failed.
+                    },
+                    timeout.Token).ConfigureAwait(false);
+                return new TlsConnectionStream(client, ssl);
+            }
+            catch (Exception ex) when (
+                ex is AuthenticationException or IOException or OperationCanceledException or Win32Exception)
+            {
+                await ssl.DisposeAsync().ConfigureAwait(false);
+                client.Dispose();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
     }
+
+    /// <summary>
+    /// How long an accepted peer has to complete the handshake, matching the
+    /// client's connect timeout.
+    /// </summary>
+    public TimeSpan HandshakeTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
     /// <inheritdoc/>
     public void Close()

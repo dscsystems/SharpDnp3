@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/SharpDnp3/SharpDnp3.csproj" />
+    <ProjectReference Include="../../conformance/dnp3c/dut/SharpDnp3.Conformance.Dut.csproj" />
   </ItemGroup>
 
 </Project>

@@ -233,6 +233,52 @@ internal sealed class Harness : IAsyncDisposable
     }
 
     /// <summary>
+    /// Transmits several application fragments in one write, so they arrive in
+    /// one read from the connection, as a busy master's often do.
+    /// </summary>
+    public async Task SendTogetherAsync(params byte[][] fragments)
+    {
+        foreach (var f in fragments)
+        {
+            _txStack.Send(_sink, f);
+        }
+
+        await FlushAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Builds a request under the next sequence number, without sending it.</summary>
+    public byte[] NextRequest(FuncCode fc, params ObjectHeader[] objects)
+    {
+        Seq = (byte)((Seq + 1) % AppConstants.SeqModulus);
+        return FragmentFactory.BuildRequest(
+            new AppControl(Fir: true, Fin: true, Con: false, Uns: false, Seq), fc, objects);
+    }
+
+    /// <summary>Builds a confirm for <paramref name="seq"/>, without sending it.</summary>
+    public static byte[] Confirm(byte seq, bool unsolicited = false)
+    {
+        var dst = new List<byte>(AppConstants.RequestHeaderSize);
+        HeaderCodec.AppendHeader(dst, new AppHeader(
+            new AppControl(Fir: true, Fin: true, Con: false, Uns: unsolicited, seq),
+            FuncCode.Confirm,
+            Iin.None));
+        return [.. dst];
+    }
+
+    /// <summary>Waits for the next unsolicited fragment from <paramref name="after"/> on.</summary>
+    public async Task<Fragment> AwaitUnsolicitedAsync(int after)
+    {
+        for (var i = after; ; i++)
+        {
+            var f = await AwaitAsync(i).ConfigureAwait(false);
+            if (f.Header.Control.Uns)
+            {
+                return f;
+            }
+        }
+    }
+
+    /// <summary>
     /// Fails if the outstation says anything after <paramref name="before"/>
     /// fragments.
     /// </summary>

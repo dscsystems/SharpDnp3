@@ -86,8 +86,21 @@ public sealed class OutstationConfig
     /// </summary>
     public TimeSpan SelectTimeout { get; set; }
 
+    /// <summary>
+    /// Caps the command objects one SELECT, OPERATE or DIRECT_OPERATE may
+    /// carry, across all its headers. The ones past the cap are answered
+    /// TOO_MANY_OPS and never reach the command handler. Zero means no cap.
+    /// </summary>
+    public int MaxControlsPerRequest { get; set; }
+
     /// <summary>Paces unsolicited reporting.</summary>
     public UnsolicitedConfig Unsolicited { get; set; } = new();
+
+    /// <summary>
+    /// Says when a clock the master has set needs setting again. The default
+    /// never asks again.
+    /// </summary>
+    public ClockConfig Clock { get; set; } = new();
 
     /// <summary>
     /// What this device says about itself when a master reads group 0.
@@ -100,6 +113,16 @@ public sealed class OutstationConfig
     /// derived one replaces it.
     /// </remarks>
     public IList<DeviceAttribute> Attributes { get; } = [];
+
+    /// <summary>
+    /// Answers group 0 the way a device without device attributes does: every
+    /// read and write is refused with OBJECT_UNKNOWN.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Attributes"/>, and the point counts and fragment sizes
+    /// otherwise derived from this configuration, are not reported.
+    /// </remarks>
+    public bool DisableAttributes { get; set; }
 
     /// <summary>Parameterises file transfer.</summary>
     /// <remarks>
@@ -216,6 +239,35 @@ public sealed class OutstationConfig
     }
 }
 
+/// <summary>Paces time synchronisation.</summary>
+/// <remarks>
+/// A clock drifts from the moment it is set. A device that knows how fast asks
+/// the master for the time again before the drift matters, with NEED_TIME; if
+/// the master does not answer, it stops vouching for the clock, and reports its
+/// timestamps as unsynchronised. Without either, one clock write at power-up is
+/// trusted forever.
+/// </remarks>
+public sealed class ClockConfig
+{
+    /// <summary>
+    /// How long after the master sets the clock the outstation asserts
+    /// NEED_TIME again. Zero never does.
+    /// </summary>
+    public TimeSpan SyncInterval { get; set; }
+
+    /// <summary>
+    /// How much longer the clock is trusted once NEED_TIME is asserted.
+    /// </summary>
+    /// <remarks>
+    /// When it has passed without the master setting the clock, timestamps are
+    /// reported as unsynchronised, and relative-time events are measured from
+    /// the unsynchronised common time of occurrence, g51v2. Zero stops trusting
+    /// the clock as soon as NEED_TIME is asserted. It applies only with a
+    /// <see cref="SyncInterval"/>.
+    /// </remarks>
+    public TimeSpan Holdover { get; set; }
+}
+
 /// <summary>
 /// The hook an outstation implementation provides for the behaviour the stack
 /// cannot decide on its own.
@@ -253,6 +305,27 @@ public interface IOutstationApplication
 }
 
 /// <summary>
+/// Implemented by an <see cref="IOutstationApplication"/> that can refuse the
+/// restart function codes. An application that does not implement it supports
+/// both.
+/// </summary>
+/// <remarks>
+/// It is asked on every request, so support can change while the outstation
+/// runs. A restart the device does not support is answered
+/// NO_FUNC_CODE_SUPPORT and not carried out. Reporting a restart that did not
+/// happen would have the master throw away its picture of the device and poll
+/// it all again, for nothing.
+/// </remarks>
+public interface IRestartSupport
+{
+    /// <summary>Reports whether COLD_RESTART is supported.</summary>
+    bool SupportsColdRestart();
+
+    /// <summary>Reports whether WARM_RESTART is supported.</summary>
+    bool SupportsWarmRestart();
+}
+
+/// <summary>
 /// A device-controlled internal indication: one the library cannot know for
 /// itself, because it depends on the device rather than on the protocol.
 /// </summary>
@@ -272,7 +345,16 @@ public enum Indication : ushort
     ConfigCorrupt = 0x2000,
 }
 
-/// <summary>An application with sensible defaults.</summary>
+/// <summary>An application with sensible defaults, for deriving from.</summary>
+/// <remarks>
+/// Its <see cref="WriteAbsoluteTime"/> accepts a master's clock write and
+/// discards it, and its <see cref="Now"/> is the host clock. A derived class
+/// that accepts clock writes has to override the two together: accepting a write
+/// tells the master the outstation is now synchronised, clearing NEED_TIME, so a
+/// time that is never applied leaves the device reporting synchronised
+/// timestamps from a clock nobody set. A null application passed to
+/// <see cref="OutstationSession"/> does apply the writes.
+/// </remarks>
 public class NopApplication : IOutstationApplication
 {
     /// <inheritdoc/>
@@ -289,6 +371,28 @@ public class NopApplication : IOutstationApplication
 
     /// <inheritdoc/>
     public virtual bool SupportsWriteTime() => true;
+}
+
+/// <summary>
+/// The application a null one becomes: <see cref="NopApplication"/>'s defaults,
+/// with a clock a master can set.
+/// </summary>
+/// <remarks>
+/// A write is kept as an offset from the host clock rather than applied to it,
+/// which a library has no business changing.
+/// </remarks>
+internal sealed class OffsetClockApplication : NopApplication
+{
+    private long _offsetTicks;
+
+    public override DateTimeOffset Now() =>
+        DateTimeOffset.UtcNow + TimeSpan.FromTicks(Interlocked.Read(ref _offsetTicks));
+
+    public override bool WriteAbsoluteTime(DateTimeOffset t)
+    {
+        Interlocked.Exchange(ref _offsetTicks, (t - DateTimeOffset.UtcNow).Ticks);
+        return true;
+    }
 }
 
 /// <summary>Counts what a session has done.</summary>
@@ -413,6 +517,14 @@ public sealed partial class OutstationSession
     private volatile bool _synchronized;
 
     /// <summary>
+    /// When a master last set the clock, by the host's monotonic clock as
+    /// <see cref="System.Diagnostics.Stopwatch"/> ticks: the application's clock
+    /// is the one that was just set, and would measure the interval across the
+    /// jump.
+    /// </summary>
+    private long _syncedAt;
+
+    /// <summary>
     /// Latched while the device has restarted, and used to seed the restart
     /// indication of a master that attaches later.
     /// </summary>
@@ -448,16 +560,33 @@ public sealed partial class OutstationSession
 
     /// <remarks>
     /// Several readers, because every association drains it before answering a
-    /// request as well as the pump draining it while the session is idle.
+    /// request as well as the pump draining it while the session is idle. It is
+    /// unbounded: a bounded queue has to do something with the batch that does
+    /// not fit, and applying it on the caller's thread lets it overtake the
+    /// ones queued before it.
     /// </remarks>
     private readonly Channel<Action<Database>> _updates =
-        Channel.CreateBounded<Action<Database>>(new BoundedChannelOptions(64));
+        Channel.CreateUnbounded<Action<Database>>();
 
     /// <summary>
     /// Serialises draining, so a drain that finds the queue empty knows every
-    /// earlier update has been applied rather than merely dequeued.
+    /// earlier update has been applied rather than merely dequeued. It is held
+    /// while batches run, so it is never taken by a caller that only queues
+    /// one.
     /// </summary>
     private readonly Lock _drainGate = new();
+
+    /// <summary>
+    /// Guards <see cref="_serving"/>. When both are needed it is taken inside
+    /// <see cref="_drainGate"/>, never around it.
+    /// </summary>
+    private readonly Lock _queueGate = new();
+
+    /// <summary>
+    /// Says whether <see cref="RunAsync"/> is running, and so whether the
+    /// session or <see cref="Update"/> applies the next batch.
+    /// </summary>
+    private bool _serving;
 
     private readonly Lock _gate = new();
     private OutstationStats _stats;
@@ -509,7 +638,7 @@ public sealed partial class OutstationSession
 
         config.ApplyDefaults();
         _cfg = config;
-        _appl = application ?? new NopApplication();
+        _appl = application ?? new OffsetClockApplication();
         _cmds = commandHandler ?? new RejectingCommandHandler();
         _indications = (int)(config.Indications & SettableIndications);
 
@@ -619,20 +748,83 @@ public sealed partial class OutstationSession
 
     /// <summary>Applies an action to the database, serialised with the session.</summary>
     /// <remarks>
+    /// <para>
     /// Batching changes in one call is what makes a set of related updates — a
     /// breaker opening and its alarm asserting — produce one consistent set of
-    /// events rather than a torn read. The action runs holding the database's
-    /// lock, so no master can be answered halfway through it.
+    /// events rather than a torn read. Batches are applied in the order they
+    /// were submitted, and each runs holding the database's lock, so no master
+    /// can be answered halfway through it.
+    /// </para>
+    /// <para>
+    /// While <see cref="RunAsync"/> is running, the action is queued and
+    /// <see cref="Update"/> returns without waiting for it; a request that
+    /// arrives after it returns is answered with the batch applied. Before
+    /// <see cref="RunAsync"/>, and after it returns, there is no protocol for a
+    /// batch to interleave with, so the action is applied before this returns,
+    /// and changes made before the session starts are in place when it does.
+    /// </para>
     /// </remarks>
     public void Update(Action<Database> action)
     {
         ArgumentNullException.ThrowIfNull(action);
 
-        if (!_updates.Writer.TryWrite(action))
+        // Queuing takes only the queue's lock: the drain lock is held while
+        // batches run, and a caller that merely queues one must not wait for
+        // them.
+        if (TryQueue(action))
         {
-            // The queue is full, which means the session is not running or is
-            // wedged. Apply directly rather than dropping the update.
-            Apply(action);
+            return;
+        }
+
+        lock (_drainGate)
+        {
+            // Serving may have started since the check, and starting takes the
+            // drain lock, so once it is held the answer cannot change again.
+            if (TryQueue(action))
+            {
+                return;
+            }
+
+            // Whatever was still queued when serving stopped goes first.
+            DrainUpdates();
+            ApplyLogged(action);
+        }
+    }
+
+    /// <summary>Queues a batch for the session if it is serving.</summary>
+    private bool TryQueue(Action<Database> action)
+    {
+        lock (_queueGate)
+        {
+            if (!_serving)
+            {
+                return false;
+            }
+
+            _updates.Writer.TryWrite(action);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Records whether the session is running, and so whether it or
+    /// <see cref="Update"/> applies the next batch. Batches still queued when it
+    /// stops are applied before <see cref="Update"/> can apply a later one
+    /// itself.
+    /// </summary>
+    private void SetServing(bool on)
+    {
+        lock (_drainGate)
+        {
+            lock (_queueGate)
+            {
+                _serving = on;
+            }
+
+            if (!on)
+            {
+                DrainUpdates();
+            }
         }
     }
 
@@ -678,6 +870,7 @@ public sealed partial class OutstationSession
         // Updates are pumped for as long as the session runs rather than only
         // while a master is attached, so events that happen during an outage
         // are queued for whoever attaches next instead of piling up unapplied.
+        SetServing(true);
         var pump = PumpUpdatesAsync(ct);
 
         try
@@ -702,6 +895,8 @@ public sealed partial class OutstationSession
             {
                 // Shutting down.
             }
+
+            SetServing(false);
         }
     }
 
@@ -956,17 +1151,23 @@ public sealed partial class OutstationSession
         {
             while (_updates.Reader.TryRead(out var fn))
             {
-                try
-                {
-                    Apply(fn);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    // A caller's update throwing must not stop the session
-                    // applying the rest of them.
-                    _log.Log(Dnp3LogLevel.Error, "update failed", ("err", ex.Message));
-                }
+                ApplyLogged(fn);
             }
+        }
+    }
+
+    /// <summary>Applies one batch, logging rather than throwing if it fails.</summary>
+    private void ApplyLogged(Action<Database> fn)
+    {
+        try
+        {
+            Apply(fn);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A caller's update throwing must not stop the session applying the
+            // rest of them.
+            _log.Log(Dnp3LogLevel.Error, "update failed", ("err", ex.Message));
         }
     }
 
@@ -990,6 +1191,7 @@ public sealed partial class OutstationSession
 
         a.Connected = true;
         a.Unsol.Reset();
+        a.DeferredRead = null;
 
         Task<bool>? rxWait = null;
 
@@ -1064,11 +1266,12 @@ public sealed partial class OutstationSession
                         ApplyPendingRestart(a);
                         CheckLinkTimeout(a);
                         CheckConfirmTimeout(a);
-                        CheckSelectTimeout(a, now);
                         CheckFileTimeout(now);
+                        ClockDue();
                         RunFreezes(now);
                         ExpireSecurity(a);
                         PollUnsolicited(a, now);
+                        ResumeDeferredRead(a);
                     }
                 }
 
@@ -1153,7 +1356,80 @@ public sealed partial class OutstationSession
             return false;
         }
 
+        try
+        {
+            ResumeDeferredRead(a);
+        }
+        catch (Dnp3Exception ex)
+        {
+            a.Log.Log(Dnp3LogLevel.Warn, "answering a deferred read failed", ("err", ex.Message));
+            return false;
+        }
+
         return true;
+    }
+
+    /// <summary>
+    /// Holds a read back while an unsolicited response awaits its confirmation,
+    /// and reports whether it did.
+    /// </summary>
+    /// <remarks>
+    /// Answered at once, the read would be selecting events while the
+    /// unsolicited response still holds its own: two responses awaiting
+    /// confirmation, and either confirmation able to release the other's
+    /// events. So the read waits, and is answered once the confirmation arrives
+    /// or times out (see <see cref="ResumeDeferredRead"/>). Only the latest read
+    /// is kept, since a master that asks again has given up on the first, and
+    /// any other request discards it: the master has moved on to something
+    /// else, and that is answered at once.
+    /// </remarks>
+    private static bool DeferRead(Association a, Received r)
+    {
+        if (!a.Unsol.Awaiting || r.Broadcast)
+        {
+            return false;
+        }
+
+        if (HeaderCodec.ParseHeader(r.Fragment.Span, out var hdr, out _) != AppParseStatus.Ok ||
+            hdr.IsResponse || hdr.Func == FuncCode.Confirm)
+        {
+            return false;
+        }
+
+        if (hdr.Func != FuncCode.Read)
+        {
+            if (a.DeferredRead is not null)
+            {
+                a.Log.Log(Dnp3LogLevel.Debug, "a request discards the deferred read", ("func", hdr.Func.ToDisplayString()));
+                a.DeferredRead = null;
+            }
+
+            return false;
+        }
+
+        // Copied: the fragment points into the stack's reassembly buffer.
+        a.DeferredRead = r with { Fragment = r.Fragment.ToArray() };
+        a.Log.Log(
+            Dnp3LogLevel.Debug,
+            "read deferred until the unsolicited response is confirmed",
+            ("seq", hdr.Control.Seq));
+        return true;
+    }
+
+    /// <summary>
+    /// Answers the deferred read, once nothing unsolicited is awaiting
+    /// confirmation any more.
+    /// </summary>
+    private void ResumeDeferredRead(Association a)
+    {
+        if (a.DeferredRead is not { } r || a.Unsol.Awaiting)
+        {
+            return;
+        }
+
+        a.DeferredRead = null;
+        Handle(a, r);
+        AdvanceResponse(a);
     }
 
     /// <summary>Picks up a restart raised from outside this loop.</summary>
@@ -1279,6 +1555,15 @@ public sealed partial class OutstationSession
     /// <summary>Dispatches one request fragment.</summary>
     private void Handle(Association a, Received r, bool authenticated = false)
     {
+        if (DeferRead(a, r))
+        {
+            return;
+        }
+
+        // Whatever this request is answered with is stamped with the clock's
+        // quality as of now.
+        ClockDue();
+
         // Before anything is answered: a restart raised a moment ago has to be
         // reported in this response rather than waiting for the next tick, or a
         // master that polls immediately after one is told the device is fine.
@@ -1426,6 +1711,10 @@ public sealed partial class OutstationSession
             }
 
             RememberRequest(a, r, frag);
+
+            // A new request ends whatever response the last one was still
+            // owed: the master has moved on, and will not confirm it now.
+            AbandonResponse(a);
         }
 
         if (r.Broadcast)
@@ -1661,6 +1950,7 @@ public sealed partial class OutstationSession
             }
 
             RememberRequest(a, r, frag);
+            AbandonResponse(a);
             Respond(a, r, frag.Header, []);
         }
     }
@@ -1724,8 +2014,10 @@ public sealed partial class OutstationSession
     private void OnRead(Association a, Received r, Fragment frag)
     {
         // A poll during an unconfirmed unsolicited series ends that series at
-        // its next timeout; see UnsolicitedConfig.UnlimitedRetries.
-        if (a.Unsol.LastFrag is not null)
+        // its next timeout; see UnsolicitedConfig.UnlimitedRetries. Not the
+        // null response's: it holds no events for the poll to have collected,
+        // and announcing the outstation goes on until the master confirms it.
+        if (a.Unsol.Retained && a.Unsol.NullConfirmed)
         {
             a.Unsol.ReadSinceSent = true;
         }
@@ -1752,7 +2044,14 @@ public sealed partial class OutstationSession
         var ctx = new Context { Synchronized = _synchronized };
         var b = new ResponseBuilder(_cfg.MaxTxFragment, ctx);
 
+        // Events go first in the response, whatever order the request named
+        // them in, and the static data after them. A master applies a response
+        // in order, so the static values, which are newer than every event, have
+        // the last word; events after them would roll each point back to
+        // whatever it last changed from. The events are still selected in the
+        // request's order, and everything else is built once they have been.
         var selected = new List<Event>();
+        var later = new List<Action>();
 
         foreach (var h in frag.Objects)
         {
@@ -1761,22 +2060,20 @@ public sealed partial class OutstationSession
                 switch (h.Variation)
                 {
                     case 1: // class 0: all static data
-                        foreach (var staticType in ResponseWriter.StaticTypes)
+                        later.Add(() =>
                         {
-                            _writer.BuildStaticRange(b, staticType, 0, 0, 0xFFFF);
-                        }
+                            foreach (var staticType in ResponseWriter.StaticTypes)
+                            {
+                                _writer.BuildStaticRange(b, staticType, 0, 0, 0xFFFF);
+                            }
 
-                        ReadDatasets(a, b, FragmentFactory.ReadAllObjects(87, 1));
+                            ReadDatasets(a, b, FragmentFactory.ReadAllObjects(87, 1));
+                        });
                         break;
 
                     case 2:
                     case 3:
                     case 4: // event classes 1, 2 and 3
-                        // Written where the class was asked for, not after
-                        // everything else: a master applies objects in order,
-                        // so in the usual Class 1,2,3,0 poll the events must
-                        // precede the static data, or an old buffered event
-                        // overwrites the current value it was read alongside.
                         // A class read names how many events it wants when its
                         // range is a count; without one it wants every event in
                         // the class.
@@ -1787,9 +2084,7 @@ public sealed partial class OutstationSession
                         }
 
                         var mask = (Class)((byte)Class.Class1 << (h.Variation - 2));
-                        var events = a.Events.Select(mask, classLimit);
-                        _writer.BuildEvents(b, events, _appl.Now, e => a.Events.Release([e]));
-                        selected.AddRange(events);
+                        selected.AddRange(a.Events.Select(mask, classLimit));
                         break;
 
                     default:
@@ -1811,6 +2106,16 @@ public sealed partial class OutstationSession
                     continue;
                 }
 
+                if (Array.IndexOf(ResponseWriter.StaticTypes, eventType) >= 0 &&
+                    ResponseWriter.TypeCount(_db.Counts(), eventType) == 0)
+                {
+                    // The events of a type the device has no points of: there
+                    // can never be any, and an empty answer would say there are
+                    // none just now.
+                    a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                    continue;
+                }
+
                 if (!TryEventReadLimit(h, out var limit))
                 {
                     a.Iin = a.Iin.Set(Iin.ParameterError);
@@ -1826,44 +2131,46 @@ public sealed partial class OutstationSession
                     }
                 }
 
-                _writer.BuildEvents(b, evs, _appl.Now, e => a.Events.Release([e]));
                 selected.AddRange(evs);
                 continue;
             }
 
+            // Captured per header: the closures below run after the loop.
+            var hdr = h;
+
             if (h.Group == 50 && h.Variation == 1)
             {
-                ReadCurrentTime(a, b, h);
+                later.Add(() => ReadCurrentTime(a, b, hdr));
                 continue;
             }
 
             if (h.Group == 80 && h.Variation == 1)
             {
-                ReadIin(a, b, h);
+                later.Add(() => ReadIin(a, b, hdr));
                 continue;
             }
 
             if (h.Group == 50 && h.Variation == 4)
             {
-                ReadTimeIntervals(a, b, h);
+                later.Add(() => ReadTimeIntervals(a, b, hdr));
                 continue;
             }
 
             if (h.Group is >= 85 and <= 87)
             {
-                ReadDatasets(a, b, h);
+                later.Add(() => ReadDatasets(a, b, hdr));
                 continue;
             }
 
             if (h.Group == 112)
             {
-                ReadTerminals(a, b, h);
+                later.Add(() => ReadTerminals(a, b, hdr));
                 continue;
             }
 
             if (h.Group == 121)
             {
-                ReadSecurityStatistics(a, b, h);
+                later.Add(() => ReadSecurityStatistics(a, b, hdr));
                 continue;
             }
 
@@ -1880,14 +2187,14 @@ public sealed partial class OutstationSession
                 var data = new List<byte>(CommandObjects.Time48Size);
                 CommandObjects.AppendTime48(data, Timestamp.Now(recorded));
 
-                b.Add(new ObjectHeader
+                later.Add(() => b.Add(new ObjectHeader
                 {
                     Group = 50,
                     Variation = 3,
                     Qualifier = Qualifier.Make(IndexPrefix.None, RangeSpec.Count8),
                     Range = new ObjectRange { Spec = RangeSpec.Count8, Count = 1 },
                     Data = data.ToArray(),
-                });
+                }));
                 continue;
             }
 
@@ -1907,33 +2214,91 @@ public sealed partial class OutstationSession
                 continue;
             }
 
-            if (h.Range.Spec.IsStartStop())
+            CheckStaticRead(a, pt, h);
+
+            later.Add(() =>
             {
-                // A range reaching past the last configured point asks for
-                // points that do not exist. The ones that do exist are still
-                // returned, but the master is told part of its request was out
-                // of range rather than being left to guess from a short answer.
-                if (h.Range.Stop >= (uint)ResponseWriter.TypeCount(_db.Counts(), pt) ||
-                    h.Range.Stop > ushort.MaxValue)
+                void Build(ushort start, ushort stop) =>
+                    _writer.BuildStaticRange(b, pt, hdr.Variation, start, stop);
+
+                if (!TryForEachPointRun(hdr, Build))
                 {
-                    a.Iin = a.Iin.Set(Iin.ParameterError);
+                    // A count with no index prefix says how many points but not
+                    // which. It has always been answered with every point, and
+                    // still is.
+                    Build(0, 0xFFFF);
                 }
-            }
+            });
+        }
 
-            var header = h;
-            void Build(ushort start, ushort stop) =>
-                _writer.BuildStaticRange(b, pt, header.Variation, start, stop);
+        var hasEvents = false;
+        if (selected.Count > 0)
+        {
+            var unsent = _writer.BuildEvents(b, selected, _appl.Now);
+            a.Events.Discard(unsent);
+            hasEvents = unsent.Count < selected.Count;
+        }
 
-            if (!TryForEachPointRun(h, Build))
+        foreach (var build in later)
+        {
+            build();
+        }
+
+        SendFragments(a, r, frag.Header, b.Done(), hasEvents);
+    }
+
+    /// <summary>
+    /// Sets the indication a read of static points earns when it names points
+    /// the device does not have.
+    /// </summary>
+    /// <remarks>
+    /// OBJECT_UNKNOWN when it has none of the type at all, PARAMETER_ERROR when
+    /// the range or the listed indexes reach past the last one. The points that
+    /// do exist are reported regardless; the indication is what tells the
+    /// master the rest were not left out by accident.
+    /// </remarks>
+    private void CheckStaticRead(Association a, PointType pt, ObjectHeader h)
+    {
+        var n = ResponseWriter.TypeCount(_db.Counts(), pt);
+        if (n == 0)
+        {
+            a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+            return;
+        }
+
+        if (NamesBeyond(h, n))
+        {
+            a.Iin = a.Iin.Set(Iin.ParameterError);
+        }
+    }
+
+    /// <summary>
+    /// Reports whether a request header names a point index of
+    /// <paramref name="n"/> or more. All objects names only the points there
+    /// are, and a count without an index prefix names none in particular.
+    /// </summary>
+    private static bool NamesBeyond(ObjectHeader h, int n)
+    {
+        var spec = h.Range.Spec;
+        if (spec.IsStartStop())
+        {
+            return h.Range.Stop >= (uint)n || h.Range.Start > h.Range.Stop;
+        }
+
+        if (spec.IsCount() && h.Qualifier.IndexPrefix.IsIndex())
+        {
+            var width = h.Qualifier.IndexPrefix.Octets();
+            var data = h.Data.Span;
+            for (var off = 0; off + width <= data.Length; off += width)
             {
-                // A count with no index prefix says how many points but not
-                // which. It has always been answered with every point, and
-                // still is.
-                Build(0, 0xFFFF);
+                if (ReadPrefix(data[off..], width) >= (uint)n)
+                {
+                    return true;
+                }
             }
         }
 
-        SendFragments(a, r, frag.Header, b.Done(), selected.Count > 0);
+        return false;
     }
 
     /// <summary>
@@ -2094,8 +2459,7 @@ public sealed partial class OutstationSession
                 var elapsed = _appl.Now() - reference;
                 if (_appl.WriteAbsoluteTime(recorded.Time + elapsed))
                 {
-                    _synchronized = true;
-                    a.Iin = a.Iin.Clear(Iin.NeedTime);
+                    ClockSet(a);
                     a.RecordedTime = null;
                     a.Log.Log(
                         Dnp3LogLevel.Debug,
@@ -2127,8 +2491,7 @@ public sealed partial class OutstationSession
                 var ts = CommandObjects.ParseTime48(stamp);
                 if (_appl.WriteAbsoluteTime(ts.Time))
                 {
-                    _synchronized = true;
-                    a.Iin = a.Iin.Clear(Iin.NeedTime);
+                    ClockSet(a);
                     a.Log.Log(Dnp3LogLevel.Debug, "clock set by master", ("time", ts.Time));
                 }
                 else
@@ -2195,15 +2558,26 @@ public sealed partial class OutstationSession
                 return;
             }
 
-            var index = (ushort)h.Range.IndexOf(i);
+            var wide = (ulong)h.Range.IndexOf(i);
             if (prefixLen > 0)
             {
-                index = (ushort)ReadPrefix(data[off..], prefixLen);
+                wide = ReadPrefix(data[off..], prefixLen);
                 off += prefixLen;
             }
 
             var value = DecodeDeadband(h.Variation, data.Slice(off, size));
             off += size;
+
+            // A four-octet index can name a point no database has. Narrowing it
+            // would wrap it onto one that does — index 65541 setting point 5's
+            // deadband — so it is refused, as a command's would be.
+            if (wide > 0xFFFF)
+            {
+                a.Iin = a.Iin.Set(Iin.ParameterError);
+                continue;
+            }
+
+            var index = (ushort)wide;
 
             if (!_db.TryGetAnalog(index, out _, out var cfg))
             {
@@ -2288,6 +2662,23 @@ public sealed partial class OutstationSession
     /// </remarks>
     private void OnRestart(Association a, Received r, Fragment frag)
     {
+        if (_appl is IRestartSupport rs)
+        {
+            var supported = frag.Header.Func == FuncCode.ColdRestart
+                ? rs.SupportsColdRestart()
+                : rs.SupportsWarmRestart();
+            if (!supported)
+            {
+                a.Iin = a.Iin.Set(Iin.NoFuncCodeSupport);
+                if (!r.Broadcast)
+                {
+                    Respond(a, r, frag.Header, []);
+                }
+
+                return;
+            }
+        }
+
         TimeSpan d;
         var now = _appl.Now();
         var until = new DateTimeOffset(Interlocked.Read(ref _restartUntilTicks), TimeSpan.Zero);
@@ -2366,6 +2757,20 @@ public sealed partial class OutstationSession
     /// </summary>
     private void OnUnsolicitedControl(Association a, Received r, Fragment frag)
     {
+        if (!_cfg.Unsolicited.Enabled)
+        {
+            // A device configured without unsolicited responses has nothing to
+            // enable or disable, and accepting the request would tell the
+            // master its events are now on their way.
+            a.Iin = a.Iin.Set(Iin.NoFuncCodeSupport);
+            if (!r.Broadcast)
+            {
+                Respond(a, r, frag.Header, []);
+            }
+
+            return;
+        }
+
         var enable = frag.Header.Func == FuncCode.EnableUnsolicited;
         foreach (var h in frag.Objects)
         {
@@ -2469,24 +2874,6 @@ public sealed partial class OutstationSession
             return;
         }
 
-        // A response is still in flight while fragments remain to be sent, and
-        // also while its last fragment awaits confirmation — the case a master
-        // produces whenever its confirm is lost, or it simply moves on. Either
-        // way the new request supersedes it: the confirmation wait is abandoned
-        // and the events it held go back in the queue. Left waiting, the new
-        // response would sit behind a confirmation that is never coming, and
-        // the timeout would then discard it along with the old one.
-        if (a.AwaitingConfirm || (a.PendingBodies is { } queued && a.PendingIndex < queued.Count))
-        {
-            a.Log.Log(Dnp3LogLevel.Debug, "a new response is replacing one still in flight");
-            if (a.AwaitingConfirm)
-            {
-                a.AwaitingConfirm = false;
-                a.BroadcastConfirmSought = false;
-                a.Events.Unselect();
-            }
-        }
-
         a.PendingBodies = bodies;
         a.PendingIndex = 0;
         a.PendingDest = r.Source;
@@ -2585,6 +2972,43 @@ public sealed partial class OutstationSession
         }
 
         FinishResponse(a);
+    }
+
+    /// <summary>
+    /// Gives up on a solicited response still in progress, because a new
+    /// request has arrived: fragments not yet sent are dropped, and the wait
+    /// for a confirmation ends.
+    /// </summary>
+    /// <remarks>
+    /// It has to run before the new request is acted on. The events the old
+    /// response carried go back to the queue here, and a read that selected its
+    /// own first would have them handed back too: put in its response, but never
+    /// confirmed away, so the master is sent them again on the next poll — and
+    /// an EVENT_BUFFER_OVERFLOW it reported is never cleared. Left waiting
+    /// instead, the new response would queue behind a confirmation the master is
+    /// never going to send, and the confirm timeout would then discard both.
+    /// </remarks>
+    private static void AbandonResponse(Association a)
+    {
+        if (a.PendingBodies is not { Count: > 0 } bodies)
+        {
+            return;
+        }
+
+        a.Log.Log(
+            Dnp3LogLevel.Debug,
+            "a new request abandons the response in progress",
+            ("fragment", a.PendingIndex), ("of", bodies.Count), ("awaiting_confirm", a.AwaitingConfirm));
+
+        if (a.PendingHasEvents)
+        {
+            a.Events.Unselect();
+        }
+
+        a.AwaitingConfirm = false;
+        a.BroadcastConfirmSought = false;
+        a.PendingBodies = null;
+        a.PendingIndex = 0;
     }
 
     /// <summary>
@@ -2730,12 +3154,48 @@ public sealed partial class OutstationSession
             iin = iin.Set(Iin.EventBufferOverflow);
         }
 
-        if (!_synchronized)
+        if (ClockDue())
         {
             iin = iin.Set(Iin.NeedTime);
         }
 
         return iin;
+    }
+
+    /// <summary>Records that a master has just set the clock.</summary>
+    private void ClockSet(Association a)
+    {
+        Interlocked.Exchange(ref _syncedAt, System.Diagnostics.Stopwatch.GetTimestamp());
+        _synchronized = true;
+        a.Iin = a.Iin.Clear(Iin.NeedTime);
+    }
+
+    /// <summary>
+    /// Reports whether the clock needs setting again, and expires the
+    /// synchronisation once the holdover after that has passed too.
+    /// </summary>
+    private bool ClockDue()
+    {
+        if (!_synchronized)
+        {
+            return true;
+        }
+
+        var interval = _cfg.Clock.SyncInterval;
+        if (interval <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        var since = System.Diagnostics.Stopwatch.GetElapsedTime(Interlocked.Read(ref _syncedAt));
+        var holdover = _cfg.Clock.Holdover > TimeSpan.Zero ? _cfg.Clock.Holdover : TimeSpan.Zero;
+        if (since >= interval + holdover && _synchronized)
+        {
+            _synchronized = false;
+            _log.Log(Dnp3LogLevel.Debug, "the clock has not been set again; timestamps are now unsynchronized");
+        }
+
+        return since >= interval;
     }
 
     /// <summary>
@@ -2886,6 +3346,7 @@ public sealed partial class OutstationSession
             case 87 or 88: pt = PointType.Dataset; return true;
             case 112 or 113: pt = PointType.VirtualTerminal; return true;
             case 40 or 42: pt = PointType.AnalogOutputStatus; return true;
+            case 110 or 111: pt = PointType.OctetString; return true;
             default: pt = PointType.Unknown; return false;
         }
     }

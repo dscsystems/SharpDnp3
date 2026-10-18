@@ -386,6 +386,10 @@ internal sealed class Primary
     {
         _state = PrimaryState.Idle;
         _linkUp = false;
+        // Flow control is the peer's answer about the exchange just abandoned.
+        // Left latched on an idle link, nothing would clear it, and every later
+        // Send would be refused rather than re-running the handshake.
+        _dfc = false;
         _pending = default;
         _hasPending = false;
         _retries = 0;

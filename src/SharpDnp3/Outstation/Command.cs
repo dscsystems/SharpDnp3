@@ -91,6 +91,27 @@ public interface ICommandHandler
     CommandStatus OperateAnalog(ushort index, AnalogOutputCommand v, OperateType op);
 }
 
+/// <summary>
+/// Implemented by an <see cref="ICommandHandler"/> that says which outputs the
+/// device has. A command for any other is refused with NOT_SUPPORTED and
+/// PARAMETER_ERROR, and never reaches the handler.
+/// </summary>
+/// <remarks>
+/// Without it, the database's output status points stand for the outputs: one
+/// with four binary output statuses has four binary outputs. A database with no
+/// output status of the type says nothing either way, and every command for it
+/// goes to the handler.
+/// </remarks>
+public interface IOutputPoints
+{
+    /// <summary>
+    /// Reports whether the device has the output: <paramref name="pt"/> is
+    /// <see cref="PointType.BinaryOutputStatus"/> for a CROB and
+    /// <see cref="PointType.AnalogOutputStatus"/> for an analog output.
+    /// </summary>
+    bool HasOutput(PointType pt, ushort index);
+}
+
 /// <summary>Refuses every command with NOT_SUPPORTED.</summary>
 /// <remarks>
 /// It is the default, and it is deliberately a refusal rather than a success:
@@ -151,6 +172,11 @@ internal sealed class Selection
     /// </remarks>
     public CommandStatus Matches(ReadOnlySpan<byte> objectsRaw, byte seq, DateTimeOffset now)
     {
+        // An expired selection is kept rather than cleared when its window
+        // closes, so the late operate can be told why it is refused: TIMEOUT
+        // says the select arrived and the operator was too slow, where NO_SELECT
+        // would send them looking for a select that went missing. Either way
+        // nothing operates.
         if (!Active)
         {
             return CommandStatus.NoSelect;
@@ -297,6 +323,10 @@ public sealed partial class OutstationSession
 
         var selecting = frag.Header.Func == FuncCode.Select;
 
+        // Counts the command objects across every header, for
+        // MaxControlsPerRequest.
+        var controls = 0;
+
         foreach (var h in frag.Objects)
         {
             // Pattern control (g12v2, with its g12v3 mask) operates a set of
@@ -336,6 +366,7 @@ public sealed partial class OutstationSession
             var prefixLen = prefix.Octets();
             var data = h.Data.Span;
             var echo = new List<byte>(data.Length);
+            uint echoed = 0;
 
             var off = 0;
             for (uint n = 0; n < h.Count; n++)
@@ -351,12 +382,23 @@ public sealed partial class OutstationSession
                 // A four-octet prefix can name an index no point has. Narrowing
                 // it would wrap it onto one that does — a command for point
                 // 65541 operating point 5 — so it is refused here, before any
-                // handler sees it, the same way an unimplemented point is.
+                // handler sees it, the same way a point the device does not
+                // have is. Both are a parameter out of range as well as a
+                // refusal.
                 var index = (ushort)wide;
                 var status = selectStatus;
-                if (wide > 0xFFFF)
+                controls++;
+                if (wide > 0xFFFF || !ControlExists(h.Group, index))
                 {
                     status = CommandStatus.NotSupported;
+                    a.Iin = a.Iin.Set(Iin.ParameterError);
+                }
+                else if (_cfg.MaxControlsPerRequest > 0 && controls > _cfg.MaxControlsPerRequest)
+                {
+                    // The controls past the limit are refused, and the ones
+                    // within it carried out: TOO_MANY_OPS on each object says
+                    // exactly which did not happen.
+                    status = CommandStatus.TooManyOps;
                 }
                 else if (status.OK())
                 {
@@ -375,21 +417,41 @@ public sealed partial class OutstationSession
                 // overwriting it in place turns the echoed request into the
                 // response the master expects.
                 echo[^1] = (byte)status;
+                echoed++;
 
                 off += prefixLen + size;
             }
 
+            // The count says how many objects follow. A request that ran short
+            // of data echoes fewer than it claimed, and repeating its count
+            // would have the master read past the end of the header.
             ObjectHeaderCodec.AppendObjectHeader(body, new ObjectHeader
             {
                 Group = h.Group,
                 Variation = h.Variation,
                 Qualifier = h.Qualifier,
-                Range = h.Range,
+                Range = h.Range with { Count = echoed },
                 Data = echo.ToArray(),
             });
         }
 
         return ([.. body], outcomes);
+    }
+
+    /// <summary>
+    /// Reports whether the device has the output a command names, as
+    /// <see cref="IOutputPoints"/> describes.
+    /// </summary>
+    private bool ControlExists(byte group, ushort index)
+    {
+        var pt = group == 41 ? PointType.AnalogOutputStatus : PointType.BinaryOutputStatus;
+        if (_cmds is IOutputPoints op)
+        {
+            return op.HasOutput(pt, index);
+        }
+
+        var n = ResponseWriter.TypeCount(_db.Counts(), pt);
+        return n == 0 || index < n;
     }
 
     /// <summary>Records an operated control as a group 13 or 43 event.</summary>
@@ -516,22 +578,6 @@ public sealed partial class OutstationSession
                     _stats.CommandsRejected++;
                 }
             }
-        }
-    }
-
-    /// <summary>Expires a stale selection.</summary>
-    /// <remarks>
-    /// A reservation that outlives its window must not be operable: an operator
-    /// who selected a breaker, walked away, and came back minutes later should
-    /// have to select again rather than operate on a decision they no longer
-    /// remember making.
-    /// </remarks>
-    private static void CheckSelectTimeout(Association a, DateTimeOffset now)
-    {
-        if (a.Sel.Active && now > a.Sel.Expires)
-        {
-            a.Log.Log(Dnp3LogLevel.Debug, "selection expired", ("seq", a.Sel.Seq));
-            a.Sel.Clear();
         }
     }
 

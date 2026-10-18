@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The device under test for the dnp3c conformance harness: a SharpDnp3
+    outstation, plus the JSON control endpoint the plugin in ../plugin drives.
+    See ../README.md.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>SharpDnp3.Conformance.Dut</AssemblyName>
+    <RootNamespace>SharpDnp3.Conformance.Dut</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\SharpDnp3\SharpDnp3.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The checks are tested against the reports they must reject. -->
+    <InternalsVisibleTo Include="SharpDnp3.Conformance.Tests" />
+  </ItemGroup>
+
+</Project>

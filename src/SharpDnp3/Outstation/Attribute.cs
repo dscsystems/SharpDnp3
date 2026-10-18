@@ -57,6 +57,10 @@ public sealed partial class OutstationSession
         OutstationConfig cfg)
     {
         var store = new Dictionary<AttributeKey, DeviceAttribute>();
+        if (cfg.DisableAttributes)
+        {
+            return store;
+        }
 
         foreach (var a in DerivedAttributes(cfg))
         {

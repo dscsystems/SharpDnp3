@@ -144,8 +144,9 @@ public sealed class DeviceConfig
     public int Subset { get; set; }
 
     /// <summary>
-    /// Stops the outstation reporting attributes at all, which is how a
-    /// master's handling of a device without them gets tested.
+    /// Stops the outstation reporting attributes at all — the derived point
+    /// counts and fragment sizes included — which is how a master's handling
+    /// of a device without them gets tested.
     /// </summary>
     public bool Disabled { get; set; }
 
@@ -222,9 +223,14 @@ public sealed class DeviceConfig
     /// Renders the attributes for the startup banner, so whoever points a
     /// master at this device can see what it will answer with.
     /// </summary>
-    public static string Describe(IReadOnlyList<DeviceAttribute> attributes)
+    public static string Describe(IReadOnlyList<DeviceAttribute> attributes, bool disabled = false)
     {
         ArgumentNullException.ThrowIfNull(attributes);
+
+        if (disabled)
+        {
+            return "  Device attributes: disabled — every group 0 request is refused\n";
+        }
 
         if (attributes.Count == 0)
         {

@@ -379,7 +379,7 @@ public class ConformanceTests
         await using var h = new Harness(
             Config(selectTimeout: TimeSpan.FromSeconds(5)), plant);
 
-        var crob = Requests.CrobHeader(3, ControlCode.LatchOn);
+        var crob = Requests.CrobHeader(1, ControlCode.LatchOn);
 
         var resp = await h.RequestAsync(FuncCode.Select, crob);
         Assert.Equal(CommandStatus.Success, Requests.CommandStatusOf(resp));
@@ -427,14 +427,27 @@ public class ConformanceTests
     }
 
     /// <summary>
-    /// Enable and disable unsolicited are accepted for the event classes.
+    /// Enable and disable unsolicited are accepted for the event classes by a
+    /// device that reports unsolicited, and refused by one configured not to: it
+    /// has nothing to turn on, and accepting would tell the master its events
+    /// are on their way.
     /// </summary>
     [Theory]
-    [InlineData((int)FuncCode.EnableUnsolicited)]
-    [InlineData((int)FuncCode.DisableUnsolicited)]
-    public async Task UnsolicitedControlAccepted(int funcCode)
+    [InlineData((int)FuncCode.EnableUnsolicited, true)]
+    [InlineData((int)FuncCode.DisableUnsolicited, true)]
+    [InlineData((int)FuncCode.EnableUnsolicited, false)]
+    [InlineData((int)FuncCode.DisableUnsolicited, false)]
+    public async Task UnsolicitedControlAccepted(int funcCode, bool enabled)
     {
-        await using var h = new Harness(Config());
+        var config = Config();
+        config.Unsolicited.Enabled = enabled;
+        await using var h = new Harness(config);
+        if (enabled)
+        {
+            // The null unsolicited response comes first, and would otherwise
+            // be taken for the answer.
+            await h.SendConfirmAsync((await h.AwaitAsync(0)).Header.Control.Seq, unsolicited: true);
+        }
 
         var resp = await h.RequestAsync(
             (FuncCode)funcCode,
@@ -442,9 +455,9 @@ public class ConformanceTests
             FragmentFactory.ReadAllObjects(60, 3),
             FragmentFactory.ReadAllObjects(60, 4));
 
-        Assert.False(
-            resp.Header.Iin.HasAny(Iin.NoFuncCodeSupport | Iin.ObjectUnknown),
-            $"{(FuncCode)funcCode} was refused; IIN = {resp.Header.Iin}");
+        Assert.True(
+            resp.Header.Iin.HasAny(Iin.NoFuncCodeSupport | Iin.ObjectUnknown) != enabled,
+            $"unsolicited enabled {enabled}: {(FuncCode)funcCode} answered with IIN = {resp.Header.Iin}");
     }
 
     /// <summary>A range read returns exactly the points asked for.</summary>

@@ -266,7 +266,7 @@ var outstation = new OutstationSession(new OutstationConfig
         HoldTime = TimeSpan.FromMilliseconds(200),  // coalesce a burst
         MaxEvents = 20,
     },
-}, new NopApplication(), commands);
+}, null, commands); // null: clock writes are kept as an offset and take effect
 
 commands.Session = outstation;
 
@@ -289,7 +289,12 @@ outstation.Update(db => db.UpdateAnalog(
 
 `IOutstationApplication` supplies the clock and restart behaviour; derive from
 `NopApplication` and override `Now()`, `SupportsWriteTime()`,
-`WriteAbsoluteTime()`, `ColdRestart()`, `WarmRestart()` as needed.
+`WriteAbsoluteTime()`, `ColdRestart()`, `WarmRestart()` as needed. Never pass a
+bare `new NopApplication()`: it accepts the master's clock write and discards
+it, so the outstation clears NEED_TIME and reports a clock nobody set as
+synchronized. Pass `null` instead, or override `WriteAbsoluteTime` with
+something that applies the time. Implement `IRestartSupport` as well to refuse
+a cold or warm restart.
 
 **Several masters on one device.** A control centre and an engineering
 workstation polling the same RTU is one session, not two:
@@ -506,8 +511,10 @@ if (db.TryGetAnalog(0, out _, out var cfg))
 
 `Database` is **not safe for concurrent use**. Configure it before `RunAsync`;
 after that, every modification goes through `Session.Update(db => ...)`, which
-runs on the session loop. Direct access afterwards is a race that shows up as
-intermittent corruption.
+runs on the session loop, between requests, in submission order. While the
+session runs `Update` only queues the batch and returns; before `RunAsync` and
+after it returns it applies the batch at once. Direct access afterwards is a
+race that shows up as intermittent corruption.
 
 Batch related changes into **one** `Update` — a breaker opening and its alarm
 asserting should become one consistent set of events, not a torn read.
@@ -554,8 +561,13 @@ silently by design. `dnp3-explorer` can edit both live with `C`, and
   protocol; if a complete record matters, size the buffer generously and watch
   the counter.
 - **Keep polling even with unsolicited reporting enabled.** After `MaxRetries`
-  unconfirmed re-sends the outstation gives up and waits to be polled.
-  Unsolicited is an optimisation, not a substitute for a poll schedule.
+  unconfirmed re-sends the outstation requeues the events and pauses
+  `RetryDelay` before starting again with a fresh response; until one is
+  confirmed, a poll is what guarantees delivery. Unsolicited is an
+  optimisation, not a substitute for a poll schedule.
+- **A command to an output with no status point is refused before your handler
+  sees it** (NOT_SUPPORTED with PARAMETER_ERROR). Implement `IOutputPoints` on
+  the handler if it serves outputs the database does not hold.
 - **Octet strings: the variation number *is* the length.** Changing the string's
   length changes the reported variation. That is legal and masters must cope.
   `UpdateOctetString` takes a span: `db.UpdateOctetString(0, "RTU-1"u8)`.

@@ -130,12 +130,33 @@ static (int Frames, int Errors) Decode(StringBuilder output, byte[] data, bool s
 
     // Frame-at-a-time mode: each frame is decoded independently, which is what
     // you want when pasting frames captured out of context.
+    //
+    // Octets skipped to resynchronise are a failure too — a frame whose CRC
+    // does not check is skipped this way — so each run of them is reported and
+    // counted. Passing over them silently would let a capture with a corrupt
+    // frame followed by a good one exit as though everything had decoded.
+    var skipped = 0;
+    string? skipError = null;
+    void FlushSkipped()
+    {
+        if (skipped > 0)
+        {
+            output.AppendFormat(
+                CultureInfo.InvariantCulture,
+                "-- skipped {0} octet(s) that do not form a valid frame: {1}\n\n", skipped, skipError);
+            errors++;
+            skipped = 0;
+            skipError = null;
+        }
+    }
+
     for (var off = 0; off < data.Length;)
     {
         if (!Dnp3Decoder.TryDecodeFrame(null, data.AsSpan(off), out var t, out var n))
         {
             if (t.Error == LinkDecodeStatus.ShortFrame.ToDisplayString())
             {
+                FlushSkipped();
                 output.AppendFormat(
                     CultureInfo.InvariantCulture,
                     "-- {0} trailing octet(s) do not form a complete frame\n", data.Length - off);
@@ -144,10 +165,17 @@ static (int Frames, int Errors) Decode(StringBuilder output, byte[] data, bool s
 
             // Not a frame at this offset. Skip an octet and look for the next
             // delimiter, the same way the streaming parser resynchronises.
+            if (skipped == 0)
+            {
+                skipError = t.Error;
+            }
+
+            skipped++;
             off++;
             continue;
         }
 
+        FlushSkipped();
         frames++;
         if (t.App?.Error is not null)
         {
@@ -159,6 +187,7 @@ static (int Frames, int Errors) Decode(StringBuilder output, byte[] data, bool s
         off += n;
     }
 
+    FlushSkipped();
     return (frames, errors);
 }
 

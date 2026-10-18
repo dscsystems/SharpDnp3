@@ -92,6 +92,15 @@ public sealed class TcpClientChannel : IChannel
                 // latency to every request on an otherwise idle link.
                 client.NoDelay = true;
                 _attempt = 0;
+
+                // A dial can take seconds, and a connection made for a channel
+                // that was closed meanwhile has nobody to close it.
+                if (_closed)
+                {
+                    client.Dispose();
+                    throw new ChannelClosedException();
+                }
+
                 return new TcpConnectionStream(client);
             }
             catch (Exception ex) when (ex is SocketException or OperationCanceledException)
@@ -193,8 +202,7 @@ public sealed class TcpServerChannel : IChannel
     /// <inheritdoc/>
     public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
     {
-        var listener = Listen();
-        var client = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+        var client = await TcpAccept.AcceptAsync(Listen, cancellationToken).ConfigureAwait(false);
         client.NoDelay = true;
         return new TcpConnectionStream(client);
     }
@@ -224,6 +232,62 @@ public sealed class TcpServerChannel : IChannel
 /// The session closes the stream when a connection drops; without this the
 /// <see cref="TcpClient"/> wrapper would leak until finalization.
 /// </remarks>
+/// <summary>Accepting for the listening channels.</summary>
+internal static class TcpAccept
+{
+    /// <summary>The bounds of the wait between failed accepts.</summary>
+    private static readonly TimeSpan MinBackoff = TimeSpan.FromMilliseconds(5);
+
+    private static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Accepts one connection, giving up when the token is cancelled or the
+    /// listener is closed.
+    /// </summary>
+    /// <remarks>
+    /// Any other accept error is the listener's trouble rather than the
+    /// caller's — a process out of file descriptors, a connection reset before
+    /// it could be accepted — and it passes. A server channel has no retry
+    /// policy, and a session treats a connect error as fatal, so throwing one
+    /// would end an outstation for good over a moment's trouble. It waits and
+    /// accepts again instead, backing off.
+    /// </remarks>
+    /// <param name="listen">
+    /// Returns the listener, or throws <see cref="ChannelClosedException"/> once
+    /// the channel is closed.
+    /// </param>
+    /// <param name="cancellationToken">Ends the wait.</param>
+    public static async Task<TcpClient> AcceptAsync(
+        Func<TcpListener> listen, CancellationToken cancellationToken)
+    {
+        var backoff = TimeSpan.Zero;
+        while (true)
+        {
+            var listener = listen();
+            try
+            {
+                return await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (
+                ex is SocketException or ObjectDisposedException or InvalidOperationException &&
+                !cancellationToken.IsCancellationRequested)
+            {
+                // A close stops the listener underneath the accept; listen()
+                // then reports it as the closed channel it is.
+                listen();
+
+                backoff = backoff < MinBackoff ? MinBackoff : backoff * 2;
+                if (backoff > MaxBackoff)
+                {
+                    backoff = MaxBackoff;
+                }
+
+                await Task.Delay(backoff, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+}
+
 internal sealed class TcpConnectionStream : Stream, IPeerEndpoint
 {
     private readonly TcpClient _client;

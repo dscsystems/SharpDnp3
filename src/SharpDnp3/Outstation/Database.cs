@@ -390,6 +390,11 @@ public sealed partial class Database
     /// </remarks>
     public bool Configure(PointType pt, ushort index, PointConfig config)
     {
+        if (!EventVariationEncodable(pt, config.EventVariation))
+        {
+            return false;
+        }
+
         lock (_gate)
         {
             return pt switch
@@ -407,6 +412,27 @@ public sealed partial class Database
                 _ => false,
             };
         }
+    }
+
+    /// <summary>
+    /// Reports whether events of a point type can be reported in the given
+    /// variation; zero keeps the current one.
+    /// </summary>
+    /// <remarks>
+    /// Octet strings and virtual terminal blocks take their variation from the
+    /// value's length, so there is no variation to check. Accepted, an event
+    /// variation with no encoding would make every event the point raised
+    /// impossible to report.
+    /// </remarks>
+    private static bool EventVariationEncodable(PointType pt, byte variation)
+    {
+        if (variation == 0 || pt is PointType.OctetString or PointType.VirtualTerminal)
+        {
+            return true;
+        }
+
+        return ObjectRegistry.TryLookup(GroupVar.GV(ResponseWriter.EventGroup(pt), variation), out var d) &&
+            d.TrySizeOctets(out var size) && size > 0;
     }
 
     private static bool SetConfig<T>(Point<T>[] pts, ushort index, PointConfig config)
@@ -608,7 +634,7 @@ public sealed partial class Database
                 return;
             }
 
-            SetFrozen(index, v);
+            SetFrozen(index, v, freeze: false);
         }
     }
 
@@ -654,17 +680,30 @@ public sealed partial class Database
         {
             if (index < _frozenAnalog.Length)
             {
-                SetFrozenAnalog(index, v);
+                SetFrozenAnalog(index, v, freeze: false);
             }
         }
     }
 
-    private void SetFrozenAnalog(int index, Analog v)
+    /// <summary>
+    /// <see cref="SetFrozen"/> for a frozen analog: its deadband decides whether
+    /// a stored value reports, and a freeze always does.
+    /// </summary>
+    private void SetFrozenAnalog(int index, Analog v, bool freeze)
     {
         var p = _frozenAnalog[index];
         var flagsChanged = p.Value.Flags != v.Flags;
         p.Value = v;
-        if (p.ShouldReport(v.Value, flagsChanged))
+        var report = p.ShouldReport(v.Value, flagsChanged);
+        if (freeze && !report)
+        {
+            // The deadband measures from the value last reported, which this
+            // event now is.
+            p.Reported = v.Value;
+            report = true;
+        }
+
+        if (report)
         {
             Raise(p.Config, new Event
             {
@@ -694,7 +733,7 @@ public sealed partial class Database
             for (var i = (int)start; i <= stop && i < n; i++)
             {
                 var v = _analog[i].Value with { Time = at };
-                SetFrozenAnalog(i, v);
+                SetFrozenAnalog(i, v, freeze: true);
                 if (!clear)
                 {
                     continue;
@@ -1099,16 +1138,25 @@ public sealed partial class Database
     /// Stores a frozen counter value and raises an event if it changed.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Shared by <see cref="UpdateFrozenCounter"/> and the freeze functions so
-    /// the two cannot disagree about when a frozen counter reports. The caller
-    /// holds the lock.
+    /// the two cannot disagree about anything else. The caller holds the lock.
+    /// </para>
+    /// <para>
+    /// A freeze is itself the news, so with <paramref name="freeze"/> it raises
+    /// an event whether or not the value changed. The master asked for a
+    /// snapshot, and the event is how it learns when the snapshot was taken: a
+    /// counter that has not moved since the last freeze is frozen again all the
+    /// same, at a new time, and leaving its event out would make it look as
+    /// though that point was never frozen at all.
+    /// </para>
     /// </remarks>
-    private void SetFrozen(int i, FrozenCounter v)
+    private void SetFrozen(int i, FrozenCounter v, bool freeze)
     {
         var p = _frozen[i];
         var changed = p.Value.Value != v.Value || p.Value.Flags != v.Flags;
         p.Value = v;
-        if (!changed)
+        if (!changed && !freeze)
         {
             return;
         }
@@ -1139,12 +1187,11 @@ public sealed partial class Database
     /// <remarks>
     /// A frozen value is a snapshot, and <paramref name="at"/> is when it was
     /// taken: the time the frozen counter variations that carry one report,
-    /// rather than whenever the running counter last happened to change. Each
-    /// frozen counter that changes raises an event just as an application
-    /// update would, which is how a master polling events learns a freeze
-    /// produced something new — writing the value in place, as this once did,
-    /// left event-driven masters to discover it only by reading the frozen
-    /// counters outright.
+    /// rather than whenever the running counter last happened to change. Every
+    /// frozen counter raises an event, changed or not, which is how a master
+    /// polling events learns when the freeze happened — writing the value in
+    /// place, as this once did, left event-driven masters to discover it only
+    /// by reading the frozen counters outright.
     /// </remarks>
     public void FreezeCounters(ushort start, ushort stop, Timestamp at) =>
         FreezeCounters(start, stop, at, false);
@@ -1166,7 +1213,7 @@ public sealed partial class Database
             for (var i = (int)start; i <= stop && i < n; i++)
             {
                 var c = _counter[i].Value;
-                SetFrozen(i, new FrozenCounter(c.Value, c.Flags, at));
+                SetFrozen(i, new FrozenCounter(c.Value, c.Flags, at), freeze: true);
                 if (clear)
                 {
                     SetCounter(i, new Counter(0, c.Flags, at));

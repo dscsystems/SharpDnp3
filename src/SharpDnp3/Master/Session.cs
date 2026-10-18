@@ -692,12 +692,23 @@ public sealed partial class MasterSession
         var now = _time.GetUtcNow();
         var floor = TimeSpan.FromMilliseconds(1);
 
+        // An unacknowledged link frame is retried at the link timeout whether
+        // or not a request is waiting on it; sleeping until the response
+        // deadline would let the link layer's whole retry budget collapse into
+        // one late retransmission.
+        var linkPending = _stack is not null && _stack.Pending;
         if (_inflight is not null)
         {
-            return Max(_inflight.Deadline - now, floor);
+            var next = _inflight.Deadline;
+            if (linkPending && _linkDeadline < next)
+            {
+                next = _linkDeadline;
+            }
+
+            return Max(next - now, floor);
         }
 
-        if (_stack is not null && _stack.Pending)
+        if (linkPending)
         {
             return Max(_linkDeadline - now, floor);
         }
@@ -783,7 +794,7 @@ public sealed partial class MasterSession
 
         try
         {
-            _stack!.Send(_sink, fragment);
+            Send(fragment);
         }
         catch (Dnp3Exception ex)
         {
@@ -1190,6 +1201,23 @@ public sealed partial class MasterSession
         }
     }
 
+    /// <summary>
+    /// Transmits a fragment and, when the link layer is now waiting for an
+    /// acknowledgement, arms the retransmission timer.
+    /// </summary>
+    /// <remarks>
+    /// Without the timer the deadline is whatever it was last set to — usually
+    /// long past — and the frame would be retransmitted on the very next tick.
+    /// </remarks>
+    private void Send(byte[] fragment)
+    {
+        _stack!.Send(_sink, fragment);
+        if (_stack.Pending)
+        {
+            _linkDeadline = _time.GetUtcNow() + _cfg.LinkTimeout;
+        }
+    }
+
     /// <summary>Answers a fragment that asked to be confirmed.</summary>
     private void SendConfirm(byte seq, bool unsolicited)
     {
@@ -1201,7 +1229,7 @@ public sealed partial class MasterSession
 
         try
         {
-            _stack!.Send(_sink, [.. dst]);
+            Send([.. dst]);
         }
         catch (Dnp3Exception ex)
         {

@@ -198,6 +198,18 @@ public sealed class Bus : IDisposable
     private Task? _pump;
     private BusStats _stats;
     private bool _closed;
+
+    /// <summary>Reports whether the bus has been closed.</summary>
+    internal bool IsClosed
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _closed;
+            }
+        }
+    }
     private bool _stopped;
     private Exception? _error;
 
@@ -719,6 +731,12 @@ public sealed class Bus : IDisposable
                     Dnp3LogLevel.Warn,
                     "station queue full; frame dropped",
                     ("station", c.Station.Address));
+
+                // The session never sees this frame, so as far as it knows the
+                // exchange is still open. Ending its hold on the strength of a
+                // frame it did not receive would hand the line to another
+                // master mid-exchange; the hold lapses on its own instead.
+                continue;
             }
 
             Arbiter.Observe(c, complete);

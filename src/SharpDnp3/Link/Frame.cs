@@ -60,20 +60,22 @@ public static class LinkConstants
     // ---- Reserved and broadcast addresses ----
 
     /// <summary>
-    /// Addresses every outstation and requests no application confirmation.
+    /// Addresses every outstation, leaving it to each whether the response
+    /// reporting the broadcast asks for an application confirmation.
     /// </summary>
-    public const ushort BroadcastNoConfirm = 0xFFFF;
+    public const ushort BroadcastOptionalConfirm = 0xFFFF;
 
     /// <summary>
-    /// Addresses every outstation and requires an application confirmation.
+    /// Addresses every outstation, and has the response reporting the broadcast
+    /// ask for an application confirmation.
     /// </summary>
     public const ushort BroadcastMandatoryConfirm = 0xFFFE;
 
     /// <summary>
-    /// Addresses every outstation, leaving the confirmation to the
-    /// outstation's discretion.
+    /// Addresses every outstation, and has the response reporting the broadcast
+    /// not ask for an application confirmation.
     /// </summary>
-    public const ushort BroadcastOptionalConfirm = 0xFFFD;
+    public const ushort BroadcastNoConfirm = 0xFFFD;
 
     /// <summary>
     /// Lets a master address an outstation without knowing its configured
@@ -89,7 +91,7 @@ public static class LinkConstants
     /// addresses.
     /// </summary>
     public static bool IsBroadcast(ushort address) =>
-        address is >= BroadcastOptionalConfirm and <= BroadcastNoConfirm;
+        address is >= BroadcastNoConfirm and <= BroadcastOptionalConfirm;
 
     /// <summary>
     /// Reports whether <paramref name="address"/> falls in the reserved range,

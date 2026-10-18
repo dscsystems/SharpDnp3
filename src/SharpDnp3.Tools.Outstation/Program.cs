@@ -134,6 +134,7 @@ var config = new OutstationConfig
 };
 
 var attributes = plant.Device.ToAttributes();
+config.DisableAttributes = plant.Device.Disabled;
 foreach (var attribute in attributes)
 {
     config.Attributes.Add(attribute);
@@ -165,7 +166,7 @@ Console.CancelKeyPress += (_, e) =>
 
 Console.Write(simulator.Describe());
 Console.WriteLine();
-Console.Write(DeviceConfig.Describe(attributes));
+Console.Write(DeviceConfig.Describe(attributes, plant.Device.Disabled));
 Console.WriteLine(DescribeFiles(config.Files));
 Console.WriteLine();
 Console.WriteLine(string.Format(

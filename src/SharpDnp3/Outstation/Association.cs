@@ -212,6 +212,13 @@ internal sealed class Association
     /// </remarks>
     public volatile bool RestartPending;
 
+    /// <summary>
+    /// A read that arrived while an unsolicited response was awaiting
+    /// confirmation, held until the confirmation or its timeout. Its fragment is
+    /// the association's own copy.
+    /// </summary>
+    public Received? DeferredRead;
+
     /// <summary>Names the far end of a connection as well as it can be named.</summary>
     public static string Describe(Stream conn, IChannel channel) =>
         (conn as IPeerEndpoint)?.Peer ?? channel.ToString() ?? "unknown";
