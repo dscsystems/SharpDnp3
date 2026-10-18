@@ -340,11 +340,35 @@ internal sealed class Commands : ICommandHandler
 
 // Supplies the clock and the restart behaviour. Deriving from NopApplication
 // gives working defaults for anything we leave out.
+//
+// Accepting a clock write tells the master the outstation is now synchronized,
+// so the write has to take effect: here it is kept as an offset from the host
+// clock, which an outstation process should not be changing. Never return true
+// without applying it.
 internal sealed class Application : NopApplication
 {
-    public override DateTimeOffset Now() => DateTimeOffset.UtcNow;
+    private readonly Lock _gate = new();
+    private TimeSpan _offset;
+
+    public override DateTimeOffset Now()
+    {
+        lock (_gate)
+        {
+            return DateTimeOffset.UtcNow + _offset;
+        }
+    }
+
     public override bool SupportsWriteTime() => true;
-    public override bool WriteAbsoluteTime(DateTimeOffset t) => true; // accept the master's clock
+
+    public override bool WriteAbsoluteTime(DateTimeOffset t)
+    {
+        lock (_gate)
+        {
+            _offset = t - DateTimeOffset.UtcNow;
+            return true;
+        }
+    }
+
     public override TimeSpan ColdRestart() => TimeSpan.FromSeconds(30);
     public override TimeSpan WarmRestart() => TimeSpan.FromSeconds(2);
 }
@@ -408,11 +432,12 @@ while (await timer.WaitForNextTickAsync(cts.Token))
 ### The rules that matter
 
 **Update through `Session.Update`, not through `Database` directly.** The database
-is not safe for concurrent use; `Update` runs your action holding the database's
-lock, which serialises it against the protocol, and applies it before any request
-that arrives after it is answered. Touching `Database` directly is fine *before*
-`RunAsync` starts — that is where point configuration belongs — and a race
-afterwards.
+is not safe for concurrent use; `Update` runs your action as one batch holding the
+database's lock — between requests, while the session runs — in the order the
+batches were submitted. That serialises it against the protocol, and applies it
+before any request that arrives after `Update` returns is answered. Touching
+`Database` directly is fine *before* `RunAsync` starts — that is where point
+configuration belongs — and a race afterwards.
 
 **Batch related changes into one `Update`.** A breaker opening and its alarm
 asserting should be one call, so they become one consistent set of events rather
@@ -709,12 +734,22 @@ await master.DisableUnsolicitedAsync(Class.Class123, ct);
 ```
 
 Setting `HoldTime` to zero sends as soon as an event appears, which turns a
-100-point plant trip into 100 responses. After `MaxRetries` unconfirmed re-sends
-the outstation gives up on that series, returns its events to the queue for the
-next poll, and waits `RetryDelay` before trying again. `UnlimitedRetries` keeps
-re-sending instead, though a poll still ends the series — so **keep polling
-even when you use unsolicited reporting**. Unsolicited is an
-optimisation, not a substitute for a poll schedule.
+100-point plant trip into 100 responses.
+
+An unconfirmed response is re-sent after each `ConfirmTimeout`, with the same
+objects and sequence number, up to `MaxRetries` times. Once those run out the
+outstation puts the events back in the queue, where the next poll collects them,
+waits `RetryDelay`, and then starts again with a fresh response carrying
+whatever is queued. It never stops for good: against a master that has gone
+away, expect `MaxRetries + 1` transmissions every
+`(MaxRetries + 1) × ConfirmTimeout + RetryDelay` while events are pending — with
+the defaults, four every 25 seconds. `UnlimitedRetries` keeps re-sending the one
+response instead. A poll that arrives while a response awaits confirmation is
+held until the confirmation or its timeout, and then answered with the events
+the response carried. **Keep polling even when you use unsolicited reporting**:
+until a response is confirmed, a poll is the only way the events are guaranteed
+to arrive. Unsolicited is an optimisation, not a substitute for a poll
+schedule.
 
 ---
 
@@ -998,6 +1033,7 @@ quality.
 | `Management` | Receives `INITIALIZE_DATA`, `INITIALIZE_APPL`, `START_APPL`, `STOP_APPL`, `SAVE_CONFIG` with the raw object section |
 | `ActivateConfig` | Receives file names from g70v8 and answers with a g91v1 delay and status list |
 | `WritableAttributes`, `AttributeWrite` | Accepts same-type writes to the listed attributes; variation 255 reports them writable |
+| `DisableAttributes` | A device without group 0: every attribute read is refused with OBJECT_UNKNOWN, the derived counts included |
 
 An absent handler answers `NO_FUNC_CODE_SUPPORT`. Datasets are deliberately
 thin: prototype-dependent values are the application's to resolve.

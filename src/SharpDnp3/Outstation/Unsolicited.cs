@@ -37,14 +37,15 @@ internal sealed class UnsolState
     public int Retries;
 
     /// <summary>
-    /// Set when the master reads while an unsolicited response is awaiting
-    /// confirmation, which ends the series at its next timeout.
+    /// Set when the master reads while an unsolicited response with events is
+    /// awaiting confirmation, which ends the series at its next timeout.
     /// </summary>
     public bool ReadSinceSent;
 
     /// <summary>
-    /// The exact fragment last transmitted, kept so a retry can repeat it octet
-    /// for octet.
+    /// The object data of the response last transmitted, kept so a retry can
+    /// repeat it; <see cref="Retained"/> says there is one, since a null
+    /// response's body is empty.
     /// </summary>
     /// <remarks>
     /// A master tells a retransmission apart from new data purely by the
@@ -52,7 +53,17 @@ internal sealed class UnsolState
     /// — has to carry the same data too, or the master matches genuinely new
     /// events as a duplicate and discards them.
     /// </remarks>
-    public byte[]? LastFrag;
+    public byte[]? LastBody;
+
+    /// <summary>Says <see cref="LastBody"/> holds a response to retry.</summary>
+    public bool Retained;
+
+    /// <summary>Forgets the response kept for a retry.</summary>
+    public void Forget()
+    {
+        LastBody = null;
+        Retained = false;
+    }
 
     /// <summary>
     /// The earliest a further unsolicited response may be sent, which is how a
@@ -77,7 +88,7 @@ internal sealed class UnsolState
         Deadline = default;
         Retries = 0;
         ReadSinceSent = false;
-        LastFrag = null;
+        Forget();
         NextAllowed = default;
         FirstEventAt = null;
     }
@@ -201,13 +212,21 @@ public sealed partial class OutstationSession
             return;
         }
 
+        // Nothing unsolicited goes out while a solicited response is in
+        // progress. The two would be awaiting confirmations at once, and the
+        // events a confirmation of one released could be the other's.
+        if (a.PendingBodies is { Count: > 0 })
+        {
+            return;
+        }
+
         // A retry repeats the fragment the master did not confirm, exactly as
         // it went out the first time. Building a fresh one from whatever is
         // queued now would put events the master has never seen behind the
         // sequence number of a transmission it has already seen, so it would
         // match them as a duplicate, deliver none of them, and confirm them
         // away regardless.
-        if (a.Unsol.Retries > 0 && a.Unsol.LastFrag is { Length: > 0 })
+        if (a.Unsol.Retries > 0 && a.Unsol.Retained)
         {
             RetryUnsolicited(a, now);
             return;
@@ -275,6 +294,26 @@ public sealed partial class OutstationSession
             _stats.UnsolicitedTimeouts++;
         }
 
+        if (a.DeferredRead is not null && a.Unsol.NullConfirmed)
+        {
+            // A read has been waiting for this response to be confirmed. It is
+            // answered now instead of the retry, and its response carries the
+            // events this one did: sending them both ways would report them
+            // twice. The null response has no events for a read to take over,
+            // so it goes on being retried, after the read is answered.
+            var handed = a.Events.Unselect();
+            a.Log.Log(
+                Dnp3LogLevel.Debug,
+                "unsolicited response unconfirmed; answering the deferred read instead of retrying",
+                ("events_requeued", handed));
+
+            a.Unsol.Retries = 0;
+            a.Unsol.ReadSinceSent = false;
+            a.Unsol.Forget();
+            a.Unsol.NextAllowed = now + _cfg.Unsolicited.RetryDelay;
+            return;
+        }
+
         // A read while the response awaited confirmation ends the series too:
         // the master is there and polling, and repeating the same response at
         // it would keep the events it holds out of every poll's reach.
@@ -293,14 +332,15 @@ public sealed partial class OutstationSession
 
             a.Log.Log(
                 Dnp3LogLevel.Warn,
-                "unsolicited series ended unconfirmed; events requeued",
+                "unsolicited series ended unconfirmed; events requeued, pausing before the next",
                 ("retries", a.Unsol.Retries),
+                ("pause", _cfg.Unsolicited.RetryDelay),
                 ("read_since_sent", a.Unsol.ReadSinceSent),
                 ("events_requeued", requeued));
 
             a.Unsol.Retries = 0;
             a.Unsol.ReadSinceSent = false;
-            a.Unsol.LastFrag = null;
+            a.Unsol.Forget();
             a.Unsol.NextAllowed = now + _cfg.Unsolicited.RetryDelay;
             return;
         }
@@ -311,12 +351,22 @@ public sealed partial class OutstationSession
             ("attempt", a.Unsol.Retries));
     }
 
-    /// <summary>Retransmits the unconfirmed response verbatim.</summary>
+    /// <summary>
+    /// Retransmits the unconfirmed response: the same sequence number and the
+    /// same objects.
+    /// </summary>
+    /// <remarks>
+    /// The internal indications are not repeated but taken afresh. They describe
+    /// the outstation now, not when the first attempt was made, and the master
+    /// may have changed them in the meantime: a retry still asserting the
+    /// DEVICE_RESTART the master has just cleared would tell it the outstation
+    /// had restarted again.
+    /// </remarks>
     private void RetryUnsolicited(Association a, DateTimeOffset now)
     {
         try
         {
-            a.Stack.SendTo(a.Sink, a.RemoteAddr, a.Unsol.LastFrag!);
+            a.Stack.SendTo(a.Sink, a.RemoteAddr, UnsolicitedFragment(a, a.Unsol.LastBody ?? []));
         }
         catch (Dnp3Exception ex)
         {
@@ -402,7 +452,7 @@ public sealed partial class OutstationSession
         var b = new ResponseBuilder(_cfg.MaxTxFragment, ctx);
         if (!isNull)
         {
-            _writer.BuildEvents(b, events, _appl.Now, e => a.Events.Release([e]));
+            a.Events.Discard(_writer.BuildEvents(b, events, _appl.Now));
         }
 
         var body = b.Done()[0];
@@ -414,14 +464,7 @@ public sealed partial class OutstationSession
         // sequence number it already had, because that is the only thing a
         // master's duplicate detection matches on.
         a.Unsol.Seq = (byte)((a.Unsol.Seq + 1) % AppConstants.SeqModulus);
-
-        var builder = new List<byte>(AppConstants.ResponseHeaderSize + body.Length);
-        HeaderCodec.AppendHeader(builder, new AppHeader(
-            new AppControl(Fir: true, Fin: true, Con: true, Uns: true, Seq: a.Unsol.Seq),
-            FuncCode.UnsolicitedResponse,
-            CurrentIin(a)));
-        builder.AddRange(body);
-        var frag = builder.ToArray();
+        var frag = UnsolicitedFragment(a, body);
 
         try
         {
@@ -443,8 +486,10 @@ public sealed partial class OutstationSession
         a.Unsol.NullSent = a.Unsol.NullSent || isNull;
         a.Unsol.ReadSinceSent = false;
 
-        // Kept whole for a retry to repeat.
-        a.Unsol.LastFrag = frag;
+        // Kept for a retry to repeat. The body is the builder's own, built for
+        // this response alone, so holding the reference is enough.
+        a.Unsol.LastBody = body;
+        a.Unsol.Retained = true;
 
         lock (_gate)
         {
@@ -455,6 +500,21 @@ public sealed partial class OutstationSession
             Dnp3LogLevel.Debug,
             "unsolicited response sent",
             ("seq", a.Unsol.Seq), ("events", events.Count), ("null", isNull));
+    }
+
+    /// <summary>
+    /// Builds an unsolicited response carrying <paramref name="body"/>, under the
+    /// current sequence number and with the indications as they are now.
+    /// </summary>
+    private byte[] UnsolicitedFragment(Association a, byte[] body)
+    {
+        var builder = new List<byte>(AppConstants.ResponseHeaderSize + body.Length);
+        HeaderCodec.AppendHeader(builder, new AppHeader(
+            new AppControl(Fir: true, Fin: true, Con: true, Uns: true, Seq: a.Unsol.Seq),
+            FuncCode.UnsolicitedResponse,
+            CurrentIin(a)));
+        builder.AddRange(body);
+        return [.. builder];
     }
 
     /// <summary>Handles a confirmation of an unsolicited response.</summary>
@@ -472,7 +532,7 @@ public sealed partial class OutstationSession
         a.Unsol.Awaiting = false;
         a.Unsol.Retries = 0;
         a.Unsol.ReadSinceSent = false;
-        a.Unsol.LastFrag = null;
+        a.Unsol.Forget();
 
         if (!a.Unsol.NullConfirmed)
         {

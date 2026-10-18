@@ -197,9 +197,17 @@ public sealed class EventBuffer
     }
 
     /// <summary>
-    /// Returns the mask of classes that have events waiting, which is what the
-    /// internal indications report.
+    /// Returns the mask of classes that have events waiting to be reported,
+    /// which is what the internal indications report.
     /// </summary>
+    /// <remarks>
+    /// An event already selected into a response is not waiting: the response
+    /// carrying it is the report. Counting it would set IIN1.1 on the very
+    /// response that empties class 1, and a master reading that as more to
+    /// collect polls again for nothing — or, polling on the bits alone, never
+    /// sees them clear. Should the confirmation not come, the event goes back to
+    /// the queue and its class is reported again.
+    /// </remarks>
     public Class Classes()
     {
         lock (_gate)
@@ -207,7 +215,10 @@ public sealed class EventBuffer
             var mask = Class.None;
             foreach (var e in _events)
             {
-                mask |= e.Class;
+                if (!e.Selected)
+                {
+                    mask |= e.Class;
+                }
             }
 
             return mask;
@@ -329,6 +340,56 @@ public sealed class EventBuffer
                     node.Value = e;
                     n++;
                 }
+            }
+
+            return n;
+        }
+    }
+
+    /// <summary>
+    /// Removes the given events, previously handed out by <see cref="Select"/>,
+    /// because they can never be reported — no encoding exists for them, or one
+    /// alone is larger than a fragment.
+    /// </summary>
+    /// <remarks>
+    /// Keeping them would re-select them forever; dropping them quietly would
+    /// leave a hole the master cannot see. So they count as lost, and the
+    /// overflow indication says so.
+    /// </remarks>
+    public int Discard(IReadOnlyList<Event> events)
+    {
+        ArgumentNullException.ThrowIfNull(events);
+        if (events.Count == 0)
+        {
+            return 0;
+        }
+
+        lock (_gate)
+        {
+            var discard = new HashSet<ulong>(events.Count);
+            foreach (var e in events)
+            {
+                discard.Add(e.Seq);
+            }
+
+            var n = 0;
+            var node = _events.First;
+            while (node is not null)
+            {
+                var next = node.Next;
+                if (node.Value.Selected && discard.Contains(node.Value.Seq))
+                {
+                    _events.Remove(node);
+                    n++;
+                }
+
+                node = next;
+            }
+
+            if (n > 0)
+            {
+                _overflow = true;
+                _drops += (ulong)n;
             }
 
             return n;

@@ -90,6 +90,17 @@ public sealed class BusRegistry
 
         lock (_gate)
         {
+            if (_entries.TryGetValue(key, out var stale) && stale.Bus.IsClosed)
+            {
+                // Someone closed the bus directly rather than releasing it. Its
+                // channel is closed with it, so handing it out would give the
+                // caller a bus that can never connect; build a new one on
+                // channel instead. The callers still holding the old one have
+                // nothing left to release.
+                _entries.Remove(key);
+                _byBus.Remove(stale.Bus);
+            }
+
             if (_entries.TryGetValue(key, out var existing))
             {
                 existing.Refs++;

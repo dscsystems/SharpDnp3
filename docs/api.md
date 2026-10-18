@@ -513,6 +513,7 @@ public sealed class TlsServerChannel : IChannel
 {
     public TlsServerChannel(string address, Dnp3TlsConfig tls);
     public IPEndPoint? BoundAddress { get; }
+    public TimeSpan HandshakeTimeout { get; init; } // default 10s
 }
 
 public sealed class UdpChannel : IChannel
@@ -553,6 +554,16 @@ configured with `MaxMasters` above one over a channel that says no is refused at
 
 `BoundAddress` is how a test asks for port `0` and finds out which port it got.
 
+A server's `ConnectAsync` returns only a usable connection, throws
+`ChannelClosedException` once the channel is closed, or throws
+`OperationCanceledException` for the token. A failed accept is waited out and
+retried, backing off from 5 ms to 1 s, and a peer that fails the TLS handshake
+(bounded by `HandshakeTimeout`) is dropped while the server waits for the next.
+Sessions treat any other connect error as fatal, so a server never hands them a
+passing one. A dialling channel closed while a dial is in progress closes the
+connection it made and throws `ChannelClosedException`, rather than returning a
+connection nobody will close.
+
 `Pipe.Create` returns two channels connected to each other in memory. This is
 what every integration test runs over and what the explorer's demo mode uses: a
 full master and outstation talking through the real link, transport and
@@ -571,8 +582,8 @@ interface, dual-stack.
 public readonly record struct Retry
 {
     public TimeSpan Min { get; init; }
-    public TimeSpan Max { get; init; }   // zero means uncapped
-    public double Factor { get; init; }
+    public TimeSpan Max { get; init; }   // zero or less: Default.Max
+    public double Factor { get; init; }  // below 1: taken as 1
     public double Jitter { get; init; }  // fraction of the delay to randomise, 0 to 1
 
     public static Retry Default { get; } // 500ms → 60s, factor 2, jitter 0.2
@@ -585,6 +596,10 @@ public readonly record struct Retry
 
 `Retry.None` connects once and gives up, which is what tests and one-shot tools
 want.
+
+A `Min` of zero or less means no retry. A `Max` of zero or less caps the delay
+at `Retry.Default.Max`, and a `Factor` below 1 is taken as 1 — a constant delay
+— so a zero-valued field never turns reconnection into a hot spin.
 
 The jitter matters more than it looks. A substation that loses a switch brings
 every master's connection down at the same instant; without jitter they all retry
@@ -1019,14 +1034,21 @@ public sealed partial class OutstationSession
 }
 ```
 
-A null `IOutstationApplication` uses `NopApplication`. **A null `ICommandHandler`
+A null `IOutstationApplication` keeps a master's clock writes as an offset from
+the host's clock, so the time the master sets is the time the outstation
+reports. **A null `ICommandHandler`
 uses `RejectingCommandHandler`, which refuses every control** — an outstation
 whose controls are not wired up must say so rather than silently report success.
 
 `Update` applies the action holding the database's lock and is safe to call from
-anywhere. An update queued before a request arrives is applied before that
-request is answered, so a master that polls after your application reports a
-change is told about the change. Batching related changes in one call is what makes a breaker opening
+anywhere. Batches are applied in the order they were submitted, however many are
+waiting, and none is applied while a request is being answered. While `RunAsync`
+is running, the action is queued and `Update` returns without waiting for it; a
+request that arrives after `Update` returns is answered with the batch applied,
+so a master that polls after your application reports a change is told about
+the change. Before `RunAsync`, and after it returns, there is no protocol for a
+batch to interleave with, so the action is applied before `Update` returns, and
+changes made before the session starts are in place when it does. Batching related changes in one call is what makes a breaker opening
 and its alarm asserting produce one consistent set of events rather than a torn
 read:
 
@@ -1115,8 +1137,13 @@ public sealed class OutstationConfig
 
     public TimeSpan ConfirmTimeout { get; set; } // default 5s; wait for an application confirm before requeueing events
     public TimeSpan SelectTimeout { get; set; }  // default 5s; how long a select reservation stays valid
+    public int MaxControlsPerRequest { get; set; } // zero: no limit; past it, TOO_MANY_OPS
 
     public UnsolicitedConfig Unsolicited { get; set; }
+    public ClockConfig Clock { get; set; }    // when NEED_TIME is asked again, and how long the clock is trusted
+
+    public IList<DeviceAttribute> Attributes { get; } // group 0; the counts and fragment sizes are derived
+    public bool DisableAttributes { get; set; }      // no group 0 at all: every attribute read is refused
 
     public bool UseLinkConfirms { get; set; }
     public int LinkRetries { get; set; }
@@ -1147,14 +1174,34 @@ public sealed class UnsolicitedConfig
     public bool UnlimitedRetries { get; set; }    // re-send for as long as it goes unconfirmed
     public TimeSpan RetryDelay { get; set; }      // wait before a new series after one fails; default 5s
 }
+
+public sealed class ClockConfig
+{
+    public TimeSpan SyncInterval { get; set; } // NEED_TIME again this long after a clock write; zero: never
+    public TimeSpan Holdover { get; set; }     // then unsynchronized this much later; zero: at once
+}
 ```
 
 `Enabled` alone does not start unsolicited reporting: the master still has to
-enable the individual classes with ENABLE_UNSOLICITED. After `MaxRetries`
-unconfirmed re-sends (or never, with `UnlimitedRetries`) the series ends: its
-events go back in the queue for the next poll, and a new series may start after
-`RetryDelay`. A read while a response awaits confirmation also ends the series
-at its next timeout, so a polling master is never kept from those events.
+enable the individual classes with ENABLE_UNSOLICITED. With `Enabled` off,
+ENABLE_UNSOLICITED and DISABLE_UNSOLICITED are answered NO_FUNC_CODE_SUPPORT.
+
+A retry repeats the objects and the sequence number of the response the master
+did not confirm, with the internal indications as they are now. After
+`MaxRetries` unconfirmed re-sends (or never, with `UnlimitedRetries`) the series
+ends: its events go back in the queue, and after `RetryDelay` a new series
+starts with a fresh sequence number and the same events. It does not stop until
+the master confirms one or polls.
+
+A read that arrives while an unsolicited response awaits confirmation is held
+until the confirmation or its timeout, and no unsolicited response goes out
+while a solicited one is in progress. When the timeout comes first, the read is
+answered instead of the retry, carrying the events the unsolicited response
+held.
+
+With `Clock` set, the outstation asks for the time again (NEED_TIME)
+`SyncInterval` after each clock write, and reports its timestamps as
+unsynchronized `Holdover` after that: a clock set once is not trusted forever.
 
 ## Database
 
@@ -1300,10 +1347,22 @@ public interface IOutstationApplication
 }
 
 public class NopApplication : IOutstationApplication; // usable defaults; every method virtual
+
+public interface IRestartSupport       // optional, on the application
+{
+    bool SupportsColdRestart();
+    bool SupportsWarmRestart();
+}
 ```
 
 The returned restart duration is reported back to the master in a group 52 time
-delay.
+delay. An application that also implements `IRestartSupport` can refuse either
+restart: the request is then answered NO_FUNC_CODE_SUPPORT with no time delay.
+
+`NopApplication.WriteAbsoluteTime` accepts a clock write and discards it, so the
+outstation clears NEED_TIME and reports timestamps as synchronized from a clock
+nobody set. Derive from it only to override `WriteAbsoluteTime` with something
+that applies the time, or pass a null application, which does.
 
 ## ICommandHandler
 
@@ -1318,7 +1377,20 @@ public interface ICommandHandler
 }
 
 public sealed class RejectingCommandHandler : ICommandHandler; // refuses everything with NOT_SUPPORTED
+
+public interface IOutputPoints         // optional, on the handler
+{
+    bool HasOutput(PointType pt, ushort index); // BinaryOutputStatus or AnalogOutputStatus
+}
 ```
+
+A command for an output the device lacks is answered NOT_SUPPORTED with
+PARAMETER_ERROR, without reaching the handler. Which outputs exist is the
+handler's to say if it implements `IOutputPoints`; otherwise it is the
+database's output status points, and a database with none lets any output
+through. A handler that serves outputs with no status point should implement
+it. An OPERATE after the select has timed out is answered TIMEOUT, and the
+commands past `MaxControlsPerRequest` in one request TOO_MANY_OPS.
 
 **Select must not operate anything.** It reports whether the outstation *would*
 accept the command. Operate is called for OPERATE, DIRECT_OPERATE and
@@ -1358,10 +1430,11 @@ public sealed class EventBuffer
     public List<Event> Select(Class mask, int limit);
     public int Confirm();
     public int Unselect();
+    public int Discard(IReadOnlyList<Event> events); // selected events that cannot be reported: dropped, counted as overflow
     public int Count(Class mask);
     public int Total { get; }
     public int SelectedCount { get; }
-    public Class Classes();
+    public Class Classes();   // the classes with events not yet selected: what IIN1.1–1.3 report
     public bool Overflowed { get; }
     public void ClearOverflow();
     public void Reset();
@@ -1766,6 +1839,9 @@ public record struct LinkStats { public ulong FramesDecoded, HeaderCrcErrors, Bo
                                  BadLength, BytesDiscarded, Resyncs; }
 public static class LinkConstants { public const int MaxFrameSize = 292; public const int MaxPayload = 250;
                                     public const ushort SelfAddress = 0xFFFC;
+                                    public const ushort BroadcastNoConfirm = 0xFFFD;        // the report does not ask for a confirm
+                                    public const ushort BroadcastMandatoryConfirm = 0xFFFE; // the report asks for one
+                                    public const ushort BroadcastOptionalConfirm = 0xFFFF;  // the outstation's choice
                                     public static bool IsBroadcast(ushort address); /* … */ }
 
 // SharpDnp3.Transport

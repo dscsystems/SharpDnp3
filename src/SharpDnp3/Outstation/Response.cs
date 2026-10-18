@@ -137,19 +137,11 @@ internal sealed class ResponseWriter
             return;
         }
 
-        if (variation != 0)
-        {
-            // An explicit variation is the master's choice, and every point in
-            // the range is reported as what it asked for.
-            BuildStaticRun(b, pt, Database.StaticGroupVar(pt, variation), start, stop);
-            return;
-        }
-
-        // Variation zero means "each point's own default" — the static
-        // variation its configuration set, which can differ from one point to
-        // the next. An object header carries exactly one variation, so points
-        // that disagree cannot share one: the range is reported as runs of
-        // consecutive points that agree, each under its own header.
+        // Each point is reported in the variation TryReportVariation picks for
+        // it, which can differ from one point to the next. An object header
+        // carries exactly one variation, so points that disagree cannot share
+        // one: the range is reported as runs of consecutive points that agree,
+        // each under its own header.
         //
         // Resolving the variation once from the first point and applying it to
         // the rest reports every later point in a variation it did not ask
@@ -160,7 +152,7 @@ internal sealed class ResponseWriter
         // The loop counts in int so a range ending at 0xFFFF cannot wrap.
         for (var idx = (int)start; idx <= stop;)
         {
-            if (!TryStaticVariation(pt, (ushort)idx, out var v))
+            if (!TryReportVariation(pt, variation, (ushort)idx, out var v))
             {
                 return;
             }
@@ -168,7 +160,7 @@ internal sealed class ResponseWriter
             var end = idx;
             while (end < stop)
             {
-                if (!TryStaticVariation(pt, (ushort)(end + 1), out var next) || next != v)
+                if (!TryReportVariation(pt, variation, (ushort)(end + 1), out var next) || next != v)
                 {
                     break;
                 }
@@ -189,18 +181,176 @@ internal sealed class ResponseWriter
     }
 
     /// <summary>
-    /// Returns the static variation a point is configured to be reported in.
+    /// Returns the variation to report a static point in, for a read that asked
+    /// for <paramref name="requested"/>: that, or for variation zero the one the
+    /// point is configured with.
     /// </summary>
-    private bool TryStaticVariation(PointType pt, ushort index, out byte variation)
+    /// <remarks>
+    /// A variation without flags is only for a point whose flags are normal,
+    /// which is what leaving them out says. A point that is offline, or forced,
+    /// or restarting is reported in the matching variation with flags instead,
+    /// or the master would read its value as good.
+    /// </remarks>
+    private bool TryReportVariation(PointType pt, byte requested, ushort index, out byte variation)
     {
-        if (TryPointConfig(pt, index, out var cfg))
+        if (!TryStaticPoint(pt, index, out variation, out var flags))
         {
-            variation = cfg.StaticVariation;
-            return true;
+            return false;
         }
 
-        variation = 0;
-        return false;
+        if (requested != 0)
+        {
+            variation = requested;
+        }
+
+        if (flags != Flags.Online && WithFlags(pt, variation) is var flagged and not 0)
+        {
+            variation = flagged;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Maps a static variation without flags to the one that carries the same
+    /// value with them, or returns zero for a variation that has flags already.
+    /// </summary>
+    private static byte WithFlags(PointType pt, byte variation) => (pt, variation) switch
+    {
+        (PointType.Binary or PointType.DoubleBitBinary or PointType.BinaryOutputStatus, 1) => 2,
+        (PointType.Counter, 5) => 1,
+        (PointType.Counter, 6) => 2,
+        (PointType.FrozenCounter, 9) => 1,
+        (PointType.FrozenCounter, 10) => 2,
+        (PointType.Analog, 3) => 1,
+        (PointType.Analog, 4) => 2,
+        (PointType.FrozenAnalog, 5) => 1,
+        (PointType.FrozenAnalog, 6) => 2,
+        _ => 0,
+    };
+
+    /// <summary>
+    /// Returns the static variation a point is configured to be reported in,
+    /// and its flags.
+    /// </summary>
+    /// <remarks>
+    /// A binary's flags octet carries its state in the top bit, and a double
+    /// bit's in the top two; a value parsed off the wire keeps them there, and
+    /// they say nothing about whether the point is normal.
+    /// </remarks>
+    private bool TryStaticPoint(PointType pt, ushort index, out byte variation, out Flags flags)
+    {
+        bool ok;
+        PointConfig cfg;
+        switch (pt)
+        {
+            case PointType.Binary:
+                ok = _db.TryGetBinary(index, out var bv, out cfg);
+                flags = bv.Flags & ~Flags.StateBit;
+                break;
+            case PointType.DoubleBitBinary:
+                ok = _db.TryGetDoubleBit(index, out var dv, out cfg);
+                flags = dv.Flags & new Flags(0x3F);
+                break;
+            case PointType.Counter:
+                ok = _db.TryGetCounter(index, out var cv, out cfg);
+                flags = cv.Flags;
+                break;
+            case PointType.FrozenCounter:
+                ok = _db.TryGetFrozenCounter(index, out var fv, out cfg);
+                flags = fv.Flags;
+                break;
+            case PointType.Analog:
+                ok = _db.TryGetAnalog(index, out var av, out cfg);
+                flags = av.Flags;
+                break;
+            case PointType.FrozenAnalog:
+                ok = _db.TryGetFrozenAnalog(index, out var fav, out cfg);
+                flags = fav.Flags;
+                break;
+            case PointType.BinaryOutputStatus:
+                ok = _db.TryGetBinaryOutputStatus(index, out var bov, out cfg);
+                flags = bov.Flags & ~Flags.StateBit;
+                break;
+            case PointType.AnalogOutputStatus:
+                ok = _db.TryGetAnalogOutputStatus(index, out var aov, out cfg);
+                flags = aov.Flags;
+                break;
+            default:
+                ok = false;
+                cfg = default;
+                flags = default;
+                break;
+        }
+
+        variation = cfg.StaticVariation;
+        return ok;
+    }
+
+    /// <summary>
+    /// Returns how many bits a point takes in a bit-packed variation, or zero
+    /// for one that is not.
+    /// </summary>
+    private static int PackedBits(GroupVar gv) => (gv.Group, gv.Variation) switch
+    {
+        (1, 1) or (10, 1) => 1,
+        (3, 1) => 2,
+        _ => 0,
+    };
+
+    /// <summary>
+    /// <see cref="BuildStaticRun"/> for a bit-packed variation, whose points
+    /// share octets: the unit of encoding is the range, not the object, so a
+    /// run is sized in bits.
+    /// </summary>
+    private bool BuildPackedRun(ResponseBuilder b, PointType pt, GroupVar gv, int bits, ushort start, ushort stop)
+    {
+        // Worst-case 16-bit range.
+        const int HeaderOverhead = ObjectHeader.ObjectHeaderSize + 4;
+
+        for (var idx = (int)start; idx <= stop;)
+        {
+            var capacity = (b.Room - HeaderOverhead) * 8 / bits;
+            if (capacity < 1)
+            {
+                b.Flush();
+                capacity = (b.Room - HeaderOverhead) * 8 / bits;
+                if (capacity < 1)
+                {
+                    return false;
+                }
+            }
+
+            var last = Math.Min(idx + capacity - 1, stop);
+            var data = new byte[(((last - idx + 1) * bits) + 7) / 8];
+            for (var i = idx; i <= last; i++)
+            {
+                int value;
+                if (pt == PointType.DoubleBitBinary)
+                {
+                    _db.TryGetDoubleBit((ushort)i, out var dv, out _);
+                    value = (int)dv.Value & 0x03;
+                }
+                else if (pt == PointType.BinaryOutputStatus)
+                {
+                    _db.TryGetBinaryOutputStatus((ushort)i, out var bov, out _);
+                    value = bov.Value ? 1 : 0;
+                }
+                else
+                {
+                    _db.TryGetBinary((ushort)i, out var bv, out _);
+                    value = bv.Value ? 1 : 0;
+                }
+
+                var bit = (i - idx) * bits;
+                data[bit / 8] |= (byte)(value << (bit % 8));
+            }
+
+            b.Add(RangeObjectHeader(gv, (ushort)idx, (ushort)last, data));
+            idx = last + 1;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -211,6 +361,11 @@ internal sealed class ResponseWriter
     /// <returns><see langword="false"/> when nothing more can be written.</returns>
     private bool BuildStaticRun(ResponseBuilder b, PointType pt, GroupVar gv, ushort start, ushort stop)
     {
+        if (PackedBits(gv) is var bits and > 0)
+        {
+            return BuildPackedRun(b, pt, gv, bits, start, stop);
+        }
+
         if (!ObjectRegistry.TryLookup(gv, out var d))
         {
             return false;
@@ -347,27 +502,6 @@ internal sealed class ResponseWriter
             default:
                 break;
         }
-    }
-
-    /// <summary>Returns a point's configuration.</summary>
-    private bool TryPointConfig(PointType pt, ushort index, out PointConfig config) => pt switch
-    {
-        PointType.Binary => _db.TryGetBinary(index, out _, out config),
-        PointType.DoubleBitBinary => _db.TryGetDoubleBit(index, out _, out config),
-        PointType.Counter => _db.TryGetCounter(index, out _, out config),
-        PointType.FrozenCounter => _db.TryGetFrozenCounter(index, out _, out config),
-        PointType.Analog => _db.TryGetAnalog(index, out _, out config),
-        PointType.FrozenAnalog => _db.TryGetFrozenAnalog(index, out _, out config),
-        PointType.BinaryOutputStatus => _db.TryGetBinaryOutputStatus(index, out _, out config),
-        PointType.AnalogOutputStatus => _db.TryGetAnalogOutputStatus(index, out _, out config),
-        PointType.OctetString => _db.TryGetOctetString(index, out _, out config),
-        _ => Fail(out config),
-    };
-
-    private static bool Fail(out PointConfig config)
-    {
-        config = default;
-        return false;
     }
 
     internal static int TypeCount(DatabaseConfig c, PointType pt) => pt switch
@@ -549,19 +683,30 @@ internal sealed class ResponseWriter
         return pt != PointType.Unknown;
     }
 
-    /// <summary>Appends event objects for the selected events.</summary>
+    /// <summary>
+    /// Appends event objects for the selected events, and returns the ones it
+    /// could not encode at all: a variation with no encoding, or an object
+    /// larger than an empty fragment.
+    /// </summary>
     /// <remarks>
+    /// <para>
+    /// Those can never be sent, and the caller has to take them out of the
+    /// selection — otherwise confirming the response would delete them as
+    /// though the master had received them.
+    /// </para>
+    /// <para>
     /// Events carry per-object index prefixes because the points that changed
     /// are not contiguous, and they are grouped into runs sharing a group and
     /// variation so a burst of analog changes becomes one header rather than
     /// fifty.
+    /// </para>
     /// </remarks>
-    public void BuildEvents(
+    public List<Event> BuildEvents(
         ResponseBuilder b,
         IReadOnlyList<Event> events,
-        Func<DateTimeOffset>? now = null,
-        Action<Event>? release = null)
+        Func<DateTimeOffset>? now = null)
     {
+        var unsent = new List<Event>();
         for (var i = 0; i < events.Count;)
         {
             if (events[i].Type == PointType.Dataset)
@@ -574,7 +719,7 @@ internal sealed class ResponseWriter
                 }
                 else
                 {
-                    release?.Invoke(events[i]);
+                    unsent.Add(events[i]);
                 }
 
                 i++;
@@ -600,29 +745,21 @@ internal sealed class ResponseWriter
             {
                 if (!CommandEventCodec.TrySize(gv.Group, gv.Variation, out size))
                 {
-                    i++;
-                    continue;
+                    size = 0;
                 }
             }
             else
             {
-                if (!ObjectRegistry.TryLookup(gv, out var d))
+                size = 0;
+                if (ObjectRegistry.TryLookup(gv, out var d) && d.TrySizeOctets(out size))
                 {
-                    i++;
-                    continue;
+                    relative = d.RelativeTime;
                 }
-
-                if (!d.TrySizeOctets(out size))
-                {
-                    i++;
-                    continue;
-                }
-
-                relative = d.RelativeTime;
             }
 
             if (size == 0)
             {
+                unsent.Add(events[i]);
                 i++;
                 continue;
             }
@@ -680,7 +817,11 @@ internal sealed class ResponseWriter
                     avail = b.Room - ctoSize - headerOverhead;
                     if (avail < perObject)
                     {
-                        return;
+                        // Not one of them fits an empty fragment, so none of
+                        // the run ever will; the events after it may.
+                        unsent.AddRange(events.Skip(i).Take(j - i));
+                        i = j;
+                        break;
                     }
                 }
 
@@ -727,6 +868,8 @@ internal sealed class ResponseWriter
                 i += runLen;
             }
         }
+
+        return unsent;
     }
 
     /// <summary>

@@ -48,8 +48,8 @@ public class UnsolicitedRetryTests
     }
 
     /// <summary>
-    /// The retry repeats the fragment the master did not confirm, exactly as it
-    /// went out the first time.
+    /// The retry repeats the objects and the sequence number of the response the
+    /// master did not confirm. Only the internal indications are taken afresh.
     /// </summary>
     [Fact]
     public async Task UnsolicitedRetryKeepsItsSequenceNumberAndContent()
@@ -74,7 +74,9 @@ public class UnsolicitedRetryTests
         var retry = await h.AwaitAsync(after + 1);
 
         Assert.Equal(first.Header.Control.Seq, retry.Header.Control.Seq);
-        Assert.Equal(first.Raw.ToArray(), retry.Raw.ToArray());
+        Assert.Equal(
+            first.Raw[first.Header.Size..].ToArray(),
+            retry.Raw[retry.Header.Size..].ToArray());
     }
 
     /// <summary>
@@ -134,6 +136,39 @@ public class UnsolicitedRetryTests
     }
 
     /// <summary>
+    /// What happens when the retries run out: the events go back in the queue,
+    /// the outstation waits <see cref="UnsolicitedConfig.RetryDelay"/>, and then
+    /// starts again with a fresh response — a new sequence number, the same
+    /// events. It does not stop until a poll.
+    /// </summary>
+    [Fact]
+    public async Task UnsolicitedStartsAgainAfterTheRetriesRunOut()
+    {
+        var confirmTimeout = TimeSpan.FromMilliseconds(150);
+        var config = Config();
+        config.Unsolicited.MaxRetries = 1;
+        config.Unsolicited.RetryDelay = confirmTimeout;
+        await using var h = new Harness(config);
+        var after = await ReadyAsync(h);
+
+        h.Outstation.Update(db =>
+            db.UpdateBinary(0, new Binary(true, Flags.Online, default)));
+
+        var original = await h.AwaitAsync(after);
+        var retry = await h.AwaitAsync(after + 1);
+        var retried = DateTime.UtcNow;
+        var fresh = await h.AwaitAsync(after + 2);
+        var gap = DateTime.UtcNow - retried;
+
+        Assert.Equal(original.Header.Control.Seq, retry.Header.Control.Seq);
+        Assert.NotEqual(original.Header.Control.Seq, fresh.Header.Control.Seq);
+        Assert.NotEmpty(fresh.Objects);
+
+        // The retry's own timeout, then the pause.
+        Assert.True(gap >= confirmTimeout * 1.5, $"the fresh response came {gap} after the retry; want about {confirmTimeout * 2}");
+    }
+
+    /// <summary>
     /// With unlimited retries the outstation keeps repeating the response,
     /// unchanged, well past the retry count.
     /// </summary>
@@ -161,10 +196,10 @@ public class UnsolicitedRetryTests
     }
 
     /// <summary>
-    /// A read while an unsolicited response awaits confirmation ends the
-    /// series at its next timeout, and the events it held go back in the queue
-    /// for the next poll instead of being repeated at a master that is plainly
-    /// polling.
+    /// A read while an unsolicited response awaits confirmation ends the series
+    /// at its next timeout: the read is held until then, and answered with the
+    /// events the unconfirmed response held instead of their being repeated at
+    /// a master that is plainly polling.
     /// </summary>
     [Fact]
     public async Task APollEndsTheSeriesAndCollectsItsEvents()
@@ -180,19 +215,15 @@ public class UnsolicitedRetryTests
 
         await h.AwaitAsync(after);
 
-        // The events are held by the unconfirmed response, so this poll does
-        // not see them; it does end the series.
-        await h.RequestAsync(FuncCode.Read, FragmentFactory.ReadAllObjects(60, 2));
-        var timeouts = h.Outstation.Stats.UnsolicitedTimeouts;
-
-        await Harness.WaitForAsync(
-            () => h.Outstation.Stats.UnsolicitedTimeouts > timeouts,
-            "the unsolicited response to time out");
-
-        // Nothing else is sent now the series is over, so the next fragment is
-        // the poll's own answer.
         var poll = await h.RequestAsync(FuncCode.Read, FragmentFactory.ReadAllObjects(60, 2));
         Assert.Equal(FuncCode.Response, poll.Header.Func);
         Assert.NotEmpty(poll.Objects);
+        Assert.True(h.Outstation.Stats.UnsolicitedTimeouts > 0, "the poll was answered before the unsolicited response timed out");
+
+        // The series is over: confirmed, the poll's answer is the last word,
+        // and nothing is retried.
+        await h.SendConfirmAsync(poll.Header.Control.Seq);
+        await h.ExpectSilenceAsync(h.Count);
+        Assert.Equal(0, h.Outstation.Events!.Total);
     }
 }

@@ -144,6 +144,14 @@ internal static class ObjectHeaderCodec
             return WalkSizePrefixed(prefix.Octets(), range.Count, buf, out length);
         }
 
+        // Variation zero carries no objects, so it has nothing for a size
+        // prefix to describe. Accepting it would leave a count nothing was
+        // checked against.
+        if (prefix.IsSize() && range.Count > 0)
+        {
+            return AppParseStatus.BadQualifier;
+        }
+
         if (!carriesData)
         {
             // No object data follows, but a list of point indexes may. A

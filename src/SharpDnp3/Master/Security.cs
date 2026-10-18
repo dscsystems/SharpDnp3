@@ -274,7 +274,7 @@ public sealed partial class MasterSession
             FreeFormat.Build(120, 2, value.ToArray()));
         try
         {
-            _stack!.Send(_sink, fragment);
+            Send(fragment);
         }
         catch (Dnp3Exception ex)
         {

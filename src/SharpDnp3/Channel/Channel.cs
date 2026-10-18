@@ -76,13 +76,23 @@ public sealed class ChannelClosedException : Dnp3Exception
 /// </remarks>
 public readonly record struct Retry
 {
-    /// <summary>The shortest delay, used before the first retry.</summary>
+    /// <summary>
+    /// The shortest delay, used before the first retry. Zero or less means
+    /// connect once, no retry.
+    /// </summary>
     public TimeSpan Min { get; init; }
 
-    /// <summary>The cap on the delay. Zero means uncapped.</summary>
+    /// <summary>
+    /// The cap on the delay. Zero or less caps it at <see cref="Default"/>'s
+    /// maximum, since an uncapped exponential soon waits longer than anyone
+    /// means.
+    /// </summary>
     public TimeSpan Max { get; init; }
 
-    /// <summary>The multiplier applied per attempt.</summary>
+    /// <summary>
+    /// The multiplier applied per attempt. Below 1 it is taken as 1: a constant
+    /// delay, never a shrinking one.
+    /// </summary>
     public double Factor { get; init; }
 
     /// <summary>
@@ -115,13 +125,20 @@ public readonly record struct Retry
             return TimeSpan.Zero;
         }
 
+        var ceiling = Max > TimeSpan.Zero ? Max : Default.Max;
+        if (ceiling < Min)
+        {
+            ceiling = Min;
+        }
+
+        var factor = Math.Max(Factor, 1);
         var d = Min.TotalMilliseconds;
         for (var i = 0; i < n; i++)
         {
-            d *= Factor;
-            if (Max > TimeSpan.Zero && d >= Max.TotalMilliseconds)
+            d *= factor;
+            if (d >= ceiling.TotalMilliseconds)
             {
-                d = Max.TotalMilliseconds;
+                d = ceiling.TotalMilliseconds;
                 break;
             }
         }
