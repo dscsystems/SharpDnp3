@@ -67,6 +67,16 @@ public sealed class Dnp3TlsConfig
         try
         {
             cert = X509Certificate2.CreateFromPemFile(CertFile, KeyFile);
+
+            // A key read from PEM is ephemeral, and SChannel cannot use an
+            // ephemeral key to authenticate: on Windows every handshake would
+            // end with the peer seeing the connection close. A round trip
+            // through PKCS#12 gives it a key it can use.
+            if (OperatingSystem.IsWindows())
+            {
+                using var pem = cert;
+                cert = X509CertificateLoader.LoadPkcs12(pem.Export(X509ContentType.Pkcs12), null);
+            }
         }
         catch (Exception ex) when (ex is IOException or CryptographicException)
         {
