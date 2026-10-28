@@ -172,7 +172,7 @@ SAv5 profile.
 | `src/SharpDnp3.Tools.Decode/` | `dnp3-decode`, an offline frame decoder |
 | `tests/SharpDnp3.Tests/` | Unit and in-memory integration tests |
 | `tests/SharpDnp3.Conformance.Tests/` | Hand-built fragments checked against what the standard requires |
-| `tests/SharpDnp3.Interop.Tests/` | Runs against go-dnp3 and opendnp3; skips when they are absent |
+| `tests/SharpDnp3.Interop.Tests/` | Runs against go-dnp3, opendnp3 and the otfabric/dnp3-interop reference images; skips when they are absent |
 | `conformance/dnp3c/` | Runs Step Function I/O's dnp3c certification procedures against the outstation |
 | `build/SharpDnp3.Generator/` | Generates the object codec table from the YAML spec |
 | `docs/` | The reference documentation |
@@ -243,6 +243,43 @@ $ GO_DNP3_BIN=/tmp/go-dnp3-bin dotnet test tests/SharpDnp3.Interop.Tests
 
 Each extended service is exercised in both directions: our master against the go
 outstation, and the go master against our outstation.
+
+### otfabric/dnp3-interop
+
+[otfabric/dnp3-interop](https://github.com/otfabric/dnp3-interop) publishes
+reference outstations and masters as Docker images (opendnp3, DSC go-dnp3 and,
+built locally, Step Function I/O dnp3), all with the same command line and
+result documents. `tests/SharpDnp3.Interop.Tests/Otfabric/` runs this stack
+against them in both directions, using that repository's `baseline` fixture
+and following its `tests/cases.tsv`:
+
+- `MasterTests`: our master against each reference outstation (integrity and
+  range reads, direct and select-before-operate controls, restarts, time sync,
+  freezes), asserting on what the outstation reports having received.
+- `OutstationTests`: each reference master against our outstation, loaded with
+  the same fixture (reads, controls, restarts, time sync, unsolicited reports,
+  freezes), asserting on the master's result document and on what reached our
+  command handler and application.
+
+It needs Docker. The images are pulled on first use; a missing Docker or image
+**skips** the test:
+
+```console
+$ dotnet test tests/SharpDnp3.Interop.Tests --filter "FullyQualifiedName~Otfabric"
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `DNP3_INTEROP_TAG` | Release of the images, default `v0.5.1` |
+| `DNP3_INTEROP_ADAPTERS` | Adapters to run, default `opendnp3,dscsystems,stepfunc` |
+| `DNP3_INTEROP_IMAGE_PREFIX` | Default `ghcr.io/otfabric/dnp3-interop-` |
+| `DNP3_INTEROP_NO_PULL` | Set to use only the images already present |
+
+The stepfunc image is not published, because the licence of the Step Function
+I/O crate forbids it. To include it, build it from the dnp3-interop checkout of
+the same tag (`make image-stepfunc VERSION=v0.5.1`); it is skipped until then.
+The `Interop` workflow runs the opendnp3 and dscsystems images weekly and on
+changes to the library or these tests.
 
 ### dnp3c conformance
 
