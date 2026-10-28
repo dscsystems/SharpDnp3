@@ -278,8 +278,8 @@ $ dotnet test tests/SharpDnp3.Interop.Tests --filter "FullyQualifiedName~Otfabri
 The stepfunc image is not published, because the licence of the Step Function
 I/O crate forbids it. To include it, build it from the dnp3-interop checkout of
 the same tag (`make image-stepfunc VERSION=v0.5.1`); it is skipped until then.
-The `Interop` workflow runs the opendnp3 and dscsystems images weekly and on
-changes to the library or these tests.
+The `Interop` workflow builds the stepfunc image on its runner (never pushing
+it) and runs all three weekly and on changes to the library or these tests.
 
 ### dnp3c conformance
 
