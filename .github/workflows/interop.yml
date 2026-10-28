@@ -1,9 +1,12 @@
 name: Interop
 
-# The otfabric/dnp3-interop reference implementations (opendnp3 and DSC go-dnp3,
-# each in a container) against our master and our outstation. The Step Function
-# I/O image is not published, so it is not part of this run. The go-dnp3 and
-# opendnp3 binary suites need locally built peers and are not run here.
+# The otfabric/dnp3-interop reference implementations (opendnp3, DSC go-dnp3 and
+# Step Function I/O dnp3, each in a container) against our master and our
+# outstation. The stepfunc image is not published, because the licence of the
+# Step Function I/O crate forbids distributing it: this job builds it on the
+# runner, from the dnp3-interop checkout of the same tag, and never pushes it.
+# The go-dnp3 and opendnp3 binary suites need locally built peers and are not
+# run here.
 on:
   schedule:
     - cron: "41 5 * * 1"
@@ -26,20 +29,32 @@ env:
   DOTNET_NOLOGO: 'true'
   DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
-  DNP3_INTEROP_ADAPTERS: 'opendnp3,dscsystems'
+  DNP3_INTEROP_ADAPTERS: 'opendnp3,dscsystems,stepfunc'
 
 jobs:
   otfabric:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      DNP3_INTEROP_TAG: ${{ inputs.tag || 'v0.5.1' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+      - name: Check out dnp3-interop, for the stepfunc image
+        uses: actions/checkout@v4
+        with:
+          repository: otfabric/dnp3-interop
+          ref: ${{ env.DNP3_INTEROP_TAG }}
+          path: dnp3-interop
+      - name: Build the stepfunc image (local only, never pushed)
+        working-directory: dnp3-interop
+        run: >
+          docker build --build-arg ADAPTER_VERSION=${{ env.DNP3_INTEROP_TAG }}
+          -f adapters/stepfunc/Dockerfile
+          -t ghcr.io/otfabric/dnp3-interop-stepfunc:${{ env.DNP3_INTEROP_TAG }} .
       - name: Run the interop tests against the reference images
-        env:
-          DNP3_INTEROP_TAG: ${{ inputs.tag || 'v0.5.1' }}
         run: >
           dotnet test tests/SharpDnp3.Interop.Tests/SharpDnp3.Interop.Tests.csproj
           --filter "FullyQualifiedName~Otfabric"
