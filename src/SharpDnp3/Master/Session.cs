@@ -3,7 +3,9 @@
 // Licensed under the GNU General Public License v3.0 or later.
 
 using System.Threading.Channels;
+using System.Net.Sockets;
 using SharpDnp3.App;
+using SharpDnp3.Security;
 using SharpDnp3.Channels;
 using SharpDnp3.Objects;
 using SharpDnp3.Stack;
@@ -106,6 +108,12 @@ public sealed class MasterConfig
     /// Supplies the clock, so tests can drive a session without waiting.
     /// </summary>
     public TimeProvider? TimeProvider { get; set; }
+
+    /// <summary>Maximum time allowed to write to the connection. Zero disables the bound.</summary>
+    public TimeSpan WriteTimeout { get; set; }
+
+    /// <summary>Optional security event reporting and traffic policy.</summary>
+    public SecurityPolicy? Security { get; set; }
 
     internal void ApplyDefaults()
     {
@@ -323,6 +331,7 @@ public sealed partial class MasterSession
     {
         ArgumentNullException.ThrowIfNull(channel);
 
+        await using var security = _cfg.Security is { } policy ? new SecurityRuntime(policy, "master") : null;
         _stack = new ProtocolStack(new StackConfig
         {
             LocalAddr = _cfg.LocalAddr,
@@ -348,7 +357,7 @@ public sealed partial class MasterSession
             Stream conn;
             try
             {
-                conn = await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
+                conn = await SecurityRuntime.ConnectAsync(channel, security, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -361,6 +370,13 @@ public sealed partial class MasterSession
                 return;
             }
 
+            var observation = security?.ForConnection(channel, conn);
+            if (channel is not UdpChannel && !await SecurityRuntime.IdentifyAsync(observation, conn, cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                continue;
+            }
+
             lock (_gate)
             {
                 _stats.Connections++;
@@ -369,7 +385,13 @@ public sealed partial class MasterSession
             _log.Log(Dnp3LogLevel.Info, "connected", ("channel", channel.ToString()));
 
             _stack.Reset();
+            _stack.Security = observation;
+            _stack.Security?.Emit(new(SecurityEventKind.ConnConnected));
+            _lastReportedIin = Iin.None;
+            _unsolicitedDisabled = Class.None;
+            _hasUnsolSeq = false;
             _security.Clear();
+            _sink.Clear();
             SetConnected(true);
             _lastRx = _time.GetUtcNow();
             StartupSequence();
@@ -378,11 +400,30 @@ public sealed partial class MasterSession
             {
                 await ServeAsync(conn, cancellationToken).ConfigureAwait(false);
             }
+            catch (Exception ex) when (ex is IOException or Dnp3TimeoutException or SocketException)
+            {
+                _log.Log(Dnp3LogLevel.Warn, "connection failed", ("err", ex.Message));
+                if (ex is Dnp3TimeoutException)
+                {
+                    _stack.Security?.Emit(new(SecurityEventKind.DoSWriteStall) { Action = SecurityAction.Disconnected });
+                }
+            }
             finally
             {
                 SetConnected(false);
                 conn.Dispose();
                 FailInflight(new NoConnectionException());
+                if (observation is not null)
+                {
+                    if (!observation.SawData && !cancellationToken.IsCancellationRequested)
+                    {
+                        observation.Emit(new(SecurityEventKind.ConnNoData));
+                    }
+
+                    observation.Emit(new(SecurityEventKind.ConnClosed));
+                    _stack.Security = null;
+                }
+
                 _log.Log(Dnp3LogLevel.Info, "disconnected");
             }
         }
@@ -461,13 +502,9 @@ public sealed partial class MasterSession
         // state — the link state machines, the reassembler, the scheduler —
         // runs here, so the stack needs no locking and a send can never
         // interleave with the processing of an inbound frame.
-        var rx = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(8)
-        {
-            SingleWriter = true,
-            SingleReader = true,
-        });
-
-        var readTask = ReadIntoAsync(conn, rx.Writer, ct);
+        var rx = ReceiveQueue.Create();
+        var readTask = ReceiveQueue.ReadAsync(conn, rx, _stack?.Security, ct);
+        var recheckTask = _stack?.Security?.RecheckAsync(linked) ?? Task.CompletedTask;
 
         _peerSilent = false;
         Task<bool>? rxWait = null;
@@ -513,6 +550,10 @@ public sealed partial class MasterSession
                         try
                         {
                             _stack!.Receive(_sink, chunk, OnFragment);
+                            if (_stack.Security?.Disconnect == true)
+                            {
+                                return;
+                            }
                         }
                         catch (Dnp3Exception ex)
                         {
@@ -544,6 +585,10 @@ public sealed partial class MasterSession
                 if (_peerSilent)
                 {
                     _peerSilent = false;
+                    _stack?.Security?.Emit(new(SecurityEventKind.ConnKeepaliveFailed)
+                    {
+                        Action = SecurityAction.Disconnected,
+                    });
                     return;
                 }
 
@@ -558,6 +603,7 @@ public sealed partial class MasterSession
         finally
         {
             await linked.CancelAsync().ConfigureAwait(false);
+            await recheckTask.ConfigureAwait(false);
             rx.Writer.TryComplete();
 
             // Surface nothing from the read loop: it ends with the connection.
@@ -572,33 +618,6 @@ public sealed partial class MasterSession
         }
     }
 
-    /// <summary>Moves octets from the connection to the session loop.</summary>
-    private static async Task ReadIntoAsync(
-        Stream conn,
-        ChannelWriter<byte[]> writer,
-        CancellationToken cancellationToken)
-    {
-        var buf = new byte[ProtocolStack.ReadChunk];
-        try
-        {
-            while (true)
-            {
-                var n = await conn.ReadAsync(buf, cancellationToken).ConfigureAwait(false);
-                if (n == 0)
-                {
-                    return;
-                }
-
-                // Copy: the buffer is reused on the next read.
-                await writer.WriteAsync(buf[..n].ToArray(), cancellationToken).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            writer.TryComplete();
-        }
-    }
-
     /// <summary>Writes whatever the stack queued to the connection.</summary>
     private async Task FlushAsync(Stream conn, CancellationToken cancellationToken)
     {
@@ -609,8 +628,8 @@ public sealed partial class MasterSession
 
         var pending = _sink.Pending.ToArray();
         _sink.Clear();
-        await conn.WriteAsync(pending, cancellationToken).ConfigureAwait(false);
-        await conn.FlushAsync(cancellationToken).ConfigureAwait(false);
+        await ConnectionIo.WriteAsync(conn, pending, _cfg.WriteTimeout, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>Retransmits an unacknowledged link frame.</summary>
@@ -916,6 +935,8 @@ public sealed partial class MasterSession
         var status = FragmentParser.ParseFragment(null, r.Fragment, out var frag, out var error);
         if (status != AppParseStatus.Ok)
         {
+            _stack?.Security?.Application(SecurityEventKind.ProtoAppMalformed, r, frag.Header,
+                SecurityAction.Ignored);
             _log.Log(Dnp3LogLevel.Warn, "malformed response", ("err", error));
             lock (_gate)
             {
@@ -939,6 +960,8 @@ public sealed partial class MasterSession
 
         if (!frag.Header.IsResponse)
         {
+            _stack?.Security?.Application(SecurityEventKind.ProtoWrongDirection, r, frag.Header,
+                SecurityAction.Ignored);
             _log.Log(
                 Dnp3LogLevel.Debug,
                 "ignoring a non-response fragment",
@@ -948,7 +971,7 @@ public sealed partial class MasterSession
 
         if (frag.Header.Func == FuncCode.AuthResponse && _cfg.SecureAuthentication is not null)
         {
-            OnAuthenticationResponse(frag);
+            OnAuthenticationResponse(r, frag);
             return;
         }
 
@@ -967,6 +990,8 @@ public sealed partial class MasterSession
                 _stats.FragmentsDiscarded++;
             }
 
+            _stack?.Security?.Application(SecurityEventKind.ProtoInvalidResponse, r, frag.Header,
+                SecurityAction.Ignored);
             _log.Log(
                 Dnp3LogLevel.Debug,
                 "discarding an invalid response",
@@ -975,15 +1000,25 @@ public sealed partial class MasterSession
             return;
         }
 
+        if (_stack?.Security is { } security)
+        {
+            ObserveRemote(security, r, frag);
+            if (uns && security.Flood(SecurityEventKind.FloodUnsolicited, security.Policy.Limits.Unsolicited) ==
+                SecurityAction.Disconnected)
+            {
+                return;
+            }
+        }
+
         ObserveIin(frag.Header.Iin);
 
         if (frag.Header.Func == FuncCode.UnsolicitedResponse)
         {
-            OnUnsolicited(frag);
+            OnUnsolicited(r, frag);
             return;
         }
 
-        OnSolicited(frag);
+        OnSolicited(r, frag);
     }
 
     /// <summary>Reacts to the indications on every response.</summary>
@@ -1039,11 +1074,13 @@ public sealed partial class MasterSession
     }
 
     /// <summary>Handles a response to a request we sent.</summary>
-    private void OnSolicited(Fragment frag)
+    private void OnSolicited(Received r, Fragment frag)
     {
         var t = _inflight;
         if (t is null)
         {
+            _stack?.Security?.Application(SecurityEventKind.UnsolResponseWithoutRequest, r, frag.Header,
+                SecurityAction.Ignored);
             _log.Log(
                 Dnp3LogLevel.Debug,
                 "response with nothing in flight",
@@ -1085,6 +1122,8 @@ public sealed partial class MasterSession
 
         if (stale)
         {
+            _stack?.Security?.Application(SecurityEventKind.SeqResponseStale, r, frag.Header,
+                SecurityAction.Ignored);
             // A response for a request we have already given up on. Acting on
             // it would attribute stale data to the current poll.
             _log.Log(
@@ -1096,6 +1135,8 @@ public sealed partial class MasterSession
 
         if (repeat)
         {
+            _stack?.Security?.Application(SecurityEventKind.SeqResponseRepeat, r, frag.Header,
+                SecurityAction.Ignored);
             lock (_gate)
             {
                 _stats.FragmentsDiscarded++;
@@ -1128,6 +1169,11 @@ public sealed partial class MasterSession
         t.Started = true;
         t.RespSeq = seq;
 
+        if (_stack?.Security is { } security)
+        {
+            ObserveRemoteRejections(security, r, frag, t);
+        }
+
         Deliver(frag, unsolicited: false);
         t.OnFragment?.Invoke(frag);
 
@@ -1153,6 +1199,16 @@ public sealed partial class MasterSession
             return;
         }
 
+        if (_stack?.Security is not null && !frag.Header.Iin.HasAny(RequestErrors))
+        {
+            _unsolicitedDisabled = t.FuncCode switch
+            {
+                FuncCode.DisableUnsolicited => _unsolicitedDisabled | t.UnsolicitedMask,
+                FuncCode.EnableUnsolicited => _unsolicitedDisabled & ~t.UnsolicitedMask,
+                _ => _unsolicitedDisabled,
+            };
+        }
+
         // A chained task runs immediately rather than going back to the
         // scheduler, so nothing can be interleaved between the two.
         if (t.Next is not null)
@@ -1172,11 +1228,16 @@ public sealed partial class MasterSession
     }
 
     /// <summary>Handles a fragment the outstation sent on its own.</summary>
-    private void OnUnsolicited(Fragment frag)
+    private void OnUnsolicited(Received r, Fragment frag)
     {
         lock (_gate)
         {
             _stats.Unsolicited++;
+        }
+
+        if (_unsolicitedDisabled == Class.Class123 && frag.Objects.Count != 0)
+        {
+            _stack?.Security?.Application(SecurityEventKind.UnsolWhileDisabled, r, frag.Header);
         }
 
         var seq = frag.Header.Control.Seq;
@@ -1188,6 +1249,8 @@ public sealed partial class MasterSession
         {
             // Our confirm was lost, not the data. Confirm again but do not
             // deliver the measurements a second time.
+            _stack?.Security?.Application(SecurityEventKind.SeqUnsolDuplicate, r, frag.Header,
+                SecurityAction.Ignored);
             _log.Log(Dnp3LogLevel.Debug, "duplicate unsolicited response", ("seq", seq));
         }
         else

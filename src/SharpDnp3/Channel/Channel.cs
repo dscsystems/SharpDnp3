@@ -11,6 +11,7 @@
 // what lets the session layer be written once.
 
 using System.Globalization;
+using SharpDnp3.Security;
 using System.Threading.Channels;
 
 namespace SharpDnp3.Channels;
@@ -46,6 +47,11 @@ public interface IChannel : IDisposable
     bool SupportsConcurrentConnections => false;
 }
 
+internal interface IObservedChannel
+{
+    Task<Stream> ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken);
+}
+
 /// <summary>Names the far end of a connection, for logging.</summary>
 /// <remarks>
 /// A session serving several masters at once needs something to tell them apart
@@ -56,6 +62,9 @@ internal interface IPeerEndpoint
 {
     /// <summary>A short description of the peer, or null when there is none.</summary>
     string? Peer { get; }
+
+    SecurityPeer? SecurityPeer => Peer is { } address ? new SecurityPeer { Remote = address } : null;
+
 }
 
 /// <summary>

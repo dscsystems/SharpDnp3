@@ -39,6 +39,9 @@ internal sealed class MasterTask
     /// <summary>The function code the request carries.</summary>
     public required FuncCode FuncCode { get; init; }
 
+    /// <summary>The event classes selected by an unsolicited enable or disable.</summary>
+    public Class UnsolicitedMask { get; init; }
+
     /// <summary>Which tasks it outranks when two fall due together.</summary>
     public int Priority { get; init; }
 
@@ -146,6 +149,7 @@ internal sealed class MasterTask
     {
         Name = Name,
         FuncCode = FuncCode,
+        UnsolicitedMask = UnsolicitedMask,
         Priority = Priority,
         Build = Build,
         OnFragment = OnFragment,
@@ -193,6 +197,7 @@ internal static class MasterTasks
     {
         Name = enable ? "enable-unsolicited" : "disable-unsolicited",
         FuncCode = enable ? FuncCode.EnableUnsolicited : FuncCode.DisableUnsolicited,
+        UnsolicitedMask = mask,
         Priority = TaskPriority.Startup,
         Build = b =>
         {

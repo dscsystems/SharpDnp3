@@ -5,7 +5,10 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Threading.Channels;
+using System.Diagnostics;
+using System.Net.Sockets;
 using SharpDnp3.App;
+using SharpDnp3.Security;
 using SharpDnp3.Channels;
 using SharpDnp3.Link;
 using SharpDnp3.Objects;
@@ -200,6 +203,18 @@ public sealed class OutstationConfig
 
     /// <summary>Receives protocol and session events.</summary>
     public IDnp3Logger? Log { get; set; }
+
+    /// <summary>Quiet time before probing the peer for link status. Zero disables the probe.</summary>
+    public TimeSpan IdleTimeout { get; set; }
+
+    /// <summary>Maximum time to finish receiving a link frame. Zero disables the bound.</summary>
+    public TimeSpan FrameAssemblyTimeout { get; set; }
+
+    /// <summary>Maximum time allowed to write to the connection. Zero disables the bound.</summary>
+    public TimeSpan WriteTimeout { get; set; }
+
+    /// <summary>Optional security event reporting and traffic policy.</summary>
+    public SecurityPolicy? Security { get; set; }
 
     internal void ApplyDefaults()
     {
@@ -611,11 +626,19 @@ public sealed partial class OutstationSession
         var bits = (int)(indication & SettableIndications);
         if (on)
         {
-            Interlocked.Or(ref _indications, bits);
+            var previous = Interlocked.Or(ref _indications, bits);
+            if ((previous & bits) != bits)
+            {
+                ReportIndication(bits, on);
+            }
         }
         else
         {
-            Interlocked.And(ref _indications, ~bits);
+            var previous = Interlocked.And(ref _indications, ~bits);
+            if ((previous & bits) != 0)
+            {
+                ReportIndication(bits, on);
+            }
         }
     }
 
@@ -864,6 +887,7 @@ public sealed partial class OutstationSession
                 channel));
         }
 
+        await using var security = _cfg.Security is { } policy ? new SecurityRuntime(policy, "outstation") : null;
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var ct = linked.Token;
 
@@ -877,11 +901,11 @@ public sealed partial class OutstationSession
         {
             if (_cfg.MaxMasters > 1)
             {
-                await ServeManyAsync(channel, ct).ConfigureAwait(false);
+                await ServeManyAsync(channel, security, ct).ConfigureAwait(false);
             }
             else
             {
-                await ServeOneAsync(channel, ct).ConfigureAwait(false);
+                await ServeOneAsync(channel, security, ct).ConfigureAwait(false);
             }
         }
         finally
@@ -901,7 +925,7 @@ public sealed partial class OutstationSession
     }
 
     /// <summary>Serves one master at a time, reconnecting after each.</summary>
-    private async Task ServeOneAsync(IChannel channel, CancellationToken cancellationToken)
+    private async Task ServeOneAsync(IChannel channel, SecurityRuntime? security, CancellationToken cancellationToken)
     {
         // Cancelling the token is how RunAsync is asked to stop, and a closed
         // channel is the same instruction arriving from the other direction.
@@ -915,7 +939,7 @@ public sealed partial class OutstationSession
             Stream conn;
             try
             {
-                conn = await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
+                conn = await SecurityRuntime.ConnectAsync(channel, security, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -926,12 +950,12 @@ public sealed partial class OutstationSession
                 return;
             }
 
-            await ServeConnectionAsync(channel, conn, cancellationToken).ConfigureAwait(false);
+            await ServeConnectionAsync(channel, conn, security, cancellationToken).ConfigureAwait(false);
         }
     }
 
     /// <summary>Accepts up to the configured number of masters and serves each.</summary>
-    private async Task ServeManyAsync(IChannel channel, CancellationToken cancellationToken)
+    private async Task ServeManyAsync(IChannel channel, SecurityRuntime? security, CancellationToken cancellationToken)
     {
         // The semaphore is the connection limit.
         using var slots = new SemaphoreSlim(_cfg.MaxMasters, _cfg.MaxMasters);
@@ -944,7 +968,7 @@ public sealed partial class OutstationSession
                 Stream conn;
                 try
                 {
-                    conn = await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
+                    conn = await SecurityRuntime.ConnectAsync(channel, security, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -982,12 +1006,16 @@ public sealed partial class OutstationSession
                         ("peer", Association.Describe(conn, channel)),
                         ("limit", _cfg.MaxMasters));
 
+                    security?.ForConnection(channel, conn).Emit(new(SecurityEventKind.ConnRejectedBusy)
+                    {
+                        Action = SecurityAction.Rejected,
+                    });
                     conn.Dispose();
                     continue;
                 }
 
                 live.RemoveAll(t => t.IsCompleted);
-                live.Add(ServeAcceptedAsync(channel, conn, slots, cancellationToken));
+                live.Add(ServeAcceptedAsync(channel, conn, security, slots, cancellationToken));
             }
         }
         finally
@@ -1010,6 +1038,7 @@ public sealed partial class OutstationSession
     private async Task ServeAcceptedAsync(
         IChannel channel,
         Stream conn,
+        SecurityRuntime? security,
         SemaphoreSlim slots,
         CancellationToken cancellationToken)
     {
@@ -1019,7 +1048,7 @@ public sealed partial class OutstationSession
 
         try
         {
-            await ServeConnectionAsync(channel, conn, cancellationToken).ConfigureAwait(false);
+            await ServeConnectionAsync(channel, conn, security, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -1041,16 +1070,44 @@ public sealed partial class OutstationSession
     private async Task ServeConnectionAsync(
         IChannel channel,
         Stream conn,
+        SecurityRuntime? security,
         CancellationToken cancellationToken)
     {
+        var observation = security?.ForConnection(channel, conn);
+        if (channel is not UdpChannel && !await SecurityRuntime.IdentifyAsync(observation, conn, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            return;
+        }
+
         var a = Attach(channel, conn);
+        a.Stack.Security = observation;
+        a.Stack.Security?.Emit(new(SecurityEventKind.ConnAccepted));
         try
         {
             await ServeAsync(a, cancellationToken).ConfigureAwait(false);
         }
+        catch (Exception ex) when (ex is IOException or Dnp3TimeoutException or SocketException or NoConnectionException)
+        {
+            a.Log.Log(Dnp3LogLevel.Warn, "connection failed", ("err", ex.Message));
+            if (ex is Dnp3TimeoutException)
+            {
+                a.Stack.Security?.Emit(new(SecurityEventKind.DoSWriteStall) { Action = SecurityAction.Disconnected });
+            }
+        }
         finally
         {
             Detach(a);
+            if (observation is not null)
+            {
+                if (!observation.SawData && !cancellationToken.IsCancellationRequested)
+                {
+                    observation.Emit(new(SecurityEventKind.ConnNoData));
+                }
+
+                observation.Emit(new(SecurityEventKind.ConnClosed));
+            }
+
             conn.Dispose();
             a.Log.Log(Dnp3LogLevel.Info, "disconnected");
         }
@@ -1181,15 +1238,16 @@ public sealed partial class OutstationSession
         // association's protocol state runs here, so its stack needs no locking
         // and a response can never interleave with the processing of an inbound
         // frame.
-        var rx = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(8)
-        {
-            SingleWriter = true,
-            SingleReader = true,
-        });
-
-        var readTask = ReadIntoAsync(a.Connection, rx.Writer, ct);
+        var rx = ReceiveQueue.Create();
+        var readTask = ReceiveQueue.ReadAsync(a.Connection, rx, a.Stack.Security, ct);
+        var recheckTask = a.Stack.Security?.RecheckAsync(linked) ?? Task.CompletedTask;
 
         a.Connected = true;
+        var trackIdle = _cfg.IdleTimeout > TimeSpan.Zero || _cfg.FrameAssemblyTimeout > TimeSpan.Zero;
+        if (trackIdle)
+        {
+            a.LastFrame = Stopwatch.GetTimestamp();
+        }
         a.Unsol.Reset();
         a.DeferredRead = null;
 
@@ -1213,6 +1271,15 @@ public sealed partial class OutstationSession
             // unsolicited hold time, so it has to be short relative to all
             // three.
             var tick = TimeSpan.FromMilliseconds(50);
+            if (_cfg.FrameAssemblyTimeout > TimeSpan.Zero && _cfg.FrameAssemblyTimeout < tick)
+            {
+                tick = _cfg.FrameAssemblyTimeout;
+            }
+
+            if (_cfg.IdleTimeout > TimeSpan.Zero && _cfg.IdleTimeout < tick)
+            {
+                tick = _cfg.IdleTimeout;
+            }
 
             while (true)
             {
@@ -1248,7 +1315,7 @@ public sealed partial class OutstationSession
                     var more = await rxWait.ConfigureAwait(false);
                     rxWait = null;
 
-                    if (!Receive(a, rx.Reader))
+                    if (!Receive(a, rx.Reader, trackIdle))
                     {
                         return;
                     }
@@ -1275,6 +1342,11 @@ public sealed partial class OutstationSession
                     }
                 }
 
+                if (trackIdle && !CheckIdle(a))
+                {
+                    return;
+                }
+
                 await FlushAsync(a, ct).ConfigureAwait(false);
             }
         }
@@ -1289,9 +1361,16 @@ public sealed partial class OutstationSession
             // A transfer belongs to the connection it started on: the master
             // that opened it cannot come back to the same handle, and holding
             // the file open would deny the next one.
-            TryCloseFile();
+            using (_db.EnterScope())
+            {
+                if (_file?.Owner == a)
+                {
+                    TryCloseFile();
+                }
+            }
 
             await linked.CancelAsync().ConfigureAwait(false);
+            await recheckTask.ConfigureAwait(false);
             rx.Writer.TryComplete();
 
             try
@@ -1310,7 +1389,7 @@ public sealed partial class OutstationSession
     /// Feeds whatever the read loop has produced through the stack. Returns
     /// false when the connection must be dropped.
     /// </summary>
-    private bool Receive(Association a, ChannelReader<byte[]> reader)
+    private bool Receive(Association a, ChannelReader<byte[]> reader, bool trackIdle)
     {
         // Updates queued before this request arrived are applied first: a
         // master that polls after the application has reported a change must be
@@ -1326,11 +1405,41 @@ public sealed partial class OutstationSession
         // database that is not being modified underneath it.
         using var scope = _db.EnterScope();
 
-        while (reader.TryRead(out var chunk))
+        for (var batch = 0; batch < ReceiveQueue.Capacity && reader.TryRead(out var chunk); batch++)
         {
+            if (trackIdle && FrameAssemblyExpired(a))
+            {
+                return false;
+            }
+
             try
             {
+                var previousFrames = a.Stack.AdmittedFrames;
                 a.Stack.Receive(a.Sink, chunk, r => Handle(a, r));
+                if (a.Stack.Security?.Disconnect == true)
+                {
+                    return false;
+                }
+
+                if (trackIdle)
+                {
+                    var gotFrame = a.Stack.AdmittedFrames != previousFrames;
+                    var now = Stopwatch.GetTimestamp();
+                    if (gotFrame)
+                    {
+                        a.LastFrame = now;
+                        a.ProbedAt = null;
+                    }
+
+                    if (a.Stack.Buffered == 0)
+                    {
+                        a.PartialSince = null;
+                    }
+                    else if (gotFrame || a.PartialSince is null)
+                    {
+                        a.PartialSince = now;
+                    }
+                }
             }
             catch (Dnp3Exception ex)
             {
@@ -1449,33 +1558,8 @@ public sealed partial class OutstationSession
     }
 
     /// <summary>Moves octets from the connection to the session loop.</summary>
-    private static async Task ReadIntoAsync(
-        Stream conn,
-        ChannelWriter<byte[]> writer,
-        CancellationToken cancellationToken)
-    {
-        var buf = new byte[ProtocolStack.ReadChunk];
-        try
-        {
-            while (true)
-            {
-                var n = await conn.ReadAsync(buf, cancellationToken).ConfigureAwait(false);
-                if (n == 0)
-                {
-                    return;
-                }
-
-                await writer.WriteAsync(buf[..n].ToArray(), cancellationToken).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            writer.TryComplete();
-        }
-    }
-
     /// <summary>Writes whatever the stack queued to the connection.</summary>
-    private static async Task FlushAsync(Association a, CancellationToken cancellationToken)
+    private async Task FlushAsync(Association a, CancellationToken cancellationToken)
     {
         if (a.Sink.IsEmpty)
         {
@@ -1484,8 +1568,56 @@ public sealed partial class OutstationSession
 
         var pending = a.Sink.Pending.ToArray();
         a.Sink.Clear();
-        await a.Connection.WriteAsync(pending, cancellationToken).ConfigureAwait(false);
-        await a.Connection.FlushAsync(cancellationToken).ConfigureAwait(false);
+        await ConnectionIo.WriteAsync(a.Connection, pending, _cfg.WriteTimeout, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private bool FrameAssemblyExpired(Association a)
+    {
+        if (_cfg.FrameAssemblyTimeout <= TimeSpan.Zero || a.PartialSince is not { } started ||
+            Stopwatch.GetElapsedTime(started) < _cfg.FrameAssemblyTimeout)
+        {
+            return false;
+        }
+
+        a.Log.Log(Dnp3LogLevel.Warn, "link frame assembly timed out");
+        a.Stack.Security?.Emit(new(SecurityEventKind.DoSSlowFrame) { Action = SecurityAction.Disconnected });
+        return true;
+    }
+
+    private bool CheckIdle(Association a)
+    {
+        if (FrameAssemblyExpired(a))
+        {
+            return false;
+        }
+
+        if (_cfg.IdleTimeout <= TimeSpan.Zero || Stopwatch.GetElapsedTime(a.LastFrame) < _cfg.IdleTimeout)
+        {
+            return true;
+        }
+
+        if (a.ProbedAt is { } probed)
+        {
+            if (Stopwatch.GetElapsedTime(probed).TotalSeconds <
+                _cfg.LinkTimeout.TotalSeconds * (_cfg.LinkRetries + 1.0))
+            {
+                return true;
+            }
+
+            a.Log.Log(Dnp3LogLevel.Warn, "idle link status probe timed out");
+            a.Stack.Security?.Emit(new(SecurityEventKind.ConnIdleTimeout) { Action = SecurityAction.Disconnected });
+            return false;
+        }
+
+        if (!a.Stack.Busy)
+        {
+            a.Stack.SendLinkStatusRequest(a.Sink, a.RemoteAddr);
+            a.ProbedAt = Stopwatch.GetTimestamp();
+            a.LinkDeadline = _appl.Now() + _cfg.LinkTimeout;
+        }
+
+        return true;
     }
 
     /// <summary>Retransmits an unacknowledged link frame.</summary>
@@ -1511,6 +1643,7 @@ public sealed partial class OutstationSession
         if (failed)
         {
             a.Log.Log(Dnp3LogLevel.Warn, "link layer gave up on a response");
+            a.Stack.Security?.Emit(new(SecurityEventKind.DoSLinkRetriesExhausted));
         }
     }
 
@@ -1526,6 +1659,7 @@ public sealed partial class OutstationSession
         }
 
         a.AwaitingConfirm = false;
+        ConfirmMissed(a);
 
         // The master's silence on one fragment means it cannot be paced through
         // the rest of the response either, so the whole thing is abandoned
@@ -1585,6 +1719,7 @@ public sealed partial class OutstationSession
         a.RemoteAddr = r.Source;
         a.RemoteKnown = true;
 
+        var observation = a.Stack.Security;
         var status = FragmentParser.ParseFragment(null, r.Fragment, out var frag, out var error);
         if (status != AppParseStatus.Ok)
         {
@@ -1593,6 +1728,12 @@ public sealed partial class OutstationSession
                 _stats.MalformedRequests++;
             }
 
+            observation?.Application(SecurityEventKind.ProtoAppMalformed, r, frag.Header, SecurityAction.Ignored);
+            if (observation is not null && status == AppParseStatus.UnknownObject && error is not null)
+            {
+                observation.Application(SecurityEventKind.AccessUnknownObject, r, frag.Header, SecurityAction.Rejected);
+                observation.Scan(error);
+            }
             a.Log.Log(Dnp3LogLevel.Warn, "malformed request", ("err", error));
             RejectMalformed(a, r, frag, status);
             return;
@@ -1606,6 +1747,7 @@ public sealed partial class OutstationSession
         // point on the strength of half a message.
         if (!frag.Header.Control.Fir || !frag.Header.Control.Fin)
         {
+            observation?.Application(SecurityEventKind.ProtoIncompleteRequest, r, frag.Header, SecurityAction.Ignored);
             lock (_gate)
             {
                 _stats.IncompleteRequests++;
@@ -1632,6 +1774,7 @@ public sealed partial class OutstationSession
         // something else.
         if (frag.Header.Func == FuncCode.Confirm && frag.Objects.Count > 0)
         {
+            observation?.Application(SecurityEventKind.ProtoConfirmWithObjects, r, frag.Header, SecurityAction.Ignored);
             lock (_gate)
             {
                 _stats.MalformedRequests++;
@@ -1643,6 +1786,7 @@ public sealed partial class OutstationSession
 
         if (frag.Header.Func != FuncCode.Confirm && (frag.Header.Control.Con || frag.Header.Control.Uns))
         {
+            observation?.Application(SecurityEventKind.ProtoRequestCONUNS, r, frag.Header, SecurityAction.Ignored);
             lock (_gate)
             {
                 _stats.MalformedRequests++;
@@ -1663,6 +1807,8 @@ public sealed partial class OutstationSession
         {
             if (!h.Qualifier.Consistent())
             {
+                observation?.Application(SecurityEventKind.ProtoInconsistentQualifier, r, frag.Header,
+                    SecurityAction.Ignored, h);
                 lock (_gate)
                 {
                     _stats.MalformedRequests++;
@@ -1677,6 +1823,22 @@ public sealed partial class OutstationSession
             }
         }
 
+        if (!authenticated && observation is not null && r.Broadcast && !observation.Policy.AllowsBroadcast(frag))
+        {
+            var reject = observation.Policy.RejectBroadcastMisuse;
+            observation.Application(SecurityEventKind.AccessBroadcastMisuse, r, frag.Header,
+                reject ? SecurityAction.Blocked : SecurityAction.Observed);
+            if (reject)
+            {
+                return;
+            }
+        }
+
+        if (frag.Header.IsResponse)
+        {
+            observation?.Application(SecurityEventKind.ProtoWrongDirection, r, frag.Header, SecurityAction.Ignored);
+        }
+
         if (frag.Header.Func is FuncCode.AuthRequest or FuncCode.AuthRequestNoAck)
         {
             OnAuthentication(a, r, frag);
@@ -1686,6 +1848,11 @@ public sealed partial class OutstationSession
         if (!authenticated && Sa is not null &&
             (CriticalFunction(frag.Header.Func) || HasAuthenticationObject(frag)))
         {
+            if (HasAuthenticationObject(frag))
+            {
+                observation?.Application(SecurityEventKind.AuthObjectSmuggled, r, frag.Header);
+            }
+
             ChallengeRequest(a, r, frag);
             return;
         }
@@ -1702,12 +1869,28 @@ public sealed partial class OutstationSession
                     _stats.RepeatedRequests++;
                 }
 
+                if (observation is not null)
+                {
+                    observation.Emit(new(SecurityEventKind.SeqRepeatRequest)
+                    {
+                        AppFunc = frag.Header.Func.ToDisplayString(),
+                        AppSeq = frag.Header.Control.Seq,
+                        Severity = observation.Over(SecurityEventKind.SeqRepeatRequest, observation.Policy.Limits.Repeats)
+                            ? SecuritySeverity.Warning : default,
+                    });
+                }
+
                 a.Log.Log(
                     Dnp3LogLevel.Debug,
                     "repeated request; re-sending the previous response",
                     ("seq", frag.Header.Control.Seq));
                 ReplayResponse(a, r, frag.Header);
                 return;
+            }
+
+            if (a.LastReqValid && a.LastReqSource == r.Source && a.LastReqSeq == frag.Header.Control.Seq)
+            {
+                observation?.Application(SecurityEventKind.SeqReusedSeq, r, frag.Header);
             }
 
             RememberRequest(a, r, frag);
@@ -1741,6 +1924,7 @@ public sealed partial class OutstationSession
         // carried out: for a control, that its point was operated.
         if (frag.Header.Func.RequiresObjects() && frag.Objects.Count == 0)
         {
+            observation?.Application(SecurityEventKind.ProtoNoObjects, r, frag.Header, SecurityAction.Rejected);
             lock (_gate)
             {
                 _stats.MalformedRequests++;
@@ -1765,6 +1949,16 @@ public sealed partial class OutstationSession
             // gets a null response carrying the error rather than silence.
             Respond(a, r, frag.Header, []);
             return;
+        }
+
+        if (observation is not null)
+        {
+            if (CheckRequestPolicy(a, observation, r, frag))
+            {
+                return;
+            }
+
+            AuditRequest(observation, r, frag);
         }
 
         switch (frag.Header.Func)
@@ -1994,6 +2188,7 @@ public sealed partial class OutstationSession
 
         if (!a.AwaitingConfirm || h.Control.Seq != a.ConfirmSeq)
         {
+            UnexpectedConfirm(a, h);
             // A confirm for a response we are not waiting on. Ignoring it is
             // right: acting on it would drop events the master never received.
             a.Log.Log(
@@ -2003,6 +2198,7 @@ public sealed partial class OutstationSession
             return;
         }
 
+        Confirmed(a);
         a.AwaitingConfirm = false;
 
         // The confirmation released the pacing: whatever is left of the
@@ -2080,6 +2276,7 @@ public sealed partial class OutstationSession
                         if (!TryEventReadLimit(h, out var classLimit))
                         {
                             a.Iin = a.Iin.Set(Iin.ParameterError);
+                            ReportUnknown(a, r, frag.Header, h, SecurityEventKind.ProtoFieldInvalid);
                             break;
                         }
 
@@ -2103,6 +2300,7 @@ public sealed partial class OutstationSession
                 if (h.Variation != 0 && !EventVariationKnown(eventType, h.Variation))
                 {
                     a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                    ReportUnknown(a, r, frag.Header, h, SecurityEventKind.AccessUnknownObject);
                     continue;
                 }
 
@@ -2113,12 +2311,14 @@ public sealed partial class OutstationSession
                     // can never be any, and an empty answer would say there are
                     // none just now.
                     a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                    ReportUnknown(a, r, frag.Header, h, SecurityEventKind.AccessUnknownObject);
                     continue;
                 }
 
                 if (!TryEventReadLimit(h, out var limit))
                 {
                     a.Iin = a.Iin.Set(Iin.ParameterError);
+                    ReportUnknown(a, r, frag.Header, h, SecurityEventKind.ProtoFieldInvalid);
                     continue;
                 }
 
@@ -2181,6 +2381,7 @@ public sealed partial class OutstationSession
                 if (a.RecordedTime is not { } recorded)
                 {
                     a.Iin = a.Iin.Set(Iin.ParameterError);
+                    ReportUnknown(a, r, frag.Header, h, SecurityEventKind.ProtoFieldInvalid);
                     continue;
                 }
 
@@ -2201,6 +2402,7 @@ public sealed partial class OutstationSession
             if (!TryPointTypeForGroup(h.Group, out var pt))
             {
                 a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                ReportUnknown(a, r, frag.Header, h, SecurityEventKind.AccessUnknownObject);
                 continue;
             }
 
@@ -2211,10 +2413,11 @@ public sealed partial class OutstationSession
                 !ObjectRegistry.TryLookup(Database.StaticGroupVar(pt, h.Variation), out _))
             {
                 a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+                ReportUnknown(a, r, frag.Header, h, SecurityEventKind.AccessUnknownObject);
                 continue;
             }
 
-            CheckStaticRead(a, pt, h);
+            CheckStaticRead(a, r, frag.Header, pt, h);
 
             later.Add(() =>
             {
@@ -2257,18 +2460,20 @@ public sealed partial class OutstationSession
     /// do exist are reported regardless; the indication is what tells the
     /// master the rest were not left out by accident.
     /// </remarks>
-    private void CheckStaticRead(Association a, PointType pt, ObjectHeader h)
+    private void CheckStaticRead(Association a, Received r, AppHeader header, PointType pt, ObjectHeader h)
     {
         var n = ResponseWriter.TypeCount(_db.Counts(), pt);
         if (n == 0)
         {
             a.Iin = a.Iin.Set(Iin.ObjectUnknown);
+            ReportUnknown(a, r, header, h, SecurityEventKind.AccessUnknownObject);
             return;
         }
 
         if (NamesBeyond(h, n))
         {
             a.Iin = a.Iin.Set(Iin.ParameterError);
+            ReportUnknown(a, r, header, h, SecurityEventKind.AccessUnknownPoint);
         }
     }
 
@@ -2457,6 +2662,7 @@ public sealed partial class OutstationSession
 
                 var recorded = CommandObjects.ParseTime48(recordedStamp);
                 var elapsed = _appl.Now() - reference;
+                ReportClockStep(a, r, frag.Header, recorded.Time + elapsed);
                 if (_appl.WriteAbsoluteTime(recorded.Time + elapsed))
                 {
                     ClockSet(a);
@@ -2489,6 +2695,7 @@ public sealed partial class OutstationSession
                 }
 
                 var ts = CommandObjects.ParseTime48(stamp);
+                ReportClockStep(a, r, frag.Header, ts.Time);
                 if (_appl.WriteAbsoluteTime(ts.Time))
                 {
                     ClockSet(a);
@@ -2688,6 +2895,7 @@ public sealed partial class OutstationSession
             // not finished restarting, so the request is understood but not
             // repeated, and the delay reported is what is left of the first.
             d = until - now;
+            a.Stack.Security?.Application(SecurityEventKind.CtrlAlreadyExecuting, r, frag.Header, SecurityAction.Rejected);
             a.Iin = a.Iin.Set(Iin.AlreadyExecuting);
         }
         else
@@ -2872,6 +3080,12 @@ public sealed partial class OutstationSession
         if (r.Broadcast)
         {
             return;
+        }
+
+        if (a.Iin.Has(Iin.ParameterError))
+        {
+            a.Stack.Security?.Application(SecurityEventKind.ProtoParameterError, r, req,
+                SecurityAction.Rejected, detail: "The response carries PARAMETER_ERROR");
         }
 
         a.PendingBodies = bodies;
@@ -3149,10 +3363,17 @@ public sealed partial class OutstationSession
             iin = iin.Set(Iin.Class3Events);
         }
 
-        if (a.Events.Overflowed)
+        var overflow = a.Events.Overflowed;
+        if (overflow)
         {
             iin = iin.Set(Iin.EventBufferOverflow);
+            if (!a.ReportedEventOverflow)
+            {
+                a.Stack.Security?.Emit(new(SecurityEventKind.DoSEventOverflow));
+            }
         }
+
+        a.ReportedEventOverflow = overflow;
 
         if (ClockDue())
         {

@@ -49,6 +49,7 @@
 using System.Globalization;
 using SharpDnp3.Channels;
 using SharpDnp3.Link;
+using SharpDnp3.Security;
 using SharpDnp3.Transport;
 
 namespace SharpDnp3.Multidrop;
@@ -103,6 +104,9 @@ public sealed class BusConfig
 
     /// <summary>Receives bus events.</summary>
     public IDnp3Logger? Log { get; set; }
+
+    /// <summary>Optional security reporting for the shared bus and its physical channel.</summary>
+    public SecurityPolicy? Security { get; set; }
 
     internal void ApplyDefaults()
     {
@@ -236,6 +240,7 @@ public sealed class Bus : IDisposable
 
         config ??= new BusConfig();
         config.ApplyDefaults();
+        config.Security?.Validate();
 
         _channel = channel;
         _cfg = config;
@@ -447,6 +452,7 @@ public sealed class Bus : IDisposable
     /// </summary>
     private async Task PumpAsync(CancellationToken cancellationToken)
     {
+        await using var security = _cfg.Security is { } policy ? new SecurityRuntime(policy, "bus") : null;
         var buf = new byte[LinkConstants.MaxFrameSize];
 
         while (true)
@@ -460,7 +466,7 @@ public sealed class Bus : IDisposable
             Stream conn;
             try
             {
-                conn = await _channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
+                conn = await SecurityRuntime.ConnectAsync(_channel, security, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -472,6 +478,13 @@ public sealed class Bus : IDisposable
                     ? null
                     : new Dnp3Exception("multidrop: connect: " + ex.Message, ex));
                 return;
+            }
+
+            var observation = security?.ForConnection(_channel, conn);
+            if (_channel is not UdpChannel &&
+                !await SecurityRuntime.IdentifyAsync(observation, conn, cancellationToken).ConfigureAwait(false))
+            {
+                continue;
             }
 
             if (!Attach(conn))
@@ -489,9 +502,21 @@ public sealed class Bus : IDisposable
             // A fresh parser per connection: buffered octets from a line that
             // has just dropped are half a frame that will never be completed.
             var parser = new FrameParser();
-            await ReadAsync(conn, parser, buf, cancellationToken).ConfigureAwait(false);
+            observation?.Emit(new(SecurityEventKind.ConnConnected), transportOverride: "multidrop");
+            using var link = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var recheck = observation?.RecheckAsync(link) ?? Task.CompletedTask;
+            try
+            {
+                await ReadAsync(conn, parser, buf, observation, link.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                await link.CancelAsync().ConfigureAwait(false);
+                await recheck.ConfigureAwait(false);
+                observation?.Emit(new(SecurityEventKind.ConnClosed), transportOverride: "multidrop");
+                Detach(conn);
+            }
 
-            Detach(conn);
             _log.Log(Dnp3LogLevel.Info, "bus disconnected");
         }
     }
@@ -566,7 +591,7 @@ public sealed class Bus : IDisposable
 
     /// <summary>Pumps one connection until it fails.</summary>
     private async Task ReadAsync(
-        Stream conn, FrameParser parser, byte[] buf, CancellationToken cancellationToken)
+        Stream conn, FrameParser parser, byte[] buf, SecurityObservation? security, CancellationToken cancellationToken)
     {
         var previous = default(LinkStats);
 
@@ -596,8 +621,20 @@ public sealed class Bus : IDisposable
                 return;
             }
 
-            Feed(parser, buf.AsSpan(0, n));
+            if (security is not null &&
+                security.Flood(SecurityEventKind.FloodFrames, security.Policy.Limits.Octets,
+                    cost: n, bucket: "bus octets") == SecurityAction.Disconnected)
+            {
+                return;
+            }
+
+            Feed(parser, buf.AsSpan(0, n), security);
+            security?.ParserStats(previous, parser.Stats, "multidrop");
             SyncParserStats(parser, ref previous);
+            if (security?.Disconnect == true)
+            {
+                return;
+            }
         }
     }
 
@@ -612,7 +649,7 @@ public sealed class Bus : IDisposable
     /// here would surface as frames that vanished with nothing in the log to
     /// say why.
     /// </remarks>
-    private void Feed(FrameParser parser, ReadOnlySpan<byte> data)
+    private void Feed(FrameParser parser, ReadOnlySpan<byte> data, SecurityObservation? security)
     {
         while (!data.IsEmpty)
         {
@@ -621,7 +658,13 @@ public sealed class Bus : IDisposable
 
             while (parser.TryNext(out var frame))
             {
-                Route(frame);
+                if (security is not null &&
+                    security.Flood(SecurityEventKind.FloodFrames, security.Policy.Limits.Frames) == SecurityAction.Disconnected)
+                {
+                    return;
+                }
+
+                Route(frame, security);
             }
 
             if (n == 0)
@@ -662,7 +705,7 @@ public sealed class Bus : IDisposable
     }
 
     /// <summary>Delivers one frame to the stations it belongs to.</summary>
-    private void Route(LinkFrame f)
+    private void Route(LinkFrame f, SecurityObservation? security)
     {
         List<StationConnection> targets;
 
@@ -689,6 +732,7 @@ public sealed class Bus : IDisposable
 
         if (targets.Count == 0)
         {
+            security?.Link(SecurityEventKind.LinkForeignDest, f, transportOverride: "multidrop");
             _log.Log(
                 Dnp3LogLevel.Debug,
                 "frame for nobody on the bus",
@@ -727,6 +771,12 @@ public sealed class Bus : IDisposable
                     _stats.FramesDropped++;
                 }
 
+                security?.Emit(new(SecurityEventKind.DoSQueueDrop)
+                {
+                    Action = SecurityAction.Ignored,
+                    LinkSrc = f.Header.Src,
+                    LinkDest = f.Header.Dest,
+                }, transportOverride: "multidrop");
                 _log.Log(
                     Dnp3LogLevel.Warn,
                     "station queue full; frame dropped",

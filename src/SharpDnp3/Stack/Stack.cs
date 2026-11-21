@@ -17,6 +17,7 @@
 // count bit advanced from two places is a lost or duplicated fragment.
 
 using SharpDnp3.Link;
+using SharpDnp3.Security;
 using SharpDnp3.Transport;
 
 namespace SharpDnp3.Stack;
@@ -187,6 +188,7 @@ internal sealed class ProtocolStack
     public void Reset()
     {
         _parser = new FrameParser();
+        AdmittedFrames = 0;
         _reasm.Reset();
         _pri.Reset();
         _sec.Reset();
@@ -207,11 +209,17 @@ internal sealed class ProtocolStack
     /// </remarks>
     public bool Pending => _awaiting;
 
+    public int Buffered => _parser.Buffered;
+
     /// <summary>
     /// Reports whether a fragment is still being transmitted, either awaiting a
     /// confirmation or with segments still to send.
     /// </summary>
     public bool Busy => _awaiting || _seg.Pending;
+
+    public ulong AdmittedFrames { get; private set; }
+
+    public SecurityObservation? Security { get; set; }
 
     /// <summary>Begins transmitting an application fragment.</summary>
     /// <remarks>
@@ -366,12 +374,33 @@ internal sealed class ProtocolStack
     /// </remarks>
     public void Receive(IByteSink sink, ReadOnlySpan<byte> data, Action<Received> onFragment)
     {
+        var security = Security;
+        if (security is not null)
+        {
+            security.SawData |= !data.IsEmpty;
+            security.Flood(SecurityEventKind.FloodFrames, security.Policy.Limits.Octets,
+                cost: data.Length, bucket: "octets");
+            if (security.Disconnect)
+            {
+                return;
+            }
+        }
+
         while (!data.IsEmpty)
         {
+            var before = _parser.Stats;
             var n = _parser.Write(data);
             data = data[n..];
 
             Drain(sink, onFragment);
+            if (security is not null)
+            {
+                security.ParserStats(before, _parser.Stats);
+                if (security.Disconnect)
+                {
+                    return;
+                }
+            }
 
             if (n == 0)
             {
@@ -385,10 +414,22 @@ internal sealed class ProtocolStack
         // TryNext returning false is the ordinary case: the buffered octets do
         // not yet make a frame, so there is nothing to do until more arrive.
         // The parser resyncs past corruption itself.
-        while (_parser.TryNext(out var f))
+        var security = Security;
+        while (security?.Disconnect != true && _parser.TryNext(out var f))
         {
+            if (security is not null &&
+                security.Flood(SecurityEventKind.FloodFrames, security.Policy.Limits.Frames) == SecurityAction.Disconnected)
+            {
+                return;
+            }
+
             if (!AddressedToUs(f.Header.Dest))
             {
+                if (security is { SharedLink: false })
+                {
+                    security.Link(SecurityEventKind.LinkForeignDest, f);
+                }
+
                 continue;
             }
 
@@ -399,6 +440,7 @@ internal sealed class ProtocolStack
             // outstation an outstation's.
             if (f.Header.Control.Dir == _cfg.IsMaster)
             {
+                security?.Link(SecurityEventKind.LinkWrongDir, f);
                 continue;
             }
 
@@ -413,12 +455,49 @@ internal sealed class ProtocolStack
             // dropped where the protocol is acted on, not where it is read.
             if (!LinkConstants.IsValidSource(f.Header.Src))
             {
+                security?.Link(SecurityEventKind.LinkInvalidSource, f);
                 continue;
             }
 
             if (f.Header.Control.Prm)
             {
+                if (security is not null)
+                {
+                    if (!_cfg.IsMaster && security.Policy.AllowedMasters is { } masters && !masters.Contains(f.Header.Src))
+                    {
+                        var reject = security.Policy.RejectUnexpectedMaster;
+                        security.Link(SecurityEventKind.LinkUnexpectedMaster, f,
+                            reject ? SecurityAction.Blocked : SecurityAction.Observed);
+                        if (reject)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if (_cfg.IsMaster && f.Header.Src != _cfg.RemoteAddr && _cfg.RemoteAddr != LinkConstants.SelfAddress)
+                    {
+                        security.Link(SecurityEventKind.LinkUnexpectedSource, f, SecurityAction.Observed);
+                    }
+
+                    security.RememberLink(f.Header.Src);
+                    ObservePrimary(security, f);
+                }
+
+                AdmittedFrames++;
                 var res = _sec.OnFrame(f);
+                if (security is not null && res.Note is { } note)
+                {
+                    var elevated = note == SecurityEventKind.SeqFCBRepeat &&
+                        security.Over(note, security.Policy.Limits.FcbRepeats);
+                    security.Emit(new(note)
+                    {
+                        LinkSrc = f.Header.Src,
+                        LinkDest = f.Header.Dest,
+                        LinkFunc = (byte)f.Header.Control.Func,
+                        Severity = elevated ? SecuritySeverity.Alert : default,
+                        Action = res.Discarded ? SecurityAction.Ignored : SecurityAction.Observed,
+                    });
+                }
                 if (res.Reply is { } reply)
                 {
                     // A separate buffer from the transmit path: answering an
@@ -450,12 +529,14 @@ internal sealed class ProtocolStack
                 // comes from an address the primary was not sent to.
                 if (_dest != LinkConstants.SelfAddress || !LinkConstants.IsValidSource(f.Header.Src))
                 {
+                    security?.Link(SecurityEventKind.LinkUnexpectedSource, f);
                     continue;
                 }
 
                 _dest = f.Header.Src;
             }
 
+            AdmittedFrames++;
             var (next, action) = _pri.OnFrame(f);
             switch (action)
             {
@@ -479,12 +560,48 @@ internal sealed class ProtocolStack
         }
     }
 
+    private static void ObservePrimary(SecurityObservation security, LinkFrame frame)
+    {
+        if (LinkConstants.IsBroadcast(frame.Header.Dest))
+        {
+            security.Link(SecurityEventKind.LinkBroadcast, frame, SecurityAction.Observed);
+        }
+        else if (frame.Header.Dest == LinkConstants.SelfAddress)
+        {
+            security.Link(SecurityEventKind.LinkSelfAddress, frame, SecurityAction.Observed);
+        }
+
+        switch (frame.Header.Control.Func)
+        {
+            case LinkFunction.RequestLinkStatus:
+                security.Flood(SecurityEventKind.FloodLinkStatus, security.Policy.Limits.LinkStatus, mayDisconnect: false);
+                break;
+            case LinkFunction.ResetLinkStates:
+                security.Flood(SecurityEventKind.FloodLinkReset, security.Policy.Limits.LinkReset, mayDisconnect: false);
+                break;
+        }
+    }
+
     /// <summary>
     /// Runs a segment through reassembly and reports any completed fragment.
     /// </summary>
     private void Deliver(LinkFrame f, ReadOnlySpan<byte> payload, Action<Received> onFragment)
     {
         var res = _reasm.Accept(payload);
+        if (res.Discarded != default)
+        {
+            var kind = res.Discarded == DiscardReason.Overflow && !_cfg.IsMaster
+                ? SecurityEventKind.AccessOversizedRequest : SecurityEventKind.TransportDiscard;
+            Security?.Emit(new(kind)
+            {
+                Action = SecurityAction.Ignored,
+                LinkSrc = f.Header.Src,
+                LinkDest = f.Header.Dest,
+                TransportSeq = payload.IsEmpty ? null : (byte)(payload[0] & 0x3f),
+                Value = res.Discarded.ToDisplayString(),
+            });
+        }
+
         if (!res.Complete)
         {
             return;
@@ -523,7 +640,7 @@ internal sealed class ProtocolStack
     /// with nothing to report. Asking for link status is how a session finds
     /// out before the next poll is due.
     /// </remarks>
-    public void SendLinkStatusRequest(IByteSink sink)
+    public void SendLinkStatusRequest(IByteSink sink, ushort? destination = null)
     {
         if (_awaiting)
         {
@@ -534,6 +651,12 @@ internal sealed class ProtocolStack
             // Busy stays set — and the probe is exactly what has to go out to
             // elicit the reply that clears DFC and lets those segments move.
             return;
+        }
+
+        if (destination is { } dest)
+        {
+            _dest = dest;
+            _pri.RemoteAddr = dest;
         }
 
         var (f, action) = _pri.RequestLinkStatus();

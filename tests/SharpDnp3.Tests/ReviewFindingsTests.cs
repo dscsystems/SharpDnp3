@@ -12,6 +12,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using SharpDnp3.App;
 using SharpDnp3.Channels;
+using SharpDnp3.Security;
 using SharpDnp3.Link;
 using SharpDnp3.Master;
 using SharpDnp3.Multidrop;
@@ -423,7 +424,10 @@ public class ReviewFindingsTests
         });
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var accepted = server.ConnectAsync(cts.Token);
+        var events = new List<SecurityEvent>();
+        var policy = new SecurityPolicy { Sink = events.Add };
+        await using var security = new SecurityRuntime(policy, "outstation");
+        var accepted = SecurityRuntime.ConnectAsync(server, security, cts.Token);
         await TestPair.WaitForAsync(() => server.BoundAddress is not null, "the listener");
         var addr = server.BoundAddress!;
 
@@ -443,6 +447,13 @@ public class ReviewFindingsTests
         var done = await Task.WhenAny(accepted, Task.Delay(5000));
         Assert.Same(accepted, done);
         await using var serverConn = await accepted;
+        var observed = security.ForConnection(server, serverConn);
+        var certificate = Assert.IsType<SecurityTlsPeer>(observed.Peer?.Tls);
+        Assert.True(certificate.Verified);
+        Assert.Contains(certificate.Version, new ushort?[] { 0x0303, 0x0304 });
+
+        await security.DisposeAsync();
+        Assert.Contains(events, e => e.Kind == SecurityEventKind.TLSNonTLSProbe);
     }
 
     private sealed class TempDir : IDisposable

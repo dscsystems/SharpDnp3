@@ -11,6 +11,9 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 
+using SharpDnp3.Security;
+using AuthenticationException = System.Security.Authentication.AuthenticationException;
+
 namespace SharpDnp3.Channels;
 
 /// <summary>Describes a mutually authenticated TLS channel.</summary>
@@ -43,6 +46,86 @@ public sealed class Dnp3TlsConfig
     /// TLS 1.2, the floor IEC 62351 sets.
     /// </summary>
     public SslProtocols MinVersion { get; set; } = SslProtocols.None;
+
+    /// <summary>Additional verification after the configured certificate and name checks pass.</summary>
+    public Func<SecurityTlsPeer, bool>? VerifyPeer { get; set; }
+
+    internal bool Verify(
+        X509Certificate2Collection authority, X509Certificate? peer, X509Chain? chain,
+        SslPolicyErrors errors, SecurityObservation? observation, bool server)
+    {
+        var trusted = VerifyAgainst(authority, peer, chain, errors);
+        var metadata = peer is not null && (observation is not null || VerifyPeer is not null)
+            ? DescribeCertificate(peer) with { Verified = trusted }
+            : null;
+        if (trusted && metadata is { } certificate && VerifyPeer is { } verify)
+        {
+            try
+            {
+                trusted = verify(certificate);
+            }
+            catch (Exception)
+            {
+                trusted = false;
+            }
+        }
+
+        if (!trusted)
+        {
+            observation?.Emit(new(server && peer is null
+                ? SecurityEventKind.TLSNoClientCert : SecurityEventKind.TLSCertRejected)
+            {
+                Action = SecurityAction.Rejected,
+                Peer = observation.Peer is { } endpoint ? endpoint with { Tls = metadata } : null,
+            });
+        }
+
+        return trusted;
+    }
+
+    internal static SecurityTlsPeer DescribeCertificate(X509Certificate certificate)
+    {
+        using var cert = new X509Certificate2(certificate);
+        return new SecurityTlsPeer(cert.Subject, cert.Issuer, cert.SerialNumber,
+            cert.GetCertHashString(HashAlgorithmName.SHA256).ToLowerInvariant(), cert.NotAfter.ToUniversalTime());
+    }
+
+    internal static string HandshakeFailureKind(Exception error, TlsHandshakePrefix? prefix = null)
+    {
+        if (error is OperationCanceledException)
+        {
+            return SecurityEventKind.TLSHandshakeTimeout;
+        }
+
+        if (prefix?.NonTlsKind is { } nonTls)
+        {
+            return nonTls;
+        }
+
+        for (Exception? cause = error; cause is not null; cause = cause.InnerException)
+        {
+            var message = cause.Message;
+            if (message.Contains("alert unknown ca", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("alert bad certificate", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("alert certificate required", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("alert certificate expired", StringComparison.OrdinalIgnoreCase))
+            {
+                return SecurityEventKind.TLSLocalCertRejected;
+            }
+        }
+
+        return SecurityEventKind.TLSHandshakeFailed;
+    }
+
+    internal static void ReportExpiry(SecurityObservation? observation, SecurityTlsPeer? certificate)
+    {
+        if (observation is not null && certificate is not null &&
+            observation.Policy.CertExpiryWarning >= TimeSpan.Zero &&
+            certificate.NotAfter - DateTimeOffset.UtcNow <= observation.Policy.CertExpiryWarning)
+        {
+            observation.Emit(new(SecurityEventKind.TLSCertExpiring));
+        }
+    }
 
     internal SslProtocols EffectiveProtocols => MinVersion == SslProtocols.None
         ? SslProtocols.Tls12 | SslProtocols.Tls13
@@ -143,7 +226,7 @@ public sealed class Dnp3TlsConfig
 /// <summary>
 /// A channel that dials an address over TLS, retrying with backoff.
 /// </summary>
-public sealed class TlsClientChannel : IChannel
+public sealed class TlsClientChannel : IChannel, IObservedChannel
 {
     private readonly string _address;
     private readonly Dnp3TlsConfig _tls;
@@ -172,7 +255,13 @@ public sealed class TlsClientChannel : IChannel
     }
 
     /// <inheritdoc/>
-    public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
+    public Task<Stream> ConnectAsync(CancellationToken cancellationToken) =>
+        ConnectAsync(null, cancellationToken);
+
+    Task<Stream> IObservedChannel.ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken) =>
+        ConnectAsync(security, cancellationToken);
+
+    private async Task<Stream> ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken)
     {
         var (host, port) = EndpointParser.Split(_address);
 
@@ -187,6 +276,7 @@ public sealed class TlsClientChannel : IChannel
 
             var client = new TcpClient();
             SslStream? ssl = null;
+            SecurityObservation? observation = null;
             try
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -194,12 +284,13 @@ public sealed class TlsClientChannel : IChannel
 
                 await client.ConnectAsync(host, port, timeout.Token).ConfigureAwait(false);
                 client.NoDelay = true;
+                observation = security?.ForPeer("tls", client.Client.RemoteEndPoint as IPEndPoint);
 
                 ssl = new SslStream(
                     client.GetStream(),
                     leaveInnerStreamOpen: false,
                     (_, cert, chain, errors) =>
-                        Dnp3TlsConfig.VerifyAgainst(_authority, cert, chain, errors));
+                        _tls.Verify(_authority, cert, chain, errors, observation, server: false));
 
                 await ssl.AuthenticateAsClientAsync(
                     new SslClientAuthenticationOptions
@@ -221,7 +312,16 @@ public sealed class TlsClientChannel : IChannel
                     throw new ChannelClosedException();
                 }
 
-                return new TlsConnectionStream(client, ssl);
+                var stream = new TlsConnectionStream(client, ssl);
+                if (observation is not null)
+                {
+                    observation.PeerSource = () => stream.SecurityPeer;
+                    security!.Bind(stream, observation);
+                    stream.ReportNegotiatedSecurity(observation);
+                    Dnp3TlsConfig.ReportExpiry(observation, Dnp3TlsConfig.DescribeCertificate(_certificate));
+                }
+
+                return stream;
             }
             catch (Exception ex) when (
                 ex is SocketException or AuthenticationException or IOException or OperationCanceledException)
@@ -231,6 +331,13 @@ public sealed class TlsClientChannel : IChannel
 
                 cancellationToken.ThrowIfCancellationRequested();
 
+                (observation ?? security?.ForPeer("tls", null))?.Emit(new(observation is null
+                    ? SecurityEventKind.ConnDialFailed
+                    : Dnp3TlsConfig.HandshakeFailureKind(ex))
+                {
+                    Action = SecurityAction.Rejected,
+                    Detail = ex.GetType().Name,
+                });
                 if (_retry.Min <= TimeSpan.Zero)
                 {
                     throw new NoConnectionException(string.Format(
@@ -262,13 +369,14 @@ public sealed class TlsClientChannel : IChannel
 /// A channel that accepts mutually authenticated TLS connections, serving one
 /// at a time.
 /// </summary>
-public sealed class TlsServerChannel : IChannel
+public sealed class TlsServerChannel : IChannel, IObservedChannel
 {
     private readonly string _address;
     private readonly Dnp3TlsConfig _tls;
     private readonly X509Certificate2 _certificate;
     private readonly X509Certificate2Collection _authority;
     private readonly Lock _gate = new();
+    private readonly ServerAdmission _admission = new();
     private TcpListener? _listener;
     private bool _closed;
 
@@ -325,7 +433,10 @@ public sealed class TlsServerChannel : IChannel
     }
 
     /// <inheritdoc/>
-    public bool SupportsConcurrentConnections => true;
+    public bool SupportsConcurrentConnections => Busy != BusyPolicy.Reject;
+
+    /// <summary>How additional connections are handled while a peer is being served.</summary>
+    public BusyPolicy Busy { get; init; }
 
     /// <inheritdoc/>
     /// <remarks>
@@ -335,18 +446,38 @@ public sealed class TlsServerChannel : IChannel
     /// the peer's problem, not the listener's, so that peer is dropped and the
     /// next one waited for.
     /// </remarks>
-    public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
+    public Task<Stream> ConnectAsync(CancellationToken cancellationToken) =>
+        ConnectAsync(null, cancellationToken);
+
+    Task<Stream> IObservedChannel.ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken) =>
+        ConnectAsync(security, cancellationToken);
+
+    private Task<Stream> ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken) =>
+        _admission.AcceptAsync(token => AcceptConnectionAsync(security, token), Listen, Busy, security, "tls", cancellationToken);
+
+    private async Task<Stream> AcceptConnectionAsync(SecurityRuntime? security, CancellationToken cancellationToken)
     {
         while (true)
         {
-            var client = await TcpAccept.AcceptAsync(Listen, cancellationToken).ConfigureAwait(false);
+            var client = await TcpAccept.AcceptAsync(Listen, cancellationToken, security, "tls").ConfigureAwait(false);
+            var remote = (IPEndPoint)client.Client.RemoteEndPoint!;
+            var observation = security?.ForPeer("tls", remote);
+            if (observation is not null && !security!.Admit(observation, remote, countAccept: true))
+            {
+                client.Dispose();
+                continue;
+            }
+
             client.NoDelay = true;
 
+            // Capture only the record prefix the TLS stack already reads, to
+            // distinguish cleartext DNP3 and unrelated traffic on a TLS port.
+            var prefix = observation?.HasSink == true ? new TlsHandshakePrefix(client.Client) : null;
             var ssl = new SslStream(
-                client.GetStream(),
+                prefix ?? client.GetStream(),
                 leaveInnerStreamOpen: false,
                 (_, cert, chain, errors) =>
-                    Dnp3TlsConfig.VerifyAgainst(_authority, cert, chain, errors));
+                    _tls.Verify(_authority, cert, chain, errors, observation, server: true));
 
             try
             {
@@ -364,7 +495,16 @@ public sealed class TlsServerChannel : IChannel
                         // every handshake failed.
                     },
                     timeout.Token).ConfigureAwait(false);
-                return new TlsConnectionStream(client, ssl);
+                var stream = new TlsConnectionStream(client, ssl);
+                if (observation is not null)
+                {
+                    observation.PeerSource = () => stream.SecurityPeer;
+                    security!.Bind(stream, observation);
+                    stream.ReportNegotiatedSecurity(observation);
+                    Dnp3TlsConfig.ReportExpiry(observation, Dnp3TlsConfig.DescribeCertificate(_certificate));
+                }
+
+                return stream;
             }
             catch (Exception ex) when (
                 ex is AuthenticationException or IOException or OperationCanceledException or Win32Exception)
@@ -372,6 +512,12 @@ public sealed class TlsServerChannel : IChannel
                 await ssl.DisposeAsync().ConfigureAwait(false);
                 client.Dispose();
                 cancellationToken.ThrowIfCancellationRequested();
+                var kind = Dnp3TlsConfig.HandshakeFailureKind(ex, prefix);
+                observation?.Emit(new(kind)
+                {
+                    Action = SecurityAction.Rejected,
+                    Detail = ex.GetType().Name,
+                });
             }
         }
     }
@@ -391,6 +537,8 @@ public sealed class TlsServerChannel : IChannel
             _listener?.Stop();
             _listener = null;
         }
+
+        _admission.Dispose();
     }
 
     /// <inheritdoc/>
@@ -418,6 +566,24 @@ internal sealed class TlsConnectionStream : Stream, IPeerEndpoint
         try
         {
             Peer = client.Client.RemoteEndPoint?.ToString();
+            SecurityPeer = new SecurityPeer
+            {
+                Network = "tls",
+                Remote = Peer,
+                Local = client.Client.LocalEndPoint?.ToString(),
+                Tls = inner.RemoteCertificate is { } certificate ? Dnp3TlsConfig.DescribeCertificate(certificate) with
+                {
+                    Version = inner.SslProtocol switch
+                    {
+                        SslProtocols.Tls12 => 0x0303,
+                        SslProtocols.Tls13 => 0x0304,
+                        _ => null,
+                    },
+                    CipherSuite = (ushort)inner.NegotiatedCipherSuite,
+                    ServerName = string.IsNullOrEmpty(inner.TargetHostName) ? null : inner.TargetHostName,
+                    Verified = true,
+                } : null,
+            };
         }
         catch (SocketException)
         {
@@ -429,8 +595,25 @@ internal sealed class TlsConnectionStream : Stream, IPeerEndpoint
         }
     }
 
+    internal void ReportNegotiatedSecurity(SecurityObservation observation)
+    {
+        var cipher = _inner.NegotiatedCipherSuite.ToString();
+        if (_inner.SslProtocol is not (SslProtocols.Tls12 or SslProtocols.Tls13) ||
+            cipher.Contains("_RC4_", StringComparison.Ordinal) ||
+            cipher.Contains("_3DES_", StringComparison.Ordinal) ||
+            cipher.Contains("_CBC_", StringComparison.Ordinal) ||
+            cipher.Contains("_NULL_", StringComparison.Ordinal))
+        {
+            observation.Emit(new(SecurityEventKind.TLSWeakParams) { Detail = cipher });
+        }
+
+        Dnp3TlsConfig.ReportExpiry(observation, SecurityPeer?.Tls);
+    }
+
     /// <inheritdoc/>
     public string? Peer { get; }
+
+    public SecurityPeer? SecurityPeer { get; }
 
     public override bool CanRead => _inner.CanRead;
 

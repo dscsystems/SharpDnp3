@@ -22,6 +22,7 @@ signatures may change before 1.0.
 | `SharpDnp3.Master` | The master role: polls outstations, receives events, issues controls |
 | `SharpDnp3.Outstation` | The outstation role: holds measurements, answers polls, executes controls |
 | `SharpDnp3.Channels` | Transports: TCP, TLS, UDP, serial, in-process pipe |
+| `SharpDnp3.Security` | [Security policy, peer identity, and event dispatch](security.md) |
 | `SharpDnp3.Decoding` | Structured protocol traces for logging and tooling |
 | `SharpDnp3.Objects` | Group/variation codecs and the object descriptor table |
 | `SharpDnp3.App`, `SharpDnp3.Link`, `SharpDnp3.Transport` | The layer primitives — headers, function codes, qualifiers, framing constants. Public, but an application normally names nothing from them |

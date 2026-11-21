@@ -12,6 +12,7 @@
 
 using System.Globalization;
 using System.IO.Ports;
+using SharpDnp3.Security;
 
 namespace SharpDnp3.Channels;
 
@@ -154,11 +155,15 @@ public sealed class SerialChannel : IChannel
     /// Presents the port as a stream whose reads return empty rather than
     /// throwing when the line is idle.
     /// </summary>
-    private sealed class SerialStream : Stream
+    private sealed class SerialStream : Stream, IPeerEndpoint
     {
         private readonly SerialPort _port;
 
         public SerialStream(SerialPort port) => _port = port;
+
+        public string? Peer => _port.PortName;
+
+        public SecurityPeer SecurityPeer => new() { Network = "serial", SerialPort = _port.PortName };
 
         public override bool CanRead => true;
 

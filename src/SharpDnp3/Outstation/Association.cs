@@ -35,6 +35,11 @@ internal sealed class Association
     /// <summary>Where the stack puts octets waiting to be transmitted.</summary>
     public BufferSink Sink { get; } = new();
 
+    public long LastFrame { get; set; }
+    public long? PartialSince { get; set; }
+    public long? ProbedAt { get; set; }
+    public bool ReportedEventOverflow { get; set; }
+
     /// <summary>
     /// This master's event queue. Selection and confirmation are per-master, so
     /// each gets its own copy of the event stream.

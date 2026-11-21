@@ -287,6 +287,7 @@ public sealed partial class OutstationSession
     private void OnUnsolicitedTimeout(Association a, DateTimeOffset now)
     {
         a.Unsol.Awaiting = false;
+        ConfirmMissed(a);
         a.Unsol.Retries++;
 
         lock (_gate)
@@ -522,6 +523,7 @@ public sealed partial class OutstationSession
     {
         if (!a.Unsol.Awaiting || h.Control.Seq != a.Unsol.AwaitSeq)
         {
+            UnexpectedConfirm(a, h);
             a.Log.Log(
                 Dnp3LogLevel.Debug,
                 "unexpected unsolicited confirm",
@@ -529,6 +531,7 @@ public sealed partial class OutstationSession
             return;
         }
 
+        Confirmed(a);
         a.Unsol.Awaiting = false;
         a.Unsol.Retries = 0;
         a.Unsol.ReadSinceSent = false;

@@ -5,6 +5,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using SharpDnp3.Security;
 
 namespace SharpDnp3.Channels;
 
@@ -49,7 +50,7 @@ internal static class EndpointParser
 }
 
 /// <summary>A channel that dials an address, retrying with backoff.</summary>
-public sealed class TcpClientChannel : IChannel
+public sealed class TcpClientChannel : IChannel, IObservedChannel
 {
     private readonly string _address;
     private readonly Retry _retry;
@@ -67,7 +68,13 @@ public sealed class TcpClientChannel : IChannel
     }
 
     /// <inheritdoc/>
-    public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
+    public Task<Stream> ConnectAsync(CancellationToken cancellationToken) =>
+        ConnectAsync(null, cancellationToken);
+
+    Task<Stream> IObservedChannel.ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken) =>
+        ConnectAsync(security, cancellationToken);
+
+    private async Task<Stream> ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken)
     {
         var (host, port) = EndpointParser.Split(_address);
 
@@ -109,6 +116,8 @@ public sealed class TcpClientChannel : IChannel
 
                 cancellationToken.ThrowIfCancellationRequested();
 
+                security?.ForPeer("tcp", null)
+                    .Emit(new(SecurityEventKind.ConnDialFailed) { Detail = ex.GetType().Name });
                 if (_retry.Min <= TimeSpan.Zero)
                 {
                     throw new NoConnectionException(string.Format(
@@ -134,15 +143,16 @@ public sealed class TcpClientChannel : IChannel
 
 /// <summary>A channel that accepts inbound connections on an address.</summary>
 /// <remarks>
-/// Each <see cref="ConnectAsync"/> accepts one master. A session that serves
+/// Each <see cref="ConnectAsync(CancellationToken)"/> accepts one master. A session that serves
 /// one master at a time calls it again after each disconnection; a session
 /// configured for several calls it again straight away, so the listener hands
 /// out as many peers as the session is willing to hold.
 /// </remarks>
-public sealed class TcpServerChannel : IChannel
+public sealed class TcpServerChannel : IChannel, IObservedChannel
 {
     private readonly string _address;
     private readonly Lock _gate = new();
+    private readonly ServerAdmission _admission = new();
     private TcpListener? _listener;
     private bool _closed;
 
@@ -197,14 +207,52 @@ public sealed class TcpServerChannel : IChannel
     }
 
     /// <inheritdoc/>
-    public bool SupportsConcurrentConnections => true;
+    public bool SupportsConcurrentConnections => Busy != BusyPolicy.Reject;
+
+    /// <summary>How additional connections are handled while a peer is being served.</summary>
+    public BusyPolicy Busy { get; init; }
 
     /// <inheritdoc/>
-    public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
+    public Task<Stream> ConnectAsync(CancellationToken cancellationToken) =>
+        ConnectAsync(null, cancellationToken);
+
+    Task<Stream> IObservedChannel.ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken) =>
+        ConnectAsync(security, cancellationToken);
+
+    private Task<Stream> ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken) =>
+        _admission.AcceptAsync(token => AcceptConnectionAsync(security, token), Listen, Busy, security, "tcp", cancellationToken);
+
+    private async Task<Stream> AcceptConnectionAsync(SecurityRuntime? security, CancellationToken cancellationToken)
     {
-        var client = await TcpAccept.AcceptAsync(Listen, cancellationToken).ConfigureAwait(false);
-        client.NoDelay = true;
-        return new TcpConnectionStream(client);
+        while (true)
+        {
+            var client = await TcpAccept.AcceptAsync(Listen, cancellationToken, security).ConfigureAwait(false);
+            try
+            {
+                var remote = (IPEndPoint)client.Client.RemoteEndPoint!;
+                var observation = security?.ForPeer("tcp", remote);
+                if (observation is not null && !security!.Admit(observation, remote, countAccept: true))
+                {
+                    client.Dispose();
+                    continue;
+                }
+
+                client.NoDelay = true;
+                var stream = new TcpConnectionStream(client);
+                if (observation is not null)
+                {
+                    observation.PeerSource = () => stream.SecurityPeer;
+                    security!.Bind(stream, observation);
+                }
+
+                return stream;
+            }
+            catch
+            {
+                client.Dispose();
+                throw;
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -216,6 +264,8 @@ public sealed class TcpServerChannel : IChannel
             _listener?.Stop();
             _listener = null;
         }
+
+        _admission.Dispose();
     }
 
     /// <inheritdoc/>
@@ -257,8 +307,11 @@ internal static class TcpAccept
     /// the channel is closed.
     /// </param>
     /// <param name="cancellationToken">Ends the wait.</param>
+    /// <param name="security">Optional connection observations.</param>
+    /// <param name="transport">Transport name for accept errors.</param>
     public static async Task<TcpClient> AcceptAsync(
-        Func<TcpListener> listen, CancellationToken cancellationToken)
+        Func<TcpListener> listen, CancellationToken cancellationToken,
+        SecurityRuntime? security = null, string transport = "tcp")
     {
         var backoff = TimeSpan.Zero;
         while (true)
@@ -275,6 +328,10 @@ internal static class TcpAccept
                 // A close stops the listener underneath the accept; listen()
                 // then reports it as the closed channel it is.
                 listen();
+                security?.ForPeer(transport, null).Emit(new(SecurityEventKind.ConnAcceptError)
+                {
+                    Detail = ex.GetType().Name,
+                });
 
                 backoff = backoff < MinBackoff ? MinBackoff : backoff * 2;
                 if (backoff > MaxBackoff)
@@ -304,6 +361,12 @@ internal sealed class TcpConnectionStream : Stream, IPeerEndpoint
         try
         {
             Peer = client.Client.RemoteEndPoint?.ToString();
+            SecurityPeer = new SecurityPeer
+            {
+                Network = "tcp",
+                Remote = Peer,
+                Local = client.Client.LocalEndPoint?.ToString(),
+            };
         }
         catch (SocketException)
         {
@@ -317,6 +380,8 @@ internal sealed class TcpConnectionStream : Stream, IPeerEndpoint
 
     /// <inheritdoc/>
     public string? Peer { get; }
+
+    public SecurityPeer? SecurityPeer { get; }
 
     public override bool CanRead => _inner.CanRead;
 

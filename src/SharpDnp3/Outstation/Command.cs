@@ -3,6 +3,7 @@
 // Licensed under the GNU General Public License v3.0 or later.
 
 using SharpDnp3.App;
+using SharpDnp3.Security;
 using SharpDnp3.Objects;
 using SharpDnp3.Stack;
 
@@ -245,6 +246,14 @@ public sealed partial class OutstationSession
         if (opType == OperateType.Selected)
         {
             selectStatus = a.Sel.Matches(objectsRaw.Span, frag.Header.Control.Seq, now);
+            if (!selectStatus.OK() && a.Stack.Security is { } security)
+            {
+                var kind = !a.Sel.Active ? SecurityEventKind.CmdOperateWithoutSelect
+                    : selectStatus == CommandStatus.Timeout ? SecurityEventKind.CmdSelectTimeout
+                    : frag.Header.Control.Seq != (a.Sel.Seq + 1) % AppConstants.SeqModulus ? SecurityEventKind.CmdOperateSeqGap
+                    : SecurityEventKind.CmdOperateMismatch;
+                security.Application(kind, r, frag.Header, SecurityAction.Rejected);
+            }
 
             // The selection is consumed either way: a failed operate must not
             // leave a reservation an operator could stumble into later.
@@ -270,6 +279,12 @@ public sealed partial class OutstationSession
         ReadOnlyMemory<byte> objectsRaw,
         DateTimeOffset now)
     {
+        if (a.Sel.Active)
+        {
+            a.Stack.Security?.Application(SecurityEventKind.CmdSelectAbandoned, r, frag.Header,
+                detail: now >= a.Sel.Expires ? "Previous selection expired" : "Previous selection replaced");
+        }
+
         var (body, outcomes) = ExecuteCommands(a, frag, OperateType.Direct, CommandStatus.Success);
 
         var allOK = true;
@@ -387,11 +402,25 @@ public sealed partial class OutstationSession
                 // refusal.
                 var index = (ushort)wide;
                 var status = selectStatus;
+                var security = a.Stack.Security;
+                var code = h.Group == 12 ? new ControlCode(raw[0]) : default;
+                if (security is not null && InvalidCommandFields(h, raw, code))
+                {
+                    CommandObservation(security, SecurityEventKind.ProtoFieldInvalid, frag.Header, h,
+                        wide, code, CommandStatus.FormatError);
+                }
+
                 controls++;
                 if (wide > 0xFFFF || !ControlExists(h.Group, index))
                 {
                     status = CommandStatus.NotSupported;
                     a.Iin = a.Iin.Set(Iin.ParameterError);
+                    if (security is not null)
+                    {
+                        CommandObservation(security, SecurityEventKind.AccessUnknownPoint, frag.Header, h,
+                            wide, code, status, SecurityAction.Rejected);
+                        security.Scan($"point:{h.Group}:{wide}");
+                    }
                 }
                 else if (_cfg.MaxControlsPerRequest > 0 && controls > _cfg.MaxControlsPerRequest)
                 {
@@ -402,10 +431,41 @@ public sealed partial class OutstationSession
                 }
                 else if (status.OK())
                 {
-                    status = RunCommand(h.Group, h.Variation, index, raw, selecting, opType);
-                    if (!selecting)
+                    if (security is not null)
                     {
-                        RecordCommandEvent(h.Group, h.Variation, index, raw, status);
+                        status = CheckCommandPolicy(security, frag.Header, h, index, code);
+                    }
+
+                    if (status.OK())
+                    {
+                        status = RunCommand(h.Group, h.Variation, index, raw, selecting, opType);
+                        if (!selecting)
+                        {
+                            RecordCommandEvent(h.Group, h.Variation, index, raw, status);
+                        }
+                    }
+                }
+
+                if (security is not null)
+                {
+                    if (!status.OK())
+                    {
+                        if (status is CommandStatus.Local or CommandStatus.DownstreamLocal)
+                        {
+                            CommandObservation(security, SecurityEventKind.CmdLocalMode, frag.Header, h,
+                                wide, code, status, SecurityAction.Rejected);
+                        }
+
+                        CommandObservation(security, SecurityEventKind.CmdRejected, frag.Header, h,
+                            wide, code, status, SecurityAction.Rejected);
+                        if (security.Over(SecurityEventKind.CmdBruteForce, security.Policy.Limits.CommandRejects))
+                        {
+                            CommandObservation(security, SecurityEventKind.CmdBruteForce, frag.Header, h, wide, code, status);
+                        }
+                    }
+                    else if (!security.Policy.DisableAudit)
+                    {
+                        CommandObservation(security, SecurityEventKind.CmdReceived, frag.Header, h, wide, code, status);
                     }
                 }
 

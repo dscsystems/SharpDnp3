@@ -1,7 +1,7 @@
 # SharpDnp3
 
-A DNP3 (IEEE Std 1815-2012) master and outstation in C#, with no native
-dependencies.
+A DNP3 (IEEE Std 1815-2012) master and outstation in C#, with no third-party
+native dependencies.
 
 DNP3 is the protocol most of the electric utility industry uses between a SCADA
 system and the equipment in a substation. This library implements both ends of
@@ -147,6 +147,7 @@ testing](#building-and-testing).
 | **Command events** | Operated controls recorded as group 13/43 events in the class each output names |
 | **Extended services** | Indexed time-and-interval objects, virtual terminals, datasets (groups 85–88), application/configuration function codes 15–19 and `ACTIVATE_CONFIG`, self-address discovery |
 | **Secure Authentication** | A symmetric SAv5 subset (locally provisioned AES update keys, RFC 3394 session keys, SHA-256 HMAC, challenge/reply for every state-changing request) with security statistics |
+| **Security reporting** | Structured events, connection and traffic limits, IP and link-address admission, peer identity, and application policy. See [connection hardening and security events](docs/security.md). |
 | **Multidrop** | Several sessions sharing one serial line, with half-duplex turn taking and a bus registry |
 | **Objects** | Groups 0, 1–4, 10–13, 20–23, 30–34, 40–43, 50–52, 60, 70, 80, 85–91, 110–113, 120–122, generated from a declarative spec |
 | **Tooling** | Structured protocol decoder, four working command-line programs |

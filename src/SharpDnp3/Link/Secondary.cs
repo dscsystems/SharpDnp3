@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Ricardo Olsen / DSC Systems
 // Licensed under the GNU General Public License v3.0 or later.
 
+using SharpDnp3.Security;
+
 namespace SharpDnp3.Link;
 
 /// <summary>What a <see cref="Secondary"/> wants done with a received frame.</summary>
@@ -27,6 +29,8 @@ internal readonly struct SecResult
     /// valid combination.
     /// </summary>
     public bool Discarded { get; init; }
+
+    public string? Note { get; init; }
 
     /// <summary>Reports whether the result carries user data.</summary>
     public bool HasPayload => !Payload.IsEmpty;
@@ -133,7 +137,7 @@ internal sealed class Secondary
         // something is wrong.
         if (!ValidControl(f.Header.Control) || !ValidLength(f.Header.Control, f.Payload))
         {
-            return new SecResult { Discarded = true };
+            return new SecResult { Discarded = true, Note = SecurityEventKind.LinkInvalidControl };
         }
 
         if (LinkConstants.IsBroadcast(f.Header.Dest))
@@ -154,12 +158,12 @@ internal sealed class Secondary
             case LinkFunction.TestLinkStates:
                 if (!_reset)
                 {
-                    return new SecResult { Reply = BuildReply(LinkFunction.Nack, src) };
+                    return new SecResult { Reply = BuildReply(LinkFunction.Nack, src), Note = SecurityEventKind.LinkNotReset };
                 }
 
                 if (f.Header.Control.Fcb != _expectFcb)
                 {
-                    return new SecResult { Reply = BuildReply(LinkFunction.Nack, src) };
+                    return new SecResult { Reply = BuildReply(LinkFunction.Nack, src), Note = SecurityEventKind.SeqTestLinkNack };
                 }
 
                 _expectFcb = !_expectFcb;
@@ -175,6 +179,7 @@ internal sealed class Secondary
                     {
                         Reply = BuildReply(LinkFunction.Nack, src),
                         Discarded = true,
+                        Note = SecurityEventKind.LinkNotReset,
                     };
                 }
 
@@ -187,6 +192,7 @@ internal sealed class Secondary
                     {
                         Reply = BuildReply(LinkFunction.Ack, src),
                         Discarded = true,
+                        Note = SecurityEventKind.SeqFCBRepeat,
                     };
                 }
 
@@ -205,7 +211,11 @@ internal sealed class Secondary
                 return new SecResult { Reply = BuildReply(LinkFunction.LinkStatus, src) };
 
             default:
-                return new SecResult { Reply = BuildReply(LinkFunction.NotSupported, src) };
+                return new SecResult
+                {
+                    Reply = BuildReply(LinkFunction.NotSupported, src),
+                    Note = SecurityEventKind.LinkUnsupportedFunction,
+                };
         }
     }
 

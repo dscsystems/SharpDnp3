@@ -18,6 +18,7 @@
 
 using System.Net;
 using System.Net.Sockets;
+using SharpDnp3.Security;
 
 namespace SharpDnp3.Channels;
 
@@ -35,16 +36,27 @@ public sealed class UdpConfig
     /// an outstation normally wants.
     /// </summary>
     public string RemoteAddr { get; set; } = "";
+
+    /// <summary>Discard datagrams whose endpoint differs from the configured or learned peer.</summary>
+    public bool PinPeer { get; set; }
 }
 
+/// <summary>Counts UDP datagrams from an endpoint other than the channel's peer.</summary>
+public readonly record struct UdpStats(long ForeignSources, long DroppedSources);
+
 /// <summary>A channel over a UDP socket.</summary>
-public sealed class UdpChannel : IChannel
+public sealed class UdpChannel : IChannel, IObservedChannel
 {
     private readonly UdpConfig _cfg;
     private readonly Lock _gate = new();
     private UdpClient? _client;
     private IPEndPoint? _remote;
     private bool _closed;
+    private long _foreignSources;
+    private long _droppedSources;
+
+    /// <summary>Returns the cumulative UDP source counters.</summary>
+    public UdpStats Stats => new(Interlocked.Read(ref _foreignSources), Interlocked.Read(ref _droppedSources));
 
     /// <summary>Creates a channel over a UDP socket.</summary>
     public UdpChannel(UdpConfig config)
@@ -68,7 +80,13 @@ public sealed class UdpChannel : IChannel
     }
 
     /// <inheritdoc/>
-    public Task<Stream> ConnectAsync(CancellationToken cancellationToken)
+    public Task<Stream> ConnectAsync(CancellationToken cancellationToken) =>
+        ConnectAsync(null, cancellationToken);
+
+    Task<Stream> IObservedChannel.ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken) =>
+        ConnectAsync(security, cancellationToken);
+
+    private Task<Stream> ConnectAsync(SecurityRuntime? security, CancellationToken cancellationToken)
     {
         lock (_gate)
         {
@@ -83,15 +101,12 @@ public sealed class UdpChannel : IChannel
             {
                 // A datagram socket has no connection to re-establish, so a
                 // reconnecting session gets the same socket back.
-                return Task.FromResult<Stream>(new UdpStream(this));
+                return Task.FromResult<Stream>(new UdpStream(this, security));
             }
 
             var local = string.IsNullOrEmpty(_cfg.LocalAddr) ? ":0" : _cfg.LocalAddr;
             var (host, port) = EndpointParser.Split(local);
             var bindAddress = host.Length == 0 ? IPAddress.Any : IPAddress.Parse(host);
-
-            var client = new UdpClient(new IPEndPoint(bindAddress, port));
-            _client = client;
 
             if (!string.IsNullOrEmpty(_cfg.RemoteAddr))
             {
@@ -99,7 +114,8 @@ public sealed class UdpChannel : IChannel
                 _remote = new IPEndPoint(IPAddress.Parse(rhost), rport);
             }
 
-            return Task.FromResult<Stream>(new UdpStream(this));
+            _client = new UdpClient(new IPEndPoint(bindAddress, port));
+            return Task.FromResult<Stream>(new UdpStream(this, security));
         }
     }
 
@@ -123,12 +139,30 @@ public sealed class UdpChannel : IChannel
         : "udp " + _cfg.LocalAddr + "→" + _cfg.RemoteAddr;
 
     /// <summary>Presents the datagram socket as a stream.</summary>
-    private sealed class UdpStream : Stream
+    private sealed class UdpStream : Stream, IPeerEndpoint
     {
         private readonly UdpChannel _channel;
+        private readonly SecurityRuntime? _security;
+        private readonly HashSet<IPEndPoint> _refused = [];
         private ReadOnlyMemory<byte> _remainder;
+        private IPEndPoint? _identified;
 
-        public UdpStream(UdpChannel channel) => _channel = channel;
+        public UdpStream(UdpChannel channel, SecurityRuntime? security)
+        {
+            _channel = channel;
+            _security = security;
+        }
+
+        public string? Peer
+        {
+            get
+            {
+                lock (_channel._gate)
+                {
+                    return _channel._remote?.ToString();
+                }
+            }
+        }
 
         public override bool CanRead => true;
 
@@ -158,7 +192,12 @@ public sealed class UdpChannel : IChannel
         public override async ValueTask<int> ReadAsync(
             Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
-            if (_remainder.IsEmpty)
+            if (buffer.IsEmpty)
+            {
+                return 0;
+            }
+
+            while (_remainder.IsEmpty)
             {
                 UdpClient? client;
                 lock (_channel._gate)
@@ -183,9 +222,58 @@ public sealed class UdpChannel : IChannel
 
                 // Learn the peer from the first datagram, so an outstation can
                 // answer a master it was not configured with.
+                IPEndPoint? remote;
                 lock (_channel._gate)
                 {
-                    _channel._remote ??= result.RemoteEndPoint;
+                    remote = _channel._remote;
+                }
+
+                var sender = result.RemoteEndPoint;
+                if (_security is { } security && !sender.Equals(_identified))
+                {
+                    var foreign = remote is not null && !remote.Equals(sender);
+                    var observation = foreign
+                        ? security.ForPeer("udp", sender)
+                        : security.ForConnection(_channel, this);
+                    if (_refused.Contains(sender) || !security.Admit(observation, sender, countAccept: false) ||
+                        !await observation.IdentifyAsync(cancellationToken, sender).ConfigureAwait(false))
+                    {
+                        if (_refused.Count < 256)
+                        {
+                            _refused.Add(sender);
+                        }
+
+                        Interlocked.Increment(ref _channel._droppedSources);
+                        continue;
+                    }
+
+                    if (!foreign && result.Buffer.Length != 0)
+                    {
+                        _identified = sender;
+                    }
+                }
+
+                if (remote is null && result.Buffer.Length != 0)
+                {
+                    lock (_channel._gate)
+                    {
+                        remote = _channel._remote ??= result.RemoteEndPoint;
+                    }
+                }
+
+                if (remote is not null && !remote.Equals(result.RemoteEndPoint))
+                {
+                    Interlocked.Increment(ref _channel._foreignSources);
+                    _security?.ForConnection(_channel, this).Emit(new(SecurityEventKind.ConnUDPForeignSource)
+                    {
+                        Action = _channel._cfg.PinPeer ? SecurityAction.Ignored : SecurityAction.Observed,
+                        Peer = new SecurityPeer { Network = "udp", Remote = result.RemoteEndPoint.ToString() },
+                    });
+                    if (_channel._cfg.PinPeer)
+                    {
+                        Interlocked.Increment(ref _channel._droppedSources);
+                        continue;
+                    }
                 }
 
                 _remainder = result.Buffer;

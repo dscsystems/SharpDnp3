@@ -6,6 +6,7 @@
 // rules about what a master may ask for next.
 
 using SharpDnp3.App;
+using SharpDnp3.Security;
 using SharpDnp3.Objects;
 using SharpDnp3.Stack;
 
@@ -52,6 +53,10 @@ internal sealed class Transfer : IDisposable
     /// told the file is finished rather than being served past its end.
     /// </summary>
     public bool Done { get; set; }
+
+    public bool IsDirectory { get; init; }
+
+    public Association? Owner { get; set; }
 
     /// <summary>The octets accepted into a file being written.</summary>
     public ulong Received { get; set; }
@@ -155,6 +160,7 @@ public sealed partial class OutstationSession
     {
         if (!st.Status.OK())
         {
+            ReportFile(a, r, req, SecurityEventKind.FileRejected, status: st.Status);
             lock (_gate)
             {
                 _stats.FileErrors++;
@@ -171,6 +177,7 @@ public sealed partial class OutstationSession
     {
         if (!st.Status.OK())
         {
+            ReportFile(a, r, req, SecurityEventKind.FileRejected, status: st.Status);
             lock (_gate)
             {
                 _stats.FileErrors++;
@@ -257,6 +264,11 @@ public sealed partial class OutstationSession
             a.FileAuthUntil = _appl.Now() + _cfg.Files.Timeout;
         }
 
+        if (a.FileAuthKey == 0)
+        {
+            a.Stack.Security?.Application(SecurityEventKind.AuthFileFailed, r, frag.Header, SecurityAction.Rejected);
+        }
+
         // A failed authentication returns key zero. Credentials never appear in
         // the response or the session log.
         var value = new List<byte>();
@@ -292,6 +304,22 @@ public sealed partial class OutstationSession
         }
 
         var reply = new FileCommandStatus { RequestId = cmd.RequestId };
+        ReportSuspiciousFileName(a, r, frag.Header, cmd.Name);
+        if (cmd.Mode is FileOpenMode.Write or FileOpenMode.Append && a.Stack.Security is { } observation)
+        {
+            if (observation.Policy.MaxFileSize > 0 && cmd.Size > observation.Policy.MaxFileSize)
+            {
+                ReportFile(a, r, frag.Header, SecurityEventKind.FileOversized, cmd.Name);
+            }
+
+            if (observation.Policy.Functions is { } functions && (functions.ReadOnly || functions.DenyFileWrite))
+            {
+                observation.Application(SecurityEventKind.AccessFunctionBlocked, r, frag.Header, SecurityAction.Blocked);
+                RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.PermissionDenied });
+                return;
+            }
+        }
+
         if (!FileAuthorized(a, r.Source, cmd.Key))
         {
             RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.PermissionDenied });
@@ -320,7 +348,15 @@ public sealed partial class OutstationSession
         _handleSeq++;
         t.Handle = _handleSeq;
         t.Deadline = _appl.Now() + _cfg.Files.Timeout;
+        t.Owner = a;
         _file = t;
+        if (a.Stack.Security is { Policy.DisableAudit: false })
+        {
+            var kind = cmd.Mode is FileOpenMode.Write or FileOpenMode.Append ? SecurityEventKind.FileWriteOpened
+                : t.IsDirectory ? SecurityEventKind.FileDirectoryList
+                : SecurityEventKind.FileReadOpened;
+            ReportFile(a, r, frag.Header, kind, cmd.Name);
+        }
 
         lock (_gate)
         {
@@ -394,6 +430,7 @@ public sealed partial class OutstationSession
                     Mode = cmd.Mode,
                     BlockSize = blockSize,
                     Reader = reader,
+                    IsDirectory = info.IsDirectory,
                     Size = size,
                 };
                 return FileStatus.Success;
@@ -502,7 +539,7 @@ public sealed partial class OutstationSession
 
         var reply = new FileCommandStatus { Handle = req.Handle, RequestId = req.RequestId };
 
-        if (_file is null || _file.Handle != req.Handle)
+        if (_file is null || _file.Owner != a || _file.Handle != req.Handle)
         {
             RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.InvalidHandle });
             return;
@@ -569,6 +606,7 @@ public sealed partial class OutstationSession
         }
 
         var reply = new FileCommandStatus { RequestId = cmd.RequestId };
+        ReportSuspiciousFileName(a, r, frag.Header, cmd.Name);
         if (!FileAuthorized(a, r.Source, cmd.Key))
         {
             RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.PermissionDenied });
@@ -586,6 +624,11 @@ public sealed partial class OutstationSession
         var status = _cfg.Files.Handler!.Delete(cmd.Name);
         if (status.OK())
         {
+            if (a.Stack.Security is { Policy.DisableAudit: false })
+            {
+                ReportFile(a, r, frag.Header, SecurityEventKind.FileDelete, cmd.Name);
+            }
+
             a.Log.Log(Dnp3LogLevel.Info, "file deleted", ("name", cmd.Name));
         }
 
@@ -624,7 +667,7 @@ public sealed partial class OutstationSession
             }
         }
 
-        if (_file is null)
+        if (_file is null || _file.Owner != a)
         {
             RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.NotOpen });
             return;
@@ -632,11 +675,13 @@ public sealed partial class OutstationSession
 
         if (reply.Handle != 0 && reply.Handle != _file.Handle)
         {
+            ReportFile(a, r, frag.Header, SecurityEventKind.FileInvalidHandle);
             RespondCommandStatus(a, r, frag.Header, reply with { Status = FileStatus.InvalidHandle });
             return;
         }
 
         var name = _file.Name;
+        ReportFile(a, r, frag.Header, SecurityEventKind.FileAborted, _file.Name);
         TryCloseFile();
 
         lock (_gate)
@@ -733,7 +778,7 @@ public sealed partial class OutstationSession
         });
 
         var t = _file;
-        if (t is null)
+        if (t is null || t.Owner != a)
         {
             Fail(FileStatus.NotOpen);
             return;
@@ -741,6 +786,7 @@ public sealed partial class OutstationSession
 
         if (t.Handle != req.Handle)
         {
+            ReportFile(a, r, frag.Header, SecurityEventKind.FileInvalidHandle);
             Fail(FileStatus.InvalidHandle);
             return;
         }
@@ -900,12 +946,13 @@ public sealed partial class OutstationSession
         var t = _file;
         FileStatus status;
 
-        if (t is null)
+        if (t is null || t.Owner != a)
         {
             status = FileStatus.NotOpen;
         }
         else if (t.Handle != block.Handle)
         {
+            ReportFile(a, r, frag.Header, SecurityEventKind.FileInvalidHandle);
             status = FileStatus.InvalidHandle;
         }
         else if (t.Mode != FileOpenMode.Write && t.Mode != FileOpenMode.Append)
@@ -1000,6 +1047,7 @@ public sealed partial class OutstationSession
             "file transfer timed out; the handle is being released",
             ("name", t.Name), ("handle", t.Handle));
 
+        t.Owner?.Stack.Security?.Emit(new(SecurityEventKind.FileTimeout));
         TryCloseFile();
 
         lock (_gate)

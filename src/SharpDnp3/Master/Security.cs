@@ -8,6 +8,7 @@
 
 using System.Security.Cryptography;
 using SharpDnp3.App;
+using SharpDnp3.Stack;
 using SharpDnp3.Objects;
 using SharpDnp3.Security;
 
@@ -157,6 +158,10 @@ public sealed partial class MasterSession
             _security.Messages = 0;
             var ttl = cfg.KeyTimeout > TimeSpan.Zero ? cfg.KeyTimeout : TimeSpan.FromMinutes(10);
             _security.Until = _time.GetUtcNow() + ttl;
+            if (_stack?.Security is { Policy.DisableAudit: false } security)
+            {
+                security.Emit(new(SecurityEventKind.AuthMasterKeyChange) { User = cfg.User, AppSeq = f.Header.Control.Seq });
+            }
         };
         change.Next = () => next;
 
@@ -222,7 +227,7 @@ public sealed partial class MasterSession
     /// Answers the challenge an outstation sent in place of a response to a
     /// critical request.
     /// </summary>
-    private void OnAuthenticationResponse(Fragment f)
+    private void OnAuthenticationResponse(Received r, Fragment f)
     {
         var t = _inflight;
         if (_cfg.SecureAuthentication is not { } cfg || t is null || f.Header.Control.Uns ||
@@ -234,12 +239,15 @@ public sealed partial class MasterSession
 
         if (t.FuncCode == FuncCode.AuthRequest)
         {
-            OnSolicited(f);
+            OnSolicited(r, f);
             return;
         }
 
         if (!SingleAuthObject(f, 1, out var h))
         {
+            _stack?.Security?.Application(f.Objects.Any(obj => obj.Group == 120 && obj.Variation == 7)
+                ? SecurityEventKind.AuthMasterErrorReceived : SecurityEventKind.AuthMasterChallengeFailed,
+                r, f.Header, SecurityAction.Rejected);
             _inflight = null;
             CompleteTask(t, new AuthenticationException());
             return;
@@ -252,6 +260,7 @@ public sealed partial class MasterSession
         }
         catch (MalformedException ex)
         {
+            _stack?.Security?.Application(SecurityEventKind.AuthMasterChallengeFailed, r, f.Header, SecurityAction.Rejected);
             _inflight = null;
             CompleteTask(t, ex);
             return;
@@ -260,6 +269,7 @@ public sealed partial class MasterSession
         if (!SecurityReady() || c.Algorithm != 4 || c.Reason != 1 || (c.User != 0 && c.User != cfg.User) ||
             c.Data.Length != 32)
         {
+            _stack?.Security?.Application(SecurityEventKind.AuthMasterChallengeFailed, r, f.Header, SecurityAction.Rejected);
             _inflight = null;
             CompleteTask(t, new AuthenticationException());
             return;

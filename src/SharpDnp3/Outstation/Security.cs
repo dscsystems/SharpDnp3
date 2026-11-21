@@ -196,6 +196,26 @@ public sealed partial class OutstationSession
 
     private void AuthenticationError(Association a, Received r, byte seq, ushort user, byte code)
     {
+        if (a.Stack.Security is { } security)
+        {
+            var kind = code switch
+            {
+                7 => SecurityEventKind.AuthAuthorizationDenied,
+                11 => SecurityEventKind.AuthUnknownUser,
+                _ => SecurityEventKind.AuthFailure,
+            };
+            security.Emit(new(kind)
+            {
+                AppSeq = seq,
+                User = user,
+                Action = SecurityAction.Rejected,
+            });
+            if (security.Over(SecurityEventKind.AuthBruteForce, security.Policy.Limits.AuthFailures))
+            {
+                security.Emit(new(SecurityEventKind.AuthBruteForce) { User = user });
+            }
+        }
+
         uint sequence;
         lock (_securityGate)
         {
@@ -216,6 +236,7 @@ public sealed partial class OutstationSession
     {
         if (r.Broadcast)
         {
+            a.Stack.Security?.Application(SecurityEventKind.AuthBroadcastCritical, r, frag.Header, SecurityAction.Ignored);
             CountSecurity(9);
             return;
         }
@@ -260,6 +281,15 @@ public sealed partial class OutstationSession
             Sequence = sequence,
             Until = _appl.Now() + SecurityReplyTimeout,
         };
+        if (a.Stack.Security is { } security)
+        {
+            security.Flood(SecurityEventKind.FloodAuthChallenges, security.Policy.Limits.AuthChallenges, mayDisconnect: false);
+            if (!security.Policy.DisableAudit)
+            {
+                security.Application(SecurityEventKind.AuthChallenge, r, frag.Header);
+            }
+        }
+
         CountSecurity(8);
     }
 
@@ -268,6 +298,7 @@ public sealed partial class OutstationSession
         var seq = frag.Header.Control.Seq;
         if (Sa is null)
         {
+            a.Stack.Security?.Application(SecurityEventKind.ProtoSecureAuthUnsupported, r, frag.Header, SecurityAction.Rejected);
             a.Iin = a.Iin.Set(Iin.NoFuncCodeSupport);
             if (frag.Header.Func.NoReply())
             {
@@ -282,6 +313,7 @@ public sealed partial class OutstationSession
         {
             // This code carries errors and must never execute an operation.
             a.Security.Pending = null;
+            a.Stack.Security?.Application(SecurityEventKind.AuthErrorReceived, r, frag.Header, SecurityAction.Ignored);
             CountSecurity(11);
             return;
         }
@@ -386,6 +418,7 @@ public sealed partial class OutstationSession
         }
         catch (AuthenticationException)
         {
+            a.Stack.Security?.Application(SecurityEventKind.AuthKeyChangeFailed, r, frag.Header, SecurityAction.Rejected);
             CountSecurity(14);
             AuthenticationError(a, r, seq, v.User, 1);
             return;
@@ -404,6 +437,7 @@ public sealed partial class OutstationSession
             if (n < 16 || n > 64 || end + status.Length > plain.Length || plain.Length - end - status.Length > 7 ||
                 !SaCrypto.Equal(plain.AsSpan(end, status.Length), status))
             {
+                a.Stack.Security?.Application(SecurityEventKind.AuthKeyChangeFailed, r, frag.Header, SecurityAction.Rejected);
                 CountSecurity(14);
                 AuthenticationError(a, r, seq, v.User, 1);
                 return;
@@ -418,6 +452,11 @@ public sealed partial class OutstationSession
             u.Until = _appl.Now() + SecurityKeyTimeout;
             u.Messages = 0;
             a.Security.Pending = null;
+            if (a.Stack.Security is { Policy.DisableAudit: false } security)
+            {
+                security.Emit(new(SecurityEventKind.AuthKeyChange) { User = v.User, AppSeq = seq });
+            }
+
             CountSecurity(13);
             SendKeyStatus(a, r, seq, v.User, u);
         }
@@ -467,6 +506,11 @@ public sealed partial class OutstationSession
         }
 
         u.Messages++;
+        if (a.Stack.Security is { Policy.DisableAudit: false } security)
+        {
+            security.Emit(new(SecurityEventKind.AuthSuccess) { User = v.User, AppSeq = seq });
+        }
+
         CountSecurity(12);
         Handle(a, p.Received, authenticated: true);
     }
@@ -565,14 +609,16 @@ public sealed partial class OutstationSession
         if (a.Security.Pending is { } p && now >= p.Until)
         {
             a.Security.Pending = null;
+            a.Stack.Security?.Emit(new(SecurityEventKind.AuthReplyTimeout));
             CountSecurity(3);
             CountSecurity(9);
         }
 
         foreach (var u in a.Security.Users.Values)
         {
-            if (now >= u.Until || u.Messages >= SecurityMaxMessages)
+            if (u.Control.Length != 0 && (now >= u.Until || u.Messages >= SecurityMaxMessages))
             {
+                a.Stack.Security?.Emit(new(SecurityEventKind.AuthKeyExpired));
                 CryptographicOperations.ZeroMemory(u.Control);
                 u.Control = [];
             }
