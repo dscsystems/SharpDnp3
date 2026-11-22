@@ -98,14 +98,19 @@ public sealed class SecurityParityTests
         using (await accepting)
         {
             using var extra = new TcpClient();
-            await extra.ConnectAsync(channel.BoundAddress!, ct.Token);
             try
             {
+                await extra.ConnectAsync(channel.BoundAddress!, ct.Token);
                 Assert.Equal(0, await extra.GetStream().ReadAsync(new byte[1], ct.Token));
             }
-            catch (IOException ex) when (ex.InnerException is SocketException)
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
             {
-                // A reset is also an immediate refusal.
+                // The reset can arrive before ConnectAsync completes.
+            }
+            catch (IOException ex) when (
+                ex.InnerException is SocketException { SocketErrorCode: SocketError.ConnectionReset })
+            {
+                // It can also arrive while reading from the connected stream.
             }
         }
 
