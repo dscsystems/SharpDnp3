@@ -92,7 +92,18 @@ public sealed class SecurityParityTests
     {
         using var ct = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         using var channel = new TcpServerChannel("127.0.0.1:0") { Busy = BusyPolicy.Reject };
-        var accepting = channel.ConnectAsync(ct.Token);
+        var rejection = new TaskCompletionSource<SecurityEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var security = new SecurityRuntime(new SecurityPolicy
+        {
+            Sink = observation =>
+            {
+                if (observation.Kind == SecurityEventKind.ConnRejectedBusy)
+                {
+                    rejection.TrySetResult(observation);
+                }
+            },
+        }, "outstation");
+        var accepting = SecurityRuntime.ConnectAsync(channel, security, ct.Token);
         using var first = new TcpClient();
         await first.ConnectAsync(channel.BoundAddress!, ct.Token);
         using (await accepting)
@@ -103,15 +114,12 @@ public sealed class SecurityParityTests
                 await extra.ConnectAsync(channel.BoundAddress!, ct.Token);
                 Assert.Equal(0, await extra.GetStream().ReadAsync(new byte[1], ct.Token));
             }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+            catch (Exception ex) when (ex is SocketException or IOException { InnerException: SocketException })
             {
-                // The reset can arrive before ConnectAsync completes.
+                // The OS can surface the immediate close during connect or read.
             }
-            catch (IOException ex) when (
-                ex.InnerException is SocketException { SocketErrorCode: SocketError.ConnectionReset })
-            {
-                // It can also arrive while reading from the connected stream.
-            }
+
+            Assert.Equal(SecurityAction.Rejected, (await rejection.Task.WaitAsync(ct.Token)).Action);
         }
 
         accepting = channel.ConnectAsync(ct.Token);
